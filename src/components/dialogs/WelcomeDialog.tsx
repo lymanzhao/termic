@@ -12,6 +12,7 @@
 // is intentionally blocked so the user can't accidentally bypass setup.
 
 import { useEffect, useState } from "react";
+import { useTranslation, Trans } from "react-i18next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useUI } from "@/store/ui";
 import { AppDialog } from "@/components/ui/Dialog";
@@ -31,6 +32,7 @@ import { Sun, Moon, Monitor, Sunrise, Droplet, Binary, Code2, Flower2, GitPullRe
 type Step = 0 | 1 | 2 | 3;
 
 export function WelcomeDialog() {
+  const { t } = useTranslation("dialogs");
   const open = useUI(s => s.welcomeOpen);
   const close = useUI(s => s.closeWelcome);
   const [step, setStep] = useState<Step>(0);
@@ -60,7 +62,10 @@ export function WelcomeDialog() {
 
   useEffect(() => {
     if (!open || !dir) { setSummary(""); setRepos([]); setSelectedPaths(new Set()); return; }
-    const t = window.setTimeout(async () => {
+    // `t` is deliberately NOT a dep: re-running would re-fire the repo
+    // discovery IPC on a language switch. The stored summary localizes the
+    // next time the dir changes.
+    const timer = window.setTimeout(async () => {
       try {
         const found = await discoverRepos(dir);
         setRepos(found);
@@ -70,11 +75,12 @@ export function WelcomeDialog() {
         setSelectedPaths(new Set());
         const unadded = found.filter(r => !r.already_added).length;
         setSummary(found.length === 0
-          ? `No git repos found in ${dir}.`
-          : `Found ${found.length} repo${found.length === 1 ? "" : "s"} (${unadded} not yet added).`);
-      } catch { setSummary("Couldn't read that path."); setRepos([]); setSelectedPaths(new Set()); }
+          ? t("welcome.summaryNone", { dir })
+          : t(found.length === 1 ? "welcome.summaryFoundOne" : "welcome.summaryFoundMany", { count: found.length, unadded }));
+      } catch { setSummary(t("welcome.summaryError")); setRepos([]); setSelectedPaths(new Set()); }
     }, 200);
-    return () => window.clearTimeout(t);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dir, open]);
 
   async function browse() {
@@ -111,7 +117,7 @@ export function WelcomeDialog() {
         const okCount = created.filter(p => p !== null).length;
         if (okCount > 0) {
           useUI.getState().pushToast(
-            `Added ${okCount} project${okCount === 1 ? "" : "s"}`,
+            t(okCount === 1 ? "welcome.toastAddedOne" : "welcome.toastAddedMany", { count: okCount }),
             "success",
           );
         }
@@ -138,14 +144,14 @@ export function WelcomeDialog() {
       >
         <TermicMark size={40} />
         <div className="flex-1 min-w-0">
-          <div className="text-[18px] font-semibold leading-tight">Welcome to Termic</div>
+          <div className="text-[18px] font-semibold leading-tight">{t("welcome.title")}</div>
           <div className="text-[12.5px] text-[var(--color-fg-dim)]">
             {/* Parallel imperatives, one per step. Step 0 sets the repos
                 folder and confirms detected agents, so it says so. */}
-            {step === 0 && "Set your repos folder and agents."}
-            {step === 1 && "Let agents tell you when they need you."}
-            {step === 2 && "Pick your theme."}
-            {step === 3 && "Pick projects to add."}
+            {step === 0 && t("welcome.step0Sub")}
+            {step === 1 && t("welcome.step1Sub")}
+            {step === 2 && t("welcome.step2Sub")}
+            {step === 3 && t("welcome.step3Sub")}
           </div>
         </div>
         {/* Tiny pip indicator. Click to jump (handy for skipping back). */}
@@ -156,7 +162,7 @@ export function WelcomeDialog() {
         >
           {[0, 1, 2, 3].map(i => (
             <button key={i} onClick={() => setStep(i as Step)}
-              aria-label={`Step ${i + 1}`}
+              aria-label={t("welcome.stepAria", { n: i + 1 })}
               className={cn(
                 "h-1.5 w-6 rounded-full transition-colors",
                 i === step ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)] hover:bg-[var(--color-border-soft)]",
@@ -184,26 +190,26 @@ export function WelcomeDialog() {
 
       <div className="mt-5 flex items-center justify-between gap-2">
         <Button variant="ghost" type="button" onClick={back} disabled={step === 0 || busy}>
-          Back
+          {t("common:back")}
         </Button>
         <div className="flex gap-2">
           {step < 3 && (
             <Button variant="ghost" type="button" onClick={next} disabled={busy}>
-              Skip
+              {t("common:skip")}
             </Button>
           )}
           {step < 3 && (
             <Button variant="primary" type="button" onClick={next} disabled={busy}>
-              Next
+              {t("common:next")}
             </Button>
           )}
           {step === 3 && (
             <Button variant="primary" type="button" onClick={() => finish(!dir.trim())} disabled={busy}>
               {busy
-                ? "Adding…"
+                ? t("welcome.adding")
                 : selectedPaths.size > 0
-                  ? `Add ${selectedPaths.size} project${selectedPaths.size === 1 ? "" : "s"}`
-                  : "Get started"}
+                  ? t(selectedPaths.size === 1 ? "welcome.addProjectsOne" : "welcome.addProjectsMany", { count: selectedPaths.size })
+                  : t("welcome.getStarted")}
             </Button>
           )}
         </div>
@@ -218,6 +224,7 @@ function StepRepos({ dir, setDir, summary, clis, setClis, browse }: {
   setClis: (v: CliInfo[]) => void;
   browse: () => void;
 }) {
+  const { t } = useTranslation("dialogs");
   // Manually point Termic at an agent CLI binary when PATH detection
   // missed it. Common reasons: the user's `claude` is a shell function
   // (only visible to interactive zsh), or termic was launched from
@@ -227,7 +234,7 @@ function StepRepos({ dir, setDir, summary, clis, setClis, browse }: {
   async function pickBinary(name: string) {
     const displayName = CLI_LABEL[name] ?? name;
     const picked = await openDialog({
-      title: `Pick the ${displayName} binary`,
+      title: t("welcome.pickBinaryTitle", { name: displayName }),
       multiple: false,
       directory: false,
     });
@@ -257,23 +264,23 @@ function StepRepos({ dir, setDir, summary, clis, setClis, browse }: {
   return (
     <div className="flex flex-col gap-3">
       <label className="block text-[13.5px]">
-        Where do you keep your repos?{" "}
+        {t("welcome.reposLabel")}{" "}
         <span className="text-[var(--color-fg-faint)] font-normal">
-          (we'll suggest unadded ones)
+          {t("welcome.reposLabelHint")}
         </span>
         <div className="mt-1.5 flex gap-2">
           <Input value={dir} onChange={e => setDir(e.target.value)} placeholder="~/Projects" />
-          <Button variant="secondary" type="button" onClick={browse}>Browse…</Button>
+          <Button variant="secondary" type="button" onClick={browse}>{t("common:browse")}</Button>
         </div>
         <div className="mt-1 text-[12px] text-[var(--color-fg-faint)]">{summary}</div>
       </label>
 
       <div className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg)] p-3">
         <div className="mb-2 text-[11.5px] uppercase tracking-wider text-[var(--color-fg-dim)]">
-          Agent CLIs on your PATH
+          {t("welcome.agentClisTitle")}
         </div>
         {clis.length === 0 && (
-          <div className="text-[13.5px] text-[var(--color-fg-faint)]">Checking…</div>
+          <div className="text-[13.5px] text-[var(--color-fg-faint)]">{t("welcome.checking")}</div>
         )}
         {clis.map(c => (
           <div key={c.name} className={cn("flex items-center gap-2 py-1 text-[13.5px]", !c.found && "opacity-70")}>
@@ -293,14 +300,14 @@ function StepRepos({ dir, setDir, summary, clis, setClis, browse }: {
               </span>
             ) : (
               <>
-                <span className="text-[var(--color-fg-faint)] text-[12px]">not installed</span>
+                <span className="text-[var(--color-fg-faint)] text-[12px]">{t("welcome.notInstalled")}</span>
                 <button
                   type="button"
                   onClick={() => pickBinary(c.name)}
                   className="ml-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-2)] px-2 py-0.5 text-[11.5px] text-[var(--color-fg-dim)] hover:border-[var(--color-accent-soft)] hover:text-[var(--color-fg)]"
-                  title={`Locate the ${CLI_LABEL[c.name] ?? c.name} binary manually`}
+                  title={t("welcome.setPathTitle", { name: CLI_LABEL[c.name] ?? c.name })}
                 >
-                  Set path…
+                  {t("welcome.setPath")}
                 </button>
               </>
             )}
@@ -320,6 +327,7 @@ function StepRepos({ dir, setDir, summary, clis, setClis, browse }: {
  *  found-green / missing-gray language as the agent rows above: most
  *  people have one forge, not both, and a wall of red reads as failure. */
 function ForgeRows() {
+  const { t } = useTranslation("dialogs");
   const forges = usePr(s => s.forges);
   const refreshForges = usePr(s => s.refreshForges);
   useEffect(() => { void refreshForges(); }, [refreshForges]);
@@ -327,10 +335,10 @@ function ForgeRows() {
     <div className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg)] p-3">
       <div className="mb-2 flex items-center gap-1.5 text-[11.5px] uppercase tracking-wider text-[var(--color-fg-dim)]">
         <GitPullRequest className="h-3.5 w-3.5" />
-        Pull requests
+        {t("welcome.prSectionTitle")}
       </div>
       {forges === null && (
-        <div className="text-[13.5px] text-[var(--color-fg-faint)]">Checking…</div>
+        <div className="text-[13.5px] text-[var(--color-fg-faint)]">{t("welcome.checking")}</div>
       )}
       {(forges ?? []).map(f => (
         <div key={f.id} className={cn("flex items-center gap-2 py-1 text-[13.5px]", !f.authed && "opacity-70")}>
@@ -342,12 +350,12 @@ function ForgeRows() {
           </span>
           {!f.found ? (
             <span className="text-[12px] text-[var(--color-fg-faint)]">
-              <span className="font-mono">{f.id}</span> not installed ·{" "}
+              <span className="font-mono">{f.id}</span> {t("welcome.notInstalled")} ·{" "}
               <span className="font-mono">brew install {f.id}</span>
             </span>
           ) : !f.authed ? (
             <span className="text-[12px] text-[var(--color-fg-faint)]">
-              signed out · <span className="font-mono">{f.id} auth login</span>
+              {t("welcome.signedOut")} · <span className="font-mono">{f.id} auth login</span>
             </span>
           ) : (
             <span className="truncate font-mono text-[12px] text-[var(--color-fg-dim)]" title={f.path}>
@@ -357,8 +365,7 @@ function ForgeRows() {
         </div>
       ))}
       <div className="mt-1.5 text-[12px] text-[var(--color-fg-faint)]">
-        Without these, PR status, creating a PR, merge detection, and starting a task from an issue stay
-        off. Everything else works. You can set them up later; Settings re-checks each visit.
+        {t("welcome.forgeNote")}
       </div>
     </div>
   );
@@ -372,6 +379,7 @@ function ForgeRows() {
 // quietly missing from the list, which is the mistake the competing
 // implementation makes in the other direction.
 function StepHooks({ clis }: { clis: CliInfo[] }) {
+  const { t } = useTranslation("dialogs");
   const [rows, setRows] = useState<Record<string, AgentHookStatus>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const detected = clis.filter(c => c.found && c.name !== "shell").map(c => c.name);
@@ -408,14 +416,12 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
   return (
     <div className="flex flex-col gap-3">
       <p className="text-[12.5px] text-[var(--color-fg-dim)]">
-        Agents do not always say when they are stuck. Claude paints its idle
-        marker while it is waiting for you to approve something, so Termic can
-        read it as finished. A small hook in the agent's own config fixes that.
+        {t("welcome.hooksIntro")}
       </p>
       <div className="flex flex-col gap-1.5">
         {detected.length === 0 && (
           <p className="text-[12.5px] text-[var(--color-fg-dim)]">
-            No agent CLIs detected yet. You can turn this on later in Settings.
+            {t("welcome.hooksNone")}
           </p>
         )}
         {detected.map(id => {
@@ -436,15 +442,15 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
                     the special case is gone and every unsupported agent reads
                     the same. */}
                 <span className="text-[11.5px] text-[var(--color-fg-dim)]">
-                  {!st ? "checking…"
-                    : !st.supported ? "not supported yet"
-                    : st.host.disabled_all ? "hooks are disabled in this config"
-                    : st.host.installed ? "on" : "off"}
+                  {!st ? t("welcome.hookChecking")
+                    : !st.supported ? t("welcome.hookUnsupported")
+                    : st.host.disabled_all ? t("welcome.hookDisabled")
+                    : st.host.installed ? t("welcome.hookOn") : t("welcome.hookOff")}
                 </span>
                 {st?.supported && !st.host.disabled_all && (
                   <Button variant="ghost" type="button" disabled={busy === id}
                     onClick={() => toggle(id, !st.host.installed)}>
-                    {busy === id ? "…" : st.host.installed ? "Remove" : "Install"}
+                    {busy === id ? "…" : st.host.installed ? t("common:remove") : t("welcome.install")}
                   </Button>
                 )}
               </div>
@@ -455,8 +461,7 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
       {/* Name the file. This is the user's own config, not ours. */}
       {Object.values(rows).some(r => r.supported && r.host.installed) && (
         <p className="text-[11.5px] text-[var(--color-fg-dim)]">
-          Added one entry to your agent's settings file. Remove it any time here
-          or in Settings.
+          {t("welcome.hooksNote")}
         </p>
       )}
     </div>
@@ -478,22 +483,23 @@ const THEME_ITEMS: { id: ThemeMode; label: string; icon: typeof Sun; swatch: [st
   { id: "rosepine",  label: "Rosé Pine",      icon: Flower2, swatch: ["#191724", "#e0def4", "#ebbcba"] },
 ];
 function StepTheme() {
+  const { t } = useTranslation("dialogs");
   const themeMode = usePrefs(s => s.themeMode);
   const setThemeMode = usePrefs(s => s.setThemeMode);
   return (
     <div className="flex flex-col gap-3">
       <p className="text-[13px] text-[var(--color-fg-dim)]">
-        Live-applies as you click. Change anytime from the top toolbar.
+        {t("welcome.themeIntro")}
       </p>
       <div className="grid grid-cols-2 gap-2">
-        {THEME_ITEMS.map(t => {
-          const active = t.id === themeMode;
-          const Ic = t.icon;
-          const [bg, fg, accent] = t.swatch;
+        {THEME_ITEMS.map(item => {
+          const active = item.id === themeMode;
+          const Ic = item.icon;
+          const [bg, fg, accent] = item.swatch;
           return (
             <button
-              key={t.id} type="button"
-              onClick={() => { setThemeMode(t.id); applyTheme(t.id); }}
+              key={item.id} type="button"
+              onClick={() => { setThemeMode(item.id); applyTheme(item.id); }}
               className={cn(
                 "flex items-center gap-2.5 rounded-md border px-3 py-2 text-left transition-colors",
                 active
@@ -512,17 +518,17 @@ function StepTheme() {
               <div className="flex min-w-0 flex-col">
                 <span className="flex items-center gap-1.5 text-[13px] font-medium text-[var(--color-fg)]">
                   <Ic className="h-3.5 w-3.5 text-[var(--color-fg-dim)]" />
-                  {t.label}
+                  {item.label}
                 </span>
                 <span className="text-[11.5px] text-[var(--color-fg-faint)]">
-                  {t.id === "auto" && "follows macOS"}
-                  {t.id === "light" && "cream + terracotta"}
-                  {t.id === "claude" && "warm charcoal + clay"}
-                  {t.id === "dark" && "deeper near-black"}
-                  {t.id === "solarized" && "Schoonover palette"}
-                  {t.id === "cobalt" && "deep navy + sky blue"}
-                  {t.id === "matrix" && "phosphor green CRT"}
-                  {t.id === "rosepine" && "dusky purple + rose"}
+                  {item.id === "auto" && t("welcome.themeSubAuto")}
+                  {item.id === "light" && t("welcome.themeSubLight")}
+                  {item.id === "claude" && t("welcome.themeSubClaude")}
+                  {item.id === "dark" && t("welcome.themeSubDark")}
+                  {item.id === "solarized" && t("welcome.themeSubSolarized")}
+                  {item.id === "cobalt" && t("welcome.themeSubCobalt")}
+                  {item.id === "matrix" && t("welcome.themeSubMatrix")}
+                  {item.id === "rosepine" && t("welcome.themeSubRosepine")}
                 </span>
               </div>
             </button>
@@ -545,6 +551,7 @@ function StepProjects({ dir, repos, selected, setSelected }: {
   selected: Set<string>;
   setSelected: (v: Set<string>) => void;
 }) {
+  const { t } = useTranslation("dialogs");
   const unadded = repos.filter(r => !r.already_added);
   const added = repos.filter(r => r.already_added);
 
@@ -573,10 +580,9 @@ function StepProjects({ dir, repos, selected, setSelected }: {
   if (!dir.trim()) {
     return (
       <div className="flex flex-col gap-3 text-[13px] text-[var(--color-fg-dim)]">
-        <p>You skipped the repos directory in step 1. No projects to suggest.</p>
+        <p>{t("welcome.skippedDir")}</p>
         <p className="text-[12px] text-[var(--color-fg-faint)]">
-          You can add projects any time from the dashboard's "Add project" card,
-          or pick a repos dir in Settings → General to enable discovery.
+          {t("welcome.skippedDirHint")}
         </p>
       </div>
     );
@@ -584,10 +590,16 @@ function StepProjects({ dir, repos, selected, setSelected }: {
   if (repos.length === 0) {
     return (
       <div className="flex flex-col gap-3 text-[13px] text-[var(--color-fg-dim)]">
-        <p>No git repos found in <code className="mono">{dir}</code>.</p>
+        <p>
+          <Trans
+            t={t}
+            i18nKey="welcome.noReposInDir"
+            values={{ dir }}
+            components={{ code: <code className="mono" /> }}
+          />
+        </p>
         <p className="text-[12px] text-[var(--color-fg-faint)]">
-          Either the path is empty or you went back and changed it. Give the
-          scanner a moment, or pick a different dir in step 1.
+          {t("welcome.noReposHint")}
         </p>
       </div>
     );
@@ -598,13 +610,13 @@ function StepProjects({ dir, repos, selected, setSelected }: {
       <div className="flex items-center justify-between text-[12.5px] text-[var(--color-fg-dim)]">
         <span>
           {unadded.length === 0
-            ? `All ${repos.length} repo${repos.length === 1 ? "" : "s"} already added. Nothing new to pick.`
-            : `${unadded.length} unadded repo${unadded.length === 1 ? "" : "s"} in ${dir}. Tick what you want.`}
+            ? t(repos.length === 1 ? "welcome.allAddedOne" : "welcome.allAddedMany", { count: repos.length })
+            : t(unadded.length === 1 ? "welcome.unaddedInfoOne" : "welcome.unaddedInfoMany", { count: unadded.length, dir })}
         </span>
         {unadded.length > 0 && (
           <div className="flex gap-2">
-            <button type="button" onClick={checkAll} className="text-[var(--color-accent)] hover:underline">all</button>
-            <button type="button" onClick={checkNone} className="text-[var(--color-fg-faint)] hover:text-[var(--color-fg)] hover:underline">none</button>
+            <button type="button" onClick={checkAll} className="text-[var(--color-accent)] hover:underline">{t("welcome.all")}</button>
+            <button type="button" onClick={checkNone} className="text-[var(--color-fg-faint)] hover:text-[var(--color-fg)] hover:underline">{t("welcome.none")}</button>
           </div>
         )}
       </div>
@@ -614,7 +626,7 @@ function StepProjects({ dir, repos, selected, setSelected }: {
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter…"
+          placeholder={t("welcome.filterPlaceholder")}
           autoComplete="off"
           autoCorrect="off"
           autoCapitalize="off"
@@ -625,7 +637,7 @@ function StepProjects({ dir, repos, selected, setSelected }: {
 
       {unadded.length > 0 && visibleUnadded.length === 0 && (
         <div className="rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-4 text-center text-[12px] text-[var(--color-fg-faint)]">
-          No repos match "{filter}".
+          {t("welcome.noReposMatch", { filter })}
         </div>
       )}
 
@@ -653,7 +665,7 @@ function StepProjects({ dir, repos, selected, setSelected }: {
       {added.length > 0 && (
         <details className="rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg-1)]/50 px-3 py-2 text-[12px] text-[var(--color-fg-dim)]">
           <summary className="cursor-pointer select-none">
-            {added.length} repo{added.length === 1 ? "" : "s"} already added (won't duplicate)
+            {t(added.length === 1 ? "welcome.alreadyAddedOne" : "welcome.alreadyAddedMany", { count: added.length })}
           </summary>
           <ul className="mt-1.5 flex flex-col gap-0.5 pl-1">
             {added.map(r => (
@@ -664,8 +676,7 @@ function StepProjects({ dir, repos, selected, setSelected }: {
       )}
 
       <p className="text-[11.5px] text-[var(--color-fg-faint)]">
-        Each project lets you spawn tasks (git worktrees) per agent. You
-        can also add projects later from the dashboard.
+        {t("welcome.projectsFooter")}
       </p>
     </div>
   );

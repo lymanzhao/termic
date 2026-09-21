@@ -8,19 +8,21 @@
 // agent renders two. Specs must scope through `[data-dashboard-task-id]` or the
 // sidebar's `[data-sidebar-task-id]` rather than querying the testid globally.
 
+import { useTranslation } from "react-i18next";
 import { Bell } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
 import type { WorkBadgeReason } from "@/lib/taskWorkState";
 
 export function TaskWorkBadge({ reason }: { reason: WorkBadgeReason }) {
+  const { t } = useTranslation("chrome");
   if (reason === "working") {
     return (
       <span
         data-testid="work-badge"
         data-work-state="working"
         className="shrink-0 text-[var(--color-fg-faint)]"
-        title="Agent working"
-        aria-label="Working"
+        title={t("taskWorkBadge.working")}
+        aria-label={t("taskWorkBadge.workingAria")}
       >
         <Spinner size={12} />
       </span>
@@ -32,7 +34,7 @@ export function TaskWorkBadge({ reason }: { reason: WorkBadgeReason }) {
         data-testid="work-badge"
         data-work-state="attention"
         className="shrink-0 text-[var(--color-warn)]"
-        title="Agent needs your input"
+        title={t("taskWorkBadge.attention")}
       >
         <Bell className="h-3 w-3" strokeWidth={2.5} />
       </span>
@@ -45,8 +47,8 @@ export function TaskWorkBadge({ reason }: { reason: WorkBadgeReason }) {
       data-testid="work-badge"
       data-work-state="done"
       className="shrink-0 flex items-center justify-center"
-      title="Agent finished a turn"
-      aria-label="Work done"
+      title={t("taskWorkBadge.done")}
+      aria-label={t("taskWorkBadge.doneAria")}
     >
       <span
         className="block h-2 w-2 rounded-full"

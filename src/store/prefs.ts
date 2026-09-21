@@ -36,6 +36,7 @@ import {
 import { scoped } from "@/lib/profileScope";
 import { encodeOpenWithPick, parseOpenWithPick } from "@/lib/openWith";
 import type { OpenWithPick } from "@/lib/types";
+import { applyLanguage, parseLanguagePref, LS_LANGUAGE, type LanguagePref } from "@/lib/i18n";
 
 /** The two readouts an agent's footer chip can carry. */
 export const AGENT_FOOTER_PARTS = ["usage", "context"] as const;
@@ -483,6 +484,9 @@ export function stackFor(id: string) {
 }
 
 interface PrefsState {
+  /** UI language: "system" follows the OS (Chinese -> zh-CN, else en), or an
+   *  explicit locale. Applies live via i18next; persisted to localStorage. */
+  language: LanguagePref;
   /** Send OS notifications when an inactive tab's agent settles (output
    *  stopped changing). OFF by default — too noisy for many users. */
   desktopNotifications: boolean;
@@ -811,6 +815,7 @@ interface PrefsState {
   splitPaneDimAmount: number;
 
   setEditorFontId:    (id: string) => void;
+  setLanguage:        (l: LanguagePref) => void;
   setEditorThemeIdDark:  (id: string) => void;
   setEditorThemeIdLight: (id: string) => void;
   setTerminalFontId:  (id: string) => void;
@@ -1102,6 +1107,7 @@ const initialOpenWith = parseOpenWithPick(lsGet(LS_OPEN_WITH, ""));
 const initialQueueMinInterval = Math.max(0, Math.min(120000, Math.round(lsGetNum(LS_QUEUE_MIN_INTERVAL, 10000))));
 
 export const usePrefs = create<PrefsState>(set => ({
+  language: parseLanguagePref(lsGet(LS_LANGUAGE, "system")),
   themeMode: initialTheme,
   customThemes: [],
   customThemeRev: 0,
@@ -1164,6 +1170,12 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_EDITOR_FONT, id); } catch {}
     applyEditorFont(id);
     set({ editorFontId: id });
+  },
+  setLanguage: (l) => {
+    if (usePrefs.getState().language === l) return;  // bear trap 8
+    try { localStorage.setItem(LS_LANGUAGE, l); } catch {}
+    applyLanguage(l);
+    set({ language: l });
   },
   setEditorThemeIdDark: (id) => {
     try { localStorage.setItem(LS_EDITOR_THEME, id); } catch {}

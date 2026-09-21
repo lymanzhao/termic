@@ -9,9 +9,10 @@
 // the items (so the caller can also customize positioning).
 
 import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useApp } from "@/store/app";
 import { projectSandboxDefault } from "@/lib/projectSandboxDefault";
-import { SandboxIcon, DockerSandboxIcon, sandboxPickerLabel } from "@/components/SandboxIcon";
+import { SandboxIcon, DockerSandboxIcon, sandboxPickerLabelT } from "@/components/SandboxIcon";
 import { selectionToFields } from "@/lib/types";
 import { useUI } from "@/store/ui";
 import { defaultCliFirst, visibleCliIds } from "@/lib/agents";
@@ -32,9 +33,9 @@ type LauncherRow = Pick<Agent, "id" | "display_name"> & Partial<Pick<Agent, "ico
  *  task can sit archived for a long time, so this scales up through a
  *  short date instead of capping at hours. Terse on purpose: it sits
  *  inline before the row's title, one row per line. */
-function relativeArchivedTime(iso: string): string {
+function relativeArchivedTime(iso: string, now: string): string {
   const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
-  if (mins < 1) return "now";
+  if (mins < 1) return now;
   if (mins < 60) return `${mins}m`;
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h`;
@@ -63,6 +64,9 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   projectId: string;
   onPick?: (cli: string, mode: NewTaskMode) => void;
 }) {
+  const { t } = useTranslation("sidebar");
+  // Sandbox mode names live in the chrome namespace (SandboxIcon's table).
+  const { t: tChrome } = useTranslation("chrome");
   const agents = useApp(s => s.agents);
   const detectedClis = useApp(s => s.detectedClis);
   const openNewTask = useUI(s => s.openNewTask);
@@ -110,7 +114,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   // menu, and pinning it to the first row means it stays put when the agent
   // registry is reordered in Settings. Terminal takes part: a repo whose
   // default is a plain shell gets the same treatment.
-  const SHELL_ROW: LauncherRow = { id: "shell", display_name: "Terminal" };
+  const SHELL_ROW: LauncherRow = { id: "shell", display_name: t("projectActions.terminal") };
   const launcherRows = defaultCliFirst(
     [...agents.filter(a => visibleClis.has(a.id)), SHELL_ROW],
     project?.default_cli,
@@ -204,7 +208,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   return (
     <>
       {!canWorktree ? (
-        <SectionHeader title="RUN IN FOLDER" hint="Launch the agent at the folder root (no git)." />
+        <SectionHeader title={t("projectActions.runInFolder")} hint={t("projectActions.runInFolderHint")} />
       ) : (
         <div className="px-2 pb-1.5 pt-1.5">
           {/* Mode toggle. Main checkout comes first and is the default: most
@@ -224,7 +228,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                   : "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
               )}
             >
-              <Link2 className="h-3.5 w-3.5 shrink-0" /> Main checkout
+              <Link2 className="h-3.5 w-3.5 shrink-0" /> {t("projectActions.mainCheckout")}
             </button>
             <button
               type="button"
@@ -236,17 +240,17 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                   : "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
               )}
             >
-              <GitBranch className="h-3.5 w-3.5 shrink-0" /> Worktree
+              <GitBranch className="h-3.5 w-3.5 shrink-0" /> {t("projectActions.worktree")}
             </button>
           </div>
           <div className="px-0.5 pt-1 text-[11.5px] leading-snug text-[var(--color-fg-dim)]">
             {mode === "worktree"
               ? (isMulti
-                  ? "Branch every member into its own working directory, run agents in parallel."
-                  : "Isolated branch in its own working directory. Run agents in parallel without touching your main checkout.")
+                  ? t("projectActions.worktreeDescMulti")
+                  : t("projectActions.worktreeDescSingle"))
               : (isMulti
-                  ? "Host directory with live links to each member's checkout."
-                  : "No worktree. Runs in the repo's current branch. Edits land on your real files.")}
+                  ? t("projectActions.mainDescMulti")
+                  : t("projectActions.mainDescSingle"))}
           </div>
 
           {/* What cage this project's new tasks get, stated where the task is
@@ -267,9 +271,9 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                 ? <DockerSandboxIcon className="h-3 w-3 shrink-0" />
                 : <SandboxIcon mode={selectionToFields(sandboxDefault).mode} className="h-3 w-3 shrink-0" />}
               <span>
-                Sandboxed:{" "}
+                {t("projectActions.sandboxedNote")}{" "}
                 <span className="text-[var(--color-fg)]">
-                  {sandboxDefault === "docker" ? "Docker" : sandboxPickerLabel(selectionToFields(sandboxDefault).mode)}
+                  {sandboxDefault === "docker" ? "Docker" : sandboxPickerLabelT(selectionToFields(sandboxDefault).mode, tChrome)}
                 </span>
               </span>
             </div>
@@ -288,11 +292,11 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
               <DropdownSubTrigger className="mt-1.5 w-full justify-between gap-2">
                 <span className="flex shrink-0 items-center gap-1.5 text-[12.5px] text-[var(--color-fg-dim)]">
                   <GitBranchPlus className="h-3.5 w-3.5 shrink-0" />
-                  Branch from
+                  {t("projectActions.branchFrom")}
                 </span>
                 <span className="flex min-w-0 items-center gap-1">
                   <span className="truncate font-mono text-[12px] text-[var(--color-fg)]">
-                    {pinnedBase || "repo default"}
+                    {pinnedBase || t("projectActions.repoDefault")}
                   </span>
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
                 </span>
@@ -301,7 +305,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                 {choices.length === 0 && (
                   <DropdownItem disabled>
                     <span className="text-[12.5px] text-[var(--color-fg-faint)]">
-                      No branches found.
+                      {t("projectActions.noBranches")}
                     </span>
                   </DropdownItem>
                 )}
@@ -321,7 +325,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                         under you when you switch branches. */}
                     {b === head && (
                       <span className="ml-auto shrink-0 pl-2 text-[11px] text-[var(--color-fg-faint)]">
-                        current
+                        {t("projectActions.currentTag")}
                       </span>
                     )}
                   </DropdownItem>
@@ -353,7 +357,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
               once someone reorders their agents in Settings. */}
           {a.id === project?.default_cli && (
             <span className="ml-auto shrink-0 pl-2 text-[11px] text-[var(--color-fg-faint)]">
-              default
+              {t("projectActions.defaultTag")}
             </span>
           )}
         </DropdownItem>
@@ -367,9 +371,9 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
       }}>
         <SquareChevronRight className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
         <div className="flex min-w-0 flex-col">
-          <span className="truncate">Custom command</span>
+          <span className="truncate">{t("projectActions.customCommand")}</span>
           <span className="truncate text-[11.5px] text-[var(--color-fg-faint)]">
-            ssh, a dev server, a REPL, …
+            {t("projectActions.customCommandHint")}
           </span>
         </div>
       </DropdownItem>
@@ -382,9 +386,9 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
         <DropdownItem onSelect={() => requestAnimationFrame(() => openRace(projectId))}>
           <Flag className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
           <div className="flex min-w-0 flex-col">
-            <span className="truncate">Start a race…</span>
+            <span className="truncate">{t("projectActions.startRace")}</span>
             <span className="truncate text-[11.5px] text-[var(--color-fg-faint)]">
-              One prompt, several agents, pick a winner.
+              {t("projectActions.startRaceHint")}
             </span>
           </div>
         </DropdownItem>
@@ -398,10 +402,9 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
         <DropdownItem disabled>
           <GitBranchPlus className="h-4 w-4 text-[var(--color-fg-faint)]" />
           <div className="flex min-w-0 flex-col">
-            <span className="truncate">Worktrees unavailable</span>
+            <span className="truncate">{t("projectActions.worktreesUnavailable")}</span>
             <span className="text-[11.5px] text-[var(--color-fg-faint)]">
-              This folder isn't a git repo. Point the project at a git
-              repo (or git-init this folder) to enable worktrees.
+              {t("projectActions.worktreesUnavailableHint")}
             </span>
           </div>
         </DropdownItem>
@@ -413,11 +416,11 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
         <DropdownItem onSelect={openAdvanced}>
           <Settings2 className="h-4 w-4 text-[var(--color-fg-dim)]" />
           <div className="flex min-w-0 flex-col">
-            <span className="truncate">Advanced…</span>
+            <span className="truncate">{t("projectActions.advanced")}</span>
             <span className="truncate text-[11.5px] text-[var(--color-fg-faint)]">
               {mode === "worktree"
-                ? "Base branch, sandbox, import…"
-                : "More options and settings…"}
+                ? t("projectActions.advancedWorktreeHint")
+                : t("projectActions.advancedMainHint")}
             </span>
           </div>
         </DropdownItem>
@@ -441,7 +444,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
           <DropdownSubTrigger data-testid="import-worktree-sub" className="w-full justify-between gap-2">
             <span className="flex min-w-0 items-center gap-2">
               <FolderGit2 className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
-              <span className="truncate">Import worktree</span>
+              <span className="truncate">{t("projectActions.importWorktree")}</span>
             </span>
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
           </DropdownSubTrigger>
@@ -457,7 +460,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                 <FolderGit2 className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
                 <div className="min-w-0 flex-1">
                   <div className="truncate">
-                    {wt.branch || <span className="italic text-[var(--color-fg-dim)]">detached {wt.head}</span>}
+                    {wt.branch || <span className="italic text-[var(--color-fg-dim)]">{t("projectActions.detached", { head: wt.head })}</span>}
                   </div>
                   <div className="truncate text-[11px] text-[var(--color-fg-faint)]">{wt.path}</div>
                 </div>
@@ -467,7 +470,7 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
               <DropdownItem onSelect={() => {
                 requestAnimationFrame(() => openNewTask(projectId, { importMode: true }));
               }}>
-                More…
+                {t("projectActions.more")}
               </DropdownItem>
             )}
           </DropdownSubContent>
@@ -485,39 +488,39 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
             <DropdownSubTrigger data-testid="resume-sub" className="w-full justify-between gap-2">
               <span className="flex min-w-0 items-center gap-2">
                 <History className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
-                <span className="truncate">Resume</span>
+                <span className="truncate">{t("projectActions.resume")}</span>
               </span>
               <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
             </DropdownSubTrigger>
             <DropdownSubContent className="max-w-[320px]">
-              {archivedTasks.map(t => {
-                const iconId = resolveIconId(t.cli, agents);
+              {archivedTasks.map(task => {
+                const iconId = resolveIconId(task.cli, agents);
                 return (
-                  <DropdownItem key={t.id} onSelect={async () => {
+                  <DropdownItem key={task.id} onSelect={async () => {
                     try {
-                      const restored = await taskRestore(t.id);
+                      const restored = await taskRestore(task.id);
                       await loadAll();
                       setActiveTask(restored.id);
                     } catch (err) {
                       // task_restore refuses a live same-name duplicate;
                       // silently doing nothing here reads as a dead button.
                       useUI.getState().pushToast(
-                        typeof err === "string" ? err : "Restore failed", "error");
+                        typeof err === "string" ? err : t("restoreFailed"), "error");
                     }
                   }} className="items-center">
                     <span className={cn("shrink-0", CLI_BRAND_COLOR[iconId] || "text-[var(--color-fg-dim)]")}>
                       <CliIcon cli={iconId} className="h-4 w-4" />
                     </span>
                     <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-fg-faint)]">
-                      {relativeArchivedTime(t.archived_at ?? t.created)}
+                      {relativeArchivedTime(task.archived_at ?? task.created, t("projectActions.archivedNow"))}
                     </span>
-                    <span className="min-w-0 flex-1 truncate">{t.name}</span>
+                    <span className="min-w-0 flex-1 truncate">{task.name}</span>
                   </DropdownItem>
                 );
               })}
               {hasMoreArchived && (
                 <DropdownItem onSelect={() => setView("history")}>
-                  More…
+                  {t("projectActions.more")}
                 </DropdownItem>
               )}
             </DropdownSubContent>

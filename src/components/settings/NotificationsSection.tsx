@@ -2,6 +2,7 @@
 // out of the app (desktop notification, sound) and inside it (the tab and
 // sidebar indicators).
 
+import { useTranslation, Trans } from "react-i18next";
 import { ensureNotifyPermission, previewCompletionSound } from "@/lib/ipc";
 import { Button } from "@/components/ui/Button";
 import { usePrefs } from "@/store/prefs";
@@ -13,6 +14,7 @@ import { taskLabel } from "@/lib/taskLabel";
 import { COMPLETION_SOUND_OPTIONS, COMPLETION_SOUND_SUPPORTED } from "@/lib/notificationSounds";
 
 export function NotificationsSection() {
+  const { t } = useTranslation("settings");
   const desktopNotifications = usePrefs(s => s.desktopNotifications);
   const setDesktopNotifications = usePrefs(s => s.setDesktopNotifications);
   const completionSound = usePrefs(s => s.completionSound);
@@ -26,12 +28,12 @@ export function NotificationsSection() {
 
   return (
     <div className="flex flex-col gap-7">
-      <SectionTitle title="Notifications" />
+      <SectionTitle title={t("rail.notifications")} />
 
       <Block first>
         <Toggle
-          label="Desktop notifications"
-          hint="Notify when an inactive agent finishes or rings the bell. Clicking back in jumps to that tab."
+          label={t("notifications.desktop.label")}
+          hint={t("notifications.desktop.hint")}
           value={desktopNotifications}
           onChange={(v) => {
             setDesktopNotifications(v);
@@ -51,8 +53,8 @@ export function NotificationsSection() {
             instead of letting Preview suggest otherwise. */}
         <div className={cn(!desktopNotifications && "pointer-events-none opacity-50 select-none")}>
         <Toggle
-          label="Completion sound"
-          hint="Pick which sound plays inside desktop notifications when an inactive agent finishes a turn. Default: Funk."
+          label={t("notifications.sound.label")}
+          hint={t("notifications.sound.hint")}
           value={completionSound}
           onChange={setCompletionSound}
         />
@@ -83,20 +85,20 @@ export function NotificationsSection() {
                   ? taskLabel(task, usePrefs.getState().useBranchAsTaskName)
                   : "";
                 const title = task && proj?.name
-                  ? `${proj.name} · ${label || "task"}`
-                  : (label || "project · task");
-                previewCompletionSound(completionSoundId, { title, body: "agent finished" });
+                  ? `${proj.name} · ${label || t("notifications.sound.taskFallback")}`
+                  : (label || t("notifications.sound.titleFallback"));
+                previewCompletionSound(completionSoundId, { title, body: t("notifications.sound.body") });
               }}
-              title="Play a preview of the selected completion sound"
+              title={t("notifications.sound.previewTip")}
             >
-              Preview
+              {t("notifications.sound.preview")}
             </Button>
           </div>
         </div>
         </div>
         {!desktopNotifications && (
           <p className="mt-2 text-[12px] text-[var(--color-fg-faint)]">
-            Turn on Desktop notifications above to enable completion sounds.
+            {t("notifications.sound.lockedNote")}
           </p>
         )}
       </Block>
@@ -104,8 +106,8 @@ export function NotificationsSection() {
 
       <Block>
         <Toggle
-          label="Work-done indicator"
-          hint="Color a task's agent icon when its agent finishes a turn and is waiting on you."
+          label={t("notifications.workDone.label")}
+          hint={t("notifications.workDone.hint")}
           value={settledHighlight}
           onChange={setSettledHighlight}
         />
@@ -113,8 +115,8 @@ export function NotificationsSection() {
 
       <Block>
         <Toggle
-          label="Work-in-progress indicator"
-          hint="Show a spinner on an agent's tab and sidebar icon while it's working. On by default. Relies on work detection, which can occasionally misfire on noisy TUIs; a stuck spinner auto-clears after a few minutes."
+          label={t("notifications.working.label")}
+          hint={t("notifications.working.hint")}
           value={workingIndicator}
           onChange={setWorkingIndicator}
         />
@@ -124,12 +126,17 @@ export function NotificationsSection() {
           Agents page because it writes into an agent's own config, so this is
           a pointer rather than the thing itself. */}
       <p className="text-[12.5px] text-[var(--color-fg-dim)]">
-        These four read Termic&apos;s idea of what an agent is doing. To have the
-        agent report that itself instead, see <button
-          type="button"
-          className="text-[var(--color-accent)] hover:underline"
-          onClick={() => useApp.getState().openSettings("agents", undefined, AGENT_HOOKS_HIGHLIGHT)}
-        >Agent hooks</button> under Agents &amp; Terminals.
+        <Trans
+          t={t}
+          i18nKey="notifications.hooksNote"
+          components={{ 1: (
+            <button
+              type="button"
+              className="text-[var(--color-accent)] hover:underline"
+              onClick={() => useApp.getState().openSettings("agents", undefined, AGENT_HOOKS_HIGHLIGHT)}
+            />
+          ) }}
+        />
       </p>
     </div>
   );
