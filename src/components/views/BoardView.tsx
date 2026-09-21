@@ -19,6 +19,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Archive } from "lucide-react";
 import { EMPTY_TABS, selectTaskTabs, useApp } from "@/store/app";
 import { usePrefs } from "@/store/prefs";
 import { usePr } from "@/store/pr";
@@ -62,6 +63,18 @@ const COL_LABEL: Record<BoardStateColumn, string> = {
   working: "board.colWorking",
   review: "board.colReview",
   settled: "board.colSettled",
+};
+
+/** The dot / card-edge colour each column wears, all @theme tokens: warn is
+ *  the attention bell's colour, accent marks the actively-working agent,
+ *  pr-open is the green PR glyph, info is the settled bullet. A card's left
+ *  edge repeats its column's colour so the swimlane grid scans without
+ *  reading the headers. */
+const COL_ACCENT: Record<BoardStateColumn, string> = {
+  attention: "var(--color-warn)",
+  working: "var(--color-accent)",
+  review: "var(--color-pr-open)",
+  settled: "var(--color-info)",
 };
 
 interface DragSnapshot {
@@ -289,8 +302,14 @@ export function BoardView() {
         <div className="grid min-w-0 flex-1" style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
           {BOARD_STATE_COLUMNS.map(col => (
             <div key={col} className="flex items-center gap-1.5 px-3 py-2 text-[12px] font-semibold text-[var(--color-fg-dim)]">
+              <span className="h-[6px] w-[6px] shrink-0 rounded-full" style={{ backgroundColor: COL_ACCENT[col] }} />
               {t(COL_LABEL[col])}
-              <span className="tabular-nums text-[11px] text-[var(--color-fg-faint)]">{colCounts[col]}</span>
+              <span
+                className="ml-0.5 rounded-full px-1.5 tabular-nums text-[10.5px] font-medium text-[var(--color-fg-faint)]"
+                style={colCounts[col] > 0 ? { backgroundColor: "var(--color-hover)" } : undefined}
+              >
+                {colCounts[col]}
+              </span>
             </div>
           ))}
         </div>
@@ -369,11 +388,19 @@ export function BoardView() {
       </div>
 
       {/* Drag ghost: follows the pointer while the source card dims in place.
-          pointer-events-none so elementFromPoint sees the cells beneath it. */}
+          The tilt + shadow say "lifted", the way every kanban shows it.
+          pointer-events-none so elementFromPoint sees the cells beneath it;
+          transform + shadow are compositor-only, so the ghost costs nothing
+          to move. */}
       {drag && dragTask && (
         <div
-          className="pointer-events-none fixed z-50 rounded-md border border-[var(--color-accent-soft)] bg-[var(--color-bg-1)] px-2.5 py-2 opacity-90 shadow-lg"
-          style={{ left: drag.x - drag.grabDX, top: drag.y - drag.grabDY, width: drag.width }}
+          className="pointer-events-none fixed z-50 rounded-md border border-[var(--color-accent-soft)] bg-[var(--color-bg-1)] px-2.5 py-2 shadow-lg"
+          style={{
+            left: drag.x - drag.grabDX,
+            top: drag.y - drag.grabDY,
+            width: drag.width,
+            transform: "rotate(2deg) scale(1.02)",
+          }}
         >
           <div className="flex items-center gap-2">
             <span className={cn("shrink-0", CLI_BRAND_COLOR[resolveIconId(dragTask.cli, agents)] || "text-[var(--color-fg-faint)]")}>
@@ -382,6 +409,9 @@ export function BoardView() {
             <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">
               {taskLabel(dragTask, useBranchAsTaskName)}
             </span>
+            {drag.target?.kind === "archive" && (
+              <Archive className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-dim)]" />
+            )}
           </div>
         </div>
       )}
@@ -426,12 +456,22 @@ function BoardCell({ lane, column, tasks, projectOrder, projectById, projectAcce
               />
               <span className="truncate">{project?.name ?? g.projectId}</span>
             </div>
-            <div className="flex flex-col gap-1">
+            {/* While the pointer holds cards over this group, the accent ring
+                is the "this is where the drop lands" signal; everywhere else
+                is not a target and stays quiet. */}
+            <div
+              className={cn(
+                "flex flex-col gap-1 rounded-md",
+                dragSourceId != null && preview?.projectId === g.projectId
+                  && "ring-1 ring-inset ring-[var(--color-accent-soft)]",
+              )}
+            >
               {ordered.map(w => (
                 <BoardCard
                   key={w.id}
                   task={w}
                   ctx={ctx}
+                  column={column}
                   isDragSource={dragSourceId === w.id}
                   onPointerDown={e => onCardPointerDown(e, w, lane, column)}
                   onClick={() => onCardClick(w)}
@@ -449,9 +489,10 @@ function BoardCell({ lane, column, tasks, projectOrder, projectById, projectAcce
 // Each card subscribes to ONLY its own tab slice (selectTaskTabs), so a
 // keystroke in one task re-renders one card, not the board.
 
-function BoardCard({ task: w, ctx, isDragSource, onPointerDown, onClick }: {
+function BoardCard({ task: w, ctx, column, isDragSource, onPointerDown, onClick }: {
   task: Task;
   ctx: CardContext;
+  column: BoardStateColumn;
   isDragSource: boolean;
   onPointerDown: (e: React.PointerEvent) => void;
   onClick: () => void;
@@ -462,6 +503,11 @@ function BoardCard({ task: w, ctx, isDragSource, onPointerDown, onClick }: {
   // task can never wear two different badges on two surfaces.
   const badge = taskWorkBadge(tabs, ctx.workPrefs);
   const label = taskLabel(w, ctx.useBranchAsTaskName);
+  // The card's left edge repeats its column's accent (softened, so a grid of
+  // them reads as tint, not stripes). color-mix with a theme token: if a
+  // theme drops the variable the invalid value is discarded and the default
+  // border applies, same discipline as the dashboard's guide line.
+  const edge = `color-mix(in srgb, ${COL_ACCENT[column]} 55%, transparent)`;
 
   return (
     <div
@@ -473,9 +519,10 @@ function BoardCard({ task: w, ctx, isDragSource, onPointerDown, onClick }: {
       onKeyDown={ev => {
         if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onClick(); }
       }}
+      style={{ borderLeftColor: edge }}
       className={cn(
-        "flex cursor-pointer flex-col gap-0.5 rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-2.5 py-1.5 text-left hover:border-[var(--color-accent-soft)]",
-        isDragSource && "opacity-40",
+        "flex cursor-pointer flex-col gap-0.5 rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-2.5 py-1.5 text-left hover:border-[var(--color-accent-soft)] hover:shadow-sm",
+        isDragSource && "border-dashed opacity-40",
       )}
     >
       <div className="flex items-center gap-2">

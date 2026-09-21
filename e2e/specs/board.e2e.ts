@@ -80,6 +80,17 @@ describe("board view", () => {
     await waitVisible(`${CELL("fakeagent", "settled")} ${CARD(t1)}`);
     await waitVisible(`${CELL("fakeagent", "settled")} ${CARD(t2)}`);
     await waitVisible(`${CELL("fakecapture", "settled")} ${CARD(t3)}`);
+
+    // The column accent edge is a color-mix over a theme token. Assert the
+    // computed value: if the engine dropped the color-mix, the card would
+    // render with the default border on all four edges and the accent would
+    // be an invisible no-op that a screenshot cannot catch.
+    const edge = await browser.execute(sel => {
+      const cs = getComputedStyle(document.querySelector(sel) as HTMLElement);
+      return { left: cs.borderLeftColor, right: cs.borderRightColor };
+    }, `${CELL("fakeagent", "settled")} ${CARD(t1)}`);
+    expect(edge.left).not.toBe(edge.right);
+
     await snap("board.png");
   });
 
