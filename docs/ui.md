@@ -127,9 +127,19 @@ listener has to be attached first, and rAF is frozen on an occluded window (see
 The third nav view (GH #318), an overlay like History: `view.page === "board"`
 in `src/store/app.ts`, mounted by `MainArea`'s overlay chain, unmounted when
 left, so idle cost is zero by construction. One global board across projects,
-swimlanes by agent (`task.cli`, registry order, lanes with no live tasks not
-rendered), five columns: Needs attention, Working, In review, Settled, and a
-full-width Archived column.
+laid out as a standard kanban: five full-height fixed-width columns (Needs
+attention, Working, In review, Settled, Archived), each with its own surface
+one step above the page background, a header (semantic dot + title + count
+badge) and an independently scrolling card stack. The row sizes to its
+columns (`w-max` + `mx-auto`), so a narrow window scrolls and a wide one
+centers; never `justify-center` + overflow, which clips the left columns
+permanently.
+
+Swimlanes by agent (`task.cli`) are dividers INSIDE a column, sticky while
+the column scrolls, shown only when more than one agent has live tasks; the
+same rule hides project sub-headers on single-project groups. The Archived
+column is agent-agnostic, read-only apart from being the drop-to-archive
+target, and links to History in its footer.
 
 **The columns are derived, never stored** (`src/lib/taskBoardState.ts`, the
 third consumer of `taskWorkState.ts` after the sidebar and the dashboard):

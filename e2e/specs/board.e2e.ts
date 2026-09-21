@@ -22,8 +22,8 @@ import {
   waitVisible,
 } from "../helpers.js";
 
-const CELL = (lane: string, column: string) =>
-  `[data-board-lane="${lane}"] [data-board-cell][data-column="${column}"]`;
+const COLUMN = (column: string) => `[data-board-cell][data-column="${column}"]`;
+const LANE_IN = (lane: string, column: string) => `${COLUMN(column)} [data-board-lane="${lane}"]`;
 const CARD = (id: string) => `[data-board-task-id="${id}"]`;
 
 /** Ids of a project's live tasks in store order (what the sidebar shows). */
@@ -35,13 +35,13 @@ const projectTaskOrder = () =>
       .map((w: any) => w.id),
   );
 
-/** Card ids rendered in one board cell, in DOM order. */
+/** Card ids rendered in one board lane, in DOM order. */
 const cellCardOrder = (lane: string, column: string) =>
   browser.execute(
     sel =>
       [...document.querySelectorAll<HTMLElement>(`${sel} [data-board-task-id]`)]
         .map(el => el.dataset.boardTaskId),
-    CELL(lane, column),
+    LANE_IN(lane, column),
   );
 
 describe("board view", () => {
@@ -76,10 +76,10 @@ describe("board view", () => {
     await waitVisible('[data-board-lane="fakeagent"]');
     await waitVisible('[data-board-lane="fakecapture"]');
 
-    // Idle tasks with no PR are Settled, in a group under their project.
-    await waitVisible(`${CELL("fakeagent", "settled")} ${CARD(t1)}`);
-    await waitVisible(`${CELL("fakeagent", "settled")} ${CARD(t2)}`);
-    await waitVisible(`${CELL("fakecapture", "settled")} ${CARD(t3)}`);
+    // Idle tasks with no PR are Settled, under their agent's lane divider.
+    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`);
+    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`);
+    await waitVisible(`${LANE_IN("fakecapture", "settled")} ${CARD(t3)}`);
 
     // The column accent edge is a color-mix over a theme token. Assert the
     // computed value: if the engine dropped the color-mix, the card would
@@ -88,7 +88,7 @@ describe("board view", () => {
     const edge = await browser.execute(sel => {
       const cs = getComputedStyle(document.querySelector(sel) as HTMLElement);
       return { left: cs.borderLeftColor, right: cs.borderRightColor };
-    }, `${CELL("fakeagent", "settled")} ${CARD(t1)}`);
+    }, `${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`);
     expect(edge.left).not.toBe(edge.right);
 
     await snap("board.png");
@@ -97,7 +97,7 @@ describe("board view", () => {
   it("clicking a card activates the task and leaves the board", async () => {
     await browser.execute(
       sel => (document.querySelector(sel) as HTMLElement).click(),
-      `${CELL("fakeagent", "settled")} ${CARD(t2)}`,
+      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
     );
     await browser.waitUntil(
       () =>
@@ -120,8 +120,8 @@ describe("board view", () => {
 
     // Land on the TOP half of t1's card: the midpoint rule inserts before it.
     await pointerDrag(
-      `${CELL("fakeagent", "settled")} ${CARD(t2)}`,
-      `${CELL("fakeagent", "settled")} ${CARD(t1)}`,
+      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
+      `${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`,
       { land: "top" },
     );
 
@@ -137,8 +137,8 @@ describe("board view", () => {
 
   it("dragging to another column snaps back with no dialog and no write", async () => {
     await pointerDrag(
-      `${CELL("fakeagent", "settled")} ${CARD(t2)}`,
-      CELL("fakeagent", "working"),
+      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
+      COLUMN("working"),
     );
     // No drop target outside the origin group and the Archived column, so the
     // card stays put and nothing (confirm dialog included) appears.
@@ -146,7 +146,7 @@ describe("board view", () => {
       () => !!document.querySelector('[role="dialog"]'),
     );
     expect(dialogUp).toBe(false);
-    await waitVisible(`${CELL("fakeagent", "settled")} ${CARD(t2)}`);
+    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`);
     const archived = await browser.execute(
       id => !!window.__termic!.useApp.getState().tasks.find((w: any) => w.id === id)?.archived,
       t2,
@@ -157,7 +157,7 @@ describe("board view", () => {
   it("dropping a card on the Archived column archives it through the real confirm dialog", async () => {
     await dismissOverlays();
     await pointerDrag(
-      `${CELL("fakecapture", "settled")} ${CARD(t3)}`,
+      `${LANE_IN("fakecapture", "settled")} ${CARD(t3)}`,
       "[data-board-archive]",
     );
 
