@@ -453,6 +453,10 @@ specs and get an issue at the same time. That is the whole promotion path:
 - **Ambient agent status.** A Dock tile, or a strip beside the Dock, showing
   what every agent is doing without bringing the window forward.
   [docs/ideas/dock-widget.md](docs/ideas/dock-widget.md).
+- **A kanban board over tasks.** Columns derived from real state (working /
+  settled / needs-attention / PR open / archived), not Multica-style stored
+  statuses: the terminal is the ground truth and a hand-moved card would
+  drift from it. [docs/ideas/kanban-board.md](docs/ideas/kanban-board.md).
 - **Fixing a language server that answers badly.** Code intelligence ships,
   but when a server picks the wrong interpreter or indexes the wrong root
   there is nothing to turn. What the knobs should be, and which of them a
