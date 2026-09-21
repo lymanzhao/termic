@@ -411,7 +411,6 @@ specs and get an issue at the same time. That is the whole promotion path:
   statuses: the terminal is the ground truth and a hand-moved card would
   drift from it. Swimlanes by agent, drag-to-archive, nothing else
   draggable that does not mean something.
-  [docs/plans/kanban-board.md](docs/plans/kanban-board.md).
 - **Mobile app.** ([#165](https://github.com/simion/termic/issues/165)) A
   companion app for checking on and steering tasks while away from the Mac.
 - **Import Warp and Ghostty themes.** Termic has a native JSON theme format,

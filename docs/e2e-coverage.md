@@ -25,6 +25,7 @@ until `make e2e` is green and this file reflects it.
 |---|---|---|
 | ✅ App shell | Renders; `__termic` exposes real store state | `app.e2e.ts` |
 | ✅ Navigation | Dashboard ↔ History via real clicks | `app.e2e.ts` |
+| ✅ Board view (GH #318) | The Board nav entry opens the overlay; idle tasks land in Settled grouped under their project, one swimlane per agent in use; clicking a card activates the task and closes the board; dragging a card within its same-project group reorders and persists via `task_reorder`; dragging to another column snaps back with no dialog and no write; dropping on the Archived column runs the real confirm dialog and the card lands in the Archived column | `board.e2e.ts` |
 | ✅ History scrolling | The archive pane fills its overlay instead of sizing to its content, so an archive taller than the window overflows INSIDE the scroller: the last row starts out of view and scrolling brings it in. Filtering down and back keeps the pane full-height | `app.e2e.ts` |
 | ✅ Create (wizard) | NewTaskDialog: name + shell CLI + Main-checkout → Create → task exists | `task.e2e.ts` |
 | ✅ Non-blocking archive (GH #246) | Confirming an archive never raises the `busy-overlay` click-blocker (sampled the whole time the archive runs, not once at the end) and the row leaves the sidebar on its own; a task with an archive in flight renders as the inert `ArchivingTaskRow` (spinner badge, clicking it selects nothing) and returns to a normal row if the flag clears | `task.e2e.ts` |

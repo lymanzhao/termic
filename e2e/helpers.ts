@@ -214,6 +214,22 @@ export async function waitForAppShell(timeout = 30_000): Promise<void> {
       }),
     { timeout, interval: 250, timeoutMsg: "app shell (#root) never rendered" },
   );
+  // Pin English. The language picker defaults to "system", which follows the
+  // Mac's locale — CI boxes resolve it to English, but on a developer machine
+  // set to Chinese every English-label clickByText in the suite misses. The
+  // language-picker spec is unaffected: it sets its own start state before
+  // reading. Guarded on the pref value so an already-English session writes
+  // nothing.
+  await browser.waitUntil(
+    () =>
+      browser.execute(() => {
+        const p = window.__termic?.usePrefs?.getState();
+        if (!p) return false;
+        if (p.language !== "en") p.setLanguage("en");
+        return true;
+      }),
+    { timeout, interval: 250, timeoutMsg: "__termic prefs never came up" },
+  );
 }
 
 /**

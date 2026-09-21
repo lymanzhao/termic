@@ -3,6 +3,7 @@
 export default {
   navDashboard: "仪表盘",
   navHistory: "历史",
+  navBoard: "看板",
   projectsHeader: "项目",
   listOptionsTip: "项目列表选项",
   expandAll: "展开所有智能体",

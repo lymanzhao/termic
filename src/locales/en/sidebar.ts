@@ -3,6 +3,7 @@
 export default {
   navDashboard: "Dashboard",
   navHistory: "History",
+  navBoard: "Board",
   projectsHeader: "Projects",
   listOptionsTip: "Project list options",
   expandAll: "Expand all agents",

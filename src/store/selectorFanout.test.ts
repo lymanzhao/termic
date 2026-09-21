@@ -38,8 +38,9 @@ vi.mock("@/lib/tabFocus", () => ({
 
 import { useApp, selectTaskTabs, selectActiveTabId, EMPTY_TABS } from "@/store/app";
 import { useAgentUsage, usageKey } from "@/store/agentUsage";
+import { selectBoardColumnKey } from "@/lib/boardColumnKey";
 import type { AppState } from "@/store/app";
-import type { Tab } from "@/lib/types";
+import type { Tab, Task, TerminalTab } from "@/lib/types";
 
 /** Mounted subscribers to simulate. A busy window is a handful of panes, not
  *  2500 — but the budget should hold with two orders of magnitude of slack. */
@@ -304,6 +305,70 @@ describe("selector fan-out budget (bear trap 5)", () => {
     });
 
     expect(r.invalidations).toBe(10);
+  });
+
+  // ── Board view column key (GH #318) ────────────────────────────────
+  //
+  // BoardView holds ONE subscription for the whole board's column
+  // assignment (`selectBoardColumnKey`), deliberately string-keyed so the
+  // board re-renders when a card changes column and only then. These three
+  // cases pin that: unrelated writes cost nothing, per-keystroke tab writes
+  // that move no badge cost nothing, and a real column change costs exactly
+  // one invalidation.
+
+  const boardTask = (id: string): Task => ({
+    id, project_id: "p1", name: id, branch: id, base_branch: "main",
+    path: "/tmp/x", cli: "claude", port: 0, created: "2026-09-01T00:00:00Z",
+    archived: false,
+  } as Task);
+
+  it("the board's column key ignores unrelated writes", () => {
+    useApp.setState({
+      tasks: [boardTask("b1"), boardTask("b2")],
+      tabs: { b1: [tab("b1-t")], b2: [tab("b2-t")] },
+    });
+    const subs = [selectBoardColumnKey({ settledHighlight: true, workingIndicator: true })];
+
+    const r = measureFanout(subs, WRITES, i =>
+      useApp.getState().setSidebarWidth(200 + (i % 120)));
+
+    expect(r.invalidations).toBe(0);
+    expect(r.selectorRuns).toBe(WRITES);
+  });
+
+  it("the board's column key ignores tab writes that move no badge", () => {
+    useApp.setState({
+      tasks: [boardTask("b1")],
+      tabs: { b1: [tab("b1-t")] },
+    });
+    const subs = [selectBoardColumnKey({ settledHighlight: true, workingIndicator: true })];
+
+    // A title churn (the per-keystroke case: liveTitle updates land here)
+    // changes the tab object but not the work badge, so the string key is
+    // identical and the board does not re-render.
+    const r = measureFanout(subs, 100, i => {
+      const s = useApp.getState();
+      useApp.setState({ tabs: { ...s.tabs, b1: [{ ...tab("b1-t"), title: `t${i}` }] } });
+    });
+
+    expect(r.invalidations).toBe(0);
+  });
+
+  it("the board's column key fires exactly once on a real column change", () => {
+    useApp.setState({
+      tasks: [boardTask("b1")],
+      tabs: { b1: [tab("b1-t")] },
+    });
+    const subs = [selectBoardColumnKey({ settledHighlight: true, workingIndicator: true })];
+
+    const r = measureFanout(subs, 1, () => {
+      const s = useApp.getState();
+      // The cast narrows past the Tab union: workState exists only on
+      // terminal tabs, and a spread over the union fails to compile.
+      useApp.setState({ tabs: { ...s.tabs, b1: [{ ...(tab("b1-t") as TerminalTab), workState: "working" }] } });
+    });
+
+    expect(r.invalidations).toBe(1);
   });
 
   it("one walk step is one notification", () => {

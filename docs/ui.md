@@ -122,6 +122,38 @@ deferred by a `setTimeout`, not a `requestAnimationFrame`: a just-mounted
 listener has to be attached first, and rAF is frozen on an occluded window (see
 [gotchas.md](gotchas.md)).
 
+## Board view (kanban over tasks)
+
+The third nav view (GH #318), an overlay like History: `view.page === "board"`
+in `src/store/app.ts`, mounted by `MainArea`'s overlay chain, unmounted when
+left, so idle cost is zero by construction. One global board across projects,
+swimlanes by agent (`task.cli`, registry order, lanes with no live tasks not
+rendered), five columns: Needs attention, Working, In review, Settled, and a
+full-width Archived column.
+
+**The columns are derived, never stored** (`src/lib/taskBoardState.ts`, the
+third consumer of `taskWorkState.ts` after the sidebar and the dashboard):
+archived overrides everything, then attention, then working, then a persisted
+open/draft PR identity (main checkouts excluded, same gate as the pr poller),
+and everything else is Settled. A merged/closed PR falls back to Settled on
+the next poll. There is no `status` field on Task and there must not be one:
+the terminal is the ground truth, and a stored status a card could carry
+would drift from the PTY with no reconciliation path.
+
+Rendering discipline: the whole board's column assignment is ONE string-keyed
+selector (`src/lib/boardColumnKey.ts`, kept out of the pure module because it
+reads both stores), so the view re-renders when a card changes column and only
+then; each card subscribes to its own `selectTaskTabs` slice for its badge.
+`selectorFanout.test.ts` pins all three counts.
+
+Drags mean something or they do not happen. Hand-rolled pointer events, the
+sidebar's pattern; no dnd-kit. Exactly two drags are wired: reorder within a
+same-project group inside one cell (settle, one store write, `task_reorder`,
+whose Rust contract is same-project ids) and drop on the Archived column
+(shared `confirmAndArchive`, so the confirm dialog, delete-branch checkbox,
+open-PR warning and spinner come with it). Every other drop snaps back with
+no write. Restore stays in History; the Archived column links there.
+
 ## What a task is called (name vs branch)
 
 A task's label is decided in ONE place, `taskLabel()` in

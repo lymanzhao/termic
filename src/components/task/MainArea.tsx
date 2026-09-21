@@ -24,6 +24,7 @@ import { useUI } from "@/store/ui";
 import { usePendingTask } from "@/store/pendingTasks";
 import { Dashboard } from "@/components/views/Dashboard";
 import { HistoryView } from "@/components/views/History";
+import { BoardView } from "@/components/views/BoardView";
 import { TaskView } from "@/components/task/TaskView";
 import { CreatingTaskPane } from "@/components/task/CreatingTaskPane";
 
@@ -62,6 +63,7 @@ export function MainArea() {
   // tasks still render underneath so their PTYs survive.
   const overlay =
     view === "history" && !task ? <HistoryView /> :
+    view === "board" && !task ? <BoardView /> :
     pending ? <CreatingTaskPane id={pending.id} /> :
     !task ? <Dashboard /> :
     null;
