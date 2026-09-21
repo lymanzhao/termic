@@ -63,20 +63,47 @@ describe("taskBoardColumn", () => {
     expect(taskBoardColumn(w, [], { pr: null }, prefsOn)).toBe("review");
   });
 
-  it("merged or closed PRs fall out of review into settled", () => {
+  it("merged or closed PRs fall out of review (to backlog while untouched)", () => {
     const w = task({ pr_url: "https://github.com/acme/x/pull/1" });
-    expect(taskBoardColumn(w, [], { pr: { state: "merged" } }, prefsOn)).toBe("settled");
-    expect(taskBoardColumn(w, [], { pr: { state: "closed" } }, prefsOn)).toBe("settled");
+    expect(taskBoardColumn(w, [], { pr: { state: "merged" } }, prefsOn)).toBe("backlog");
+    expect(taskBoardColumn(w, [], { pr: { state: "closed" } }, prefsOn)).toBe("backlog");
+    // Touched tabs: the fallback below backlog is settled.
+    const touched = [tab({ workState: "done" })];
+    expect(taskBoardColumn(w, touched, { pr: { state: "merged" } }, prefsOn)).toBe("settled");
   });
 
   it("a main checkout never enters review, even with a PR url on the record", () => {
     const w = task({ is_main_checkout: true, pr_url: "https://github.com/acme/x/pull/1" });
-    expect(taskBoardColumn(w, [], { pr: { state: "open" } }, prefsOn)).toBe("settled");
+    // Touched tabs, so the assertion lands on the exclusion itself (a main
+    // checkout with a stale pr_url settles) rather than on untouched-tab
+    // backlog placement.
+    const touched = [tab({ workState: "done" })];
+    expect(taskBoardColumn(w, touched, { pr: { state: "open" } }, prefsOn)).toBe("settled");
   });
 
-  it("an idle task with no PR is settled, including a freshly spawned one", () => {
-    expect(taskBoardColumn(task(), [], null, prefsOn)).toBe("settled");
+  it("a task with no work evidence lands in backlog, not settled", () => {
+    // Freshly spawned: no tabs yet, or tabs the classifier never touched.
+    expect(taskBoardColumn(task(), [], null, prefsOn)).toBe("backlog");
+    expect(taskBoardColumn(task(), [tab({})], null, prefsOn)).toBe("backlog");
+    expect(taskBoardColumn(task(), [tab({ workState: undefined, lastInputAt: null })], null, prefsOn)).toBe("backlog");
+  });
+
+  it("a finished turn leaves evidence and lands in settled", () => {
     expect(taskBoardColumn(task(), [tab({ workState: "done" })], null, prefsOn)).toBe("settled");
+    // Explicit "idle" is a WRITE the state machine only makes when the user
+    // watched a done tab or cleared it: evidence of a past turn.
+    expect(taskBoardColumn(task(), [tab({ workState: "idle" })], null, prefsOn)).toBe("settled");
+    // Direct input evidence, even without classification.
+    expect(taskBoardColumn(task(), [tab({ lastInputAt: 1234 })], null, prefsOn)).toBe("settled");
+  });
+
+  it("backlog loses to every live signal", () => {
+    const untouched = [tab({})];
+    const attention = task({ pr_url: null });
+    expect(taskBoardColumn(attention, [tab({ unread: { reason: "attention" } })], null, prefsOn)).toBe("attention");
+    expect(taskBoardColumn(task(), [tab({ workState: "working" })], null, prefsOn)).toBe("working");
+    const withPr = task({ pr_url: "https://github.com/acme/x/pull/1" });
+    expect(taskBoardColumn(withPr, untouched, { pr: { state: "open" } }, prefsOn)).toBe("review");
   });
 
   it("prefs gate the work signals but never the review column", () => {
@@ -84,7 +111,9 @@ describe("taskBoardColumn", () => {
     // workingIndicator off: the working signal disappears, PR takes over.
     expect(taskBoardColumn(working, [tab({ workState: "working" })], { pr: { state: "open" } }, prefsOff)).toBe("review");
     const plain = task();
-    expect(taskBoardColumn(plain, [tab({ unread: { reason: "attention" } })], null, prefsOff)).toBe("settled");
+    // Attention gated off and no other evidence: the untouched task shows as
+    // backlog, the one state that never depends on prefs.
+    expect(taskBoardColumn(plain, [tab({ unread: { reason: "attention" } })], null, prefsOff)).toBe("backlog");
   });
 });
 
@@ -132,7 +161,7 @@ describe("boardCellGroups", () => {
 });
 
 describe("BOARD_STATE_COLUMNS", () => {
-  it("is the display order: attention first, settled last", () => {
-    expect(BOARD_STATE_COLUMNS).toEqual(["attention", "working", "review", "settled"]);
+  it("is the display order: backlog leads, settled closes the lifecycle", () => {
+    expect(BOARD_STATE_COLUMNS).toEqual(["backlog", "attention", "working", "review", "settled"]);
   });
 });

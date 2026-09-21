@@ -406,7 +406,7 @@ specs and get an issue at the same time. That is the whole promotion path:
 
 - **A kanban board over tasks.**
   ([#318](https://github.com/simion/termic/issues/318)) A third nav view
-  with columns derived from real state (working / settled /
+  with columns derived from real state (not started / working / settled /
   needs-attention / PR open / archived), not Multica-style stored
   statuses: the terminal is the ground truth and a hand-moved card would
   drift from it. Swimlanes by agent, drag-to-archive, nothing else

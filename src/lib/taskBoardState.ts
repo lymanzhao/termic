@@ -15,12 +15,13 @@ import {
   type WorkStatePrefs,
 } from "./taskWorkState";
 
-/** The columns, in display order. "archived" is rendered separately (it spans
- *  the full board width, ignoring swimlanes) but is part of the same
- *  derivation so the override-everything rule lives in exactly one place. */
-export type BoardColumn = "attention" | "working" | "review" | "settled" | "archived";
+/** The columns, in display order: the kanban lifecycle, attention pinned to
+ *  the front. "archived" is rendered separately (it ignores swimlanes) but is
+ *  part of the same derivation so the override-everything rule lives in
+ *  exactly one place. */
+export type BoardColumn = "backlog" | "attention" | "working" | "review" | "settled" | "archived";
 
-export const BOARD_STATE_COLUMNS = ["attention", "working", "review", "settled"] as const;
+export const BOARD_STATE_COLUMNS = ["backlog", "attention", "working", "review", "settled"] as const;
 export type BoardStateColumn = (typeof BOARD_STATE_COLUMNS)[number];
 
 /** The slice of the live PR snapshot the review column needs. Matches
@@ -30,20 +31,37 @@ export interface BoardPrInfo {
   pr: { state: string | null } | null;
 }
 
+/** No terminal tab holds ANY work evidence this session: `workState` was
+ *  never classified (the state machine skips the idle write on a fresh
+ *  spawn's idle-glyph title, so undefined means "no turn has ever run"),
+ *  and the user never submitted input (`lastInputAt` null). A tab the user
+ *  watched finishing downgrades done -> an explicit "idle" WRITE, which is
+ *  evidence and keeps the task out of here.
+ *
+ *  Session-scoped by design: these fields die with the process, so a task
+ *  that worked in a previous app session and has not been visited since
+ *  shows as backlog until it is opened. That is the same honesty as the
+ *  done badge, which also does not survive a restart; persisting a
+ *  "has worked" flag would be a stored status, which the board rules out. */
+export function taskUntouched(tabs: Tab[]): boolean {
+  return !tabs.some(t => t.type === "terminal" && (t.workState != null || t.lastInputAt != null));
+}
+
 /** Which column a task belongs in. Precedence, top wins:
  *
  *    archived          -> archived        (overrides everything)
  *    needs attention   -> attention       (agent blocked on the user)
  *    working           -> working         (agent mid-turn)
  *    PR open or draft  -> review          (main checkouts never poll PRs)
- *    everything else   -> settled         (includes freshly spawned tasks:
- *                                          termic has no not-started state)
+ *    no work evidence  -> backlog         (spawned, nobody asked anything)
+ *    everything else   -> settled         (a turn finished, or a stale one)
  *
- *  A merged or closed PR falls THROUGH to settled: the review column answers
- *  "waiting on a reviewer", and a merged PR is not. An unfetched PR (lookup
- *  null) counts as review while its identity is persisted — the poller will
- *  resolve it shortly, and a card that flickers settled -> review on every
- *  board open is worse than a briefly optimistic column. */
+ *  A merged or closed PR falls THROUGH (to backlog or settled): the review
+ *  column answers "waiting on a reviewer", and a merged PR is not. An
+ *  unfetched PR (lookup null) counts as review while its identity is
+ *  persisted — the poller will resolve it shortly, and a card that flickers
+ *  settled -> review on every board open is worse than a briefly optimistic
+ *  column. */
 export function taskBoardColumn(
   task: Task,
   tabs: Tab[],
@@ -60,6 +78,7 @@ export function taskBoardColumn(
     const state = pr?.pr?.state ?? null;
     if (state === null || state === "open" || state === "draft") return "review";
   }
+  if (taskUntouched(tabs)) return "backlog";
   return "settled";
 }
 

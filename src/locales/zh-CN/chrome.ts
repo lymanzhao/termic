@@ -176,6 +176,7 @@ export default {
     weeksAgo: "{{count}} 周前",
   },
   board: {
+    colBacklog: "未开始",
     colAttention: "需要注意",
     colWorking: "进行中",
     colReview: "审查中",

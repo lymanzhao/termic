@@ -13,6 +13,7 @@ import {
   archiveTask,
   clickByText,
   dismissOverlays,
+  ensureActiveTask,
   openTask,
   pointerDrag,
   requireTermicApi,
@@ -48,11 +49,12 @@ describe("board view", () => {
   let t1 = "";
   let t2 = "";
   let t3 = "";
+  let t4 = "";
 
   after(async () => {
-    // t3 is archived by its own case; archive what survived. Deleting by id
+    // t1 is archived by its own case; archive what survived. Deleting by id
     // is enough here: each openTask either returned or threw before creating.
-    for (const id of [t1, t2]) {
+    for (const id of [t2, t3, t4]) {
       if (!id) continue;
       const archived = await browser.execute(
         i => !!window.__termic!.useApp.getState().tasks.find((w: any) => w.id === i)?.archived,
@@ -62,7 +64,7 @@ describe("board view", () => {
     }
   });
 
-  it("opens from the sidebar nav and places idle tasks in Settled, one lane per agent", async () => {
+  it("opens from the sidebar nav and places untouched tasks in Not started, one lane per agent", async () => {
     await waitForAppShell();
     await requireTermicApi();
     t1 = await openTask("board-a", true, "fakeagent");
@@ -76,10 +78,12 @@ describe("board view", () => {
     await waitVisible('[data-board-lane="fakeagent"]');
     await waitVisible('[data-board-lane="fakecapture"]');
 
-    // Idle tasks with no PR are Settled, under their agent's lane divider.
-    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`);
-    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`);
-    await waitVisible(`${LANE_IN("fakecapture", "settled")} ${CARD(t3)}`);
+    // Tasks nobody has submitted anything to are Not started, under their
+    // agent's lane divider. This is the distinction that keeps "the agent
+    // is sitting idle" from reading as "the agent finished".
+    await waitVisible(`${LANE_IN("fakeagent", "backlog")} ${CARD(t1)}`);
+    await waitVisible(`${LANE_IN("fakeagent", "backlog")} ${CARD(t2)}`);
+    await waitVisible(`${LANE_IN("fakecapture", "backlog")} ${CARD(t3)}`);
 
     // The column accent edge is a color-mix over a theme token. Assert the
     // computed value: if the engine dropped the color-mix, the card would
@@ -88,7 +92,7 @@ describe("board view", () => {
     const edge = await browser.execute(sel => {
       const cs = getComputedStyle(document.querySelector(sel) as HTMLElement);
       return { left: cs.borderLeftColor, right: cs.borderRightColor };
-    }, `${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`);
+    }, `${LANE_IN("fakeagent", "backlog")} ${CARD(t1)}`);
     expect(edge.left).not.toBe(edge.right);
 
     await snap("board.png");
@@ -97,7 +101,7 @@ describe("board view", () => {
   it("clicking a card activates the task and leaves the board", async () => {
     await browser.execute(
       sel => (document.querySelector(sel) as HTMLElement).click(),
-      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
+      `${LANE_IN("fakeagent", "backlog")} ${CARD(t2)}`,
     );
     await browser.waitUntil(
       () =>
@@ -111,33 +115,37 @@ describe("board view", () => {
   });
 
   it("dragging within a same-project group reorders, and the order persists", async () => {
+    t4 = await openTask("board-d", false, "fakeagent");
     await clickByText("Board");
     await waitVisible('[data-testid="board-view"]');
     await dismissOverlays();
 
-    const before = await cellCardOrder("fakeagent", "settled");
-    expect(before).toEqual([t1, t2]);
+    // All three fakeagent tasks are untouched, so the backlog group holds
+    // them in store order: t1, t2, then the just-created t4.
+    const before = await cellCardOrder("fakeagent", "backlog");
+    expect(before).toEqual([t1, t2, t4]);
 
     // Land on the TOP half of t1's card: the midpoint rule inserts before it.
     await pointerDrag(
-      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
-      `${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`,
+      `${LANE_IN("fakeagent", "backlog")} ${CARD(t4)}`,
+      `${LANE_IN("fakeagent", "backlog")} ${CARD(t1)}`,
       { land: "top" },
     );
 
     await browser.waitUntil(
-      async () => JSON.stringify(await cellCardOrder("fakeagent", "settled")) === JSON.stringify([t2, t1]),
+      async () => JSON.stringify(await cellCardOrder("fakeagent", "backlog")) === JSON.stringify([t4, t1, t2]),
       { timeout: 5_000, timeoutMsg: "board cell never showed the reordered cards" },
     );
     // The store is the same truth the sidebar renders, and task_reorder
     // persists it. t3 (fakecapture lane, same project) keeps its place.
     const storeOrder = (await projectTaskOrder()) as string[];
-    expect(storeOrder.indexOf(t2)).toBeLessThan(storeOrder.indexOf(t1));
+    expect(storeOrder.indexOf(t4)).toBeLessThan(storeOrder.indexOf(t1));
+    expect(storeOrder.indexOf(t1)).toBeLessThan(storeOrder.indexOf(t2));
   });
 
   it("dragging to another column snaps back with no dialog and no write", async () => {
     await pointerDrag(
-      `${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`,
+      `${LANE_IN("fakeagent", "backlog")} ${CARD(t2)}`,
       COLUMN("working"),
     );
     // No drop target outside the origin group and the Archived column, so the
@@ -146,7 +154,7 @@ describe("board view", () => {
       () => !!document.querySelector('[role="dialog"]'),
     );
     expect(dialogUp).toBe(false);
-    await waitVisible(`${LANE_IN("fakeagent", "settled")} ${CARD(t2)}`);
+    await waitVisible(`${LANE_IN("fakeagent", "backlog")} ${CARD(t2)}`);
     const archived = await browser.execute(
       id => !!window.__termic!.useApp.getState().tasks.find((w: any) => w.id === id)?.archived,
       t2,
@@ -154,10 +162,40 @@ describe("board view", () => {
     expect(archived).toBe(false);
   });
 
+  it("a task that finished a turn moves out of Not started into Settled", async () => {
+    // Submit through the real input path (waitForAgentReady first, per the
+    // suite rule) and let the fake agent run its busy -> idle cycle: the
+    // classifier must see working then done, and the card must end in
+    // Settled. This is the regression case for "a task that did nothing
+    // shows as completed": doing something is what moves the card.
+    const { submitToAgent, waitForAgentReady, waitForWorkBadge, waitForWorkBadgeGone } = await import("../helpers.js");
+    await ensureActiveTask(t1);
+    await waitForAgentReady(t1);
+    await submitToAgent(t1, "write something to the terminal");
+    await waitForWorkBadge(t1, "working", { timeout: 20_000 });
+    await waitForWorkBadgeGone(t1, "working", { timeout: 30_000 });
+
+    await clickByText("Board");
+    await waitVisible('[data-testid="board-view"]');
+    await browser.waitUntil(
+      async () => !!(await cellCardOrder("fakeagent", "settled")).includes(t1),
+      { timeout: 30_000, timeoutMsg: "submitted task never landed in Settled" },
+    );
+    // Its untouched sibling stays behind in Not started.
+    await waitVisible(`${LANE_IN("fakeagent", "backlog")} ${CARD(t2)}`);
+    await snap("board-after-submit.png");
+  });
+
   it("dropping a card on the Archived column archives it through the real confirm dialog", async () => {
     await dismissOverlays();
+    // t1, now in Settled: this case deliberately drags from the column
+    // ADJACENT to Archived. A source on the board's far side (backlog) and
+    // the target cannot be on screen together in a narrow window, and the
+    // drag helper's scroll-into-view of one endpoint moves the other — the
+    // gesture then releases over whatever column is actually under the
+    // cursor and the dialog never comes.
     await pointerDrag(
-      `${LANE_IN("fakecapture", "settled")} ${CARD(t3)}`,
+      `${LANE_IN("fakeagent", "settled")} ${CARD(t1)}`,
       "[data-board-archive]",
     );
 
@@ -167,21 +205,20 @@ describe("board view", () => {
       () =>
         browser.execute(() =>
           [...document.querySelectorAll('[role="dialog"]')].some(d =>
-            d.textContent?.includes('Archive "board-c"')),
+            d.textContent?.includes('Archive "board-a"')),
         ),
       { timeout: 5_000, timeoutMsg: "archive confirm dialog never appeared" },
     );
     await clickByText("Remove entry");
 
-    // The card moves to the Archived column, the store agrees, and the
-    // fakecapture lane goes away with its last live task.
-    await waitVisible(`[data-board-archive] ${CARD(t3)}`);
-    await waitGone('[data-board-lane="fakecapture"]');
+    // The card moves to the Archived column and the store agrees; the
+    // fakecapture lane stays, its task was never touched.
+    await waitVisible(`[data-board-archive] ${CARD(t1)}`);
     await browser.waitUntil(
       () =>
         browser.execute(
           id => !!window.__termic!.useApp.getState().tasks.find((w: any) => w.id === id)?.archived,
-          t3,
+          t1,
         ),
       { timeout: 10_000, timeoutMsg: "task never landed as archived in the store" },
     );

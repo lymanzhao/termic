@@ -127,8 +127,9 @@ listener has to be attached first, and rAF is frozen on an occluded window (see
 The third nav view (GH #318), an overlay like History: `view.page === "board"`
 in `src/store/app.ts`, mounted by `MainArea`'s overlay chain, unmounted when
 left, so idle cost is zero by construction. One global board across projects,
-laid out as a standard kanban: five full-height fixed-width columns (Needs
-attention, Working, In review, Settled, Archived), each with its own surface
+laid out as a standard kanban: six full-height fixed-width columns (Not
+started, Needs attention, Working, In review, Settled, Archived), each with
+its own surface
 one step above the page background, a header (semantic dot + title + count
 badge) and an independently scrolling card stack. The row sizes to its
 columns (`w-max` + `mx-auto`), so a narrow window scrolls and a wide one
@@ -145,10 +146,16 @@ target, and links to History in its footer.
 third consumer of `taskWorkState.ts` after the sidebar and the dashboard):
 archived overrides everything, then attention, then working, then a persisted
 open/draft PR identity (main checkouts excluded, same gate as the pr poller),
-and everything else is Settled. A merged/closed PR falls back to Settled on
-the next poll. There is no `status` field on Task and there must not be one:
-the terminal is the ground truth, and a stored status a card could carry
-would drift from the PTY with no reconciliation path.
+then Not started for a task with no work evidence this session (no terminal
+tab has a classified `workState` or a `lastInputAt`: the state machine skips
+the idle write on a fresh spawn, so untouched stays distinguishable from a
+finished turn, whose tab holds `done` or an explicit `idle` write), and
+everything else is Settled. A merged/closed PR falls through past review.
+Not started is session-scoped by design, the same honesty as the done badge:
+nothing here survives a restart, and persisting a "has worked" flag would be
+a stored status. There is no `status` field on Task and there must not be
+one: the terminal is the ground truth, and a stored status a card could
+carry would drift from the PTY with no reconciliation path.
 
 Rendering discipline: the whole board's column assignment is ONE string-keyed
 selector (`src/lib/boardColumnKey.ts`, kept out of the pure module because it

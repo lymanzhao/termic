@@ -176,6 +176,7 @@ export default {
     weeksAgo: "{{count}} weeks ago",
   },
   board: {
+    colBacklog: "Not started",
     colAttention: "Needs attention",
     colWorking: "Working",
     colReview: "In review",

@@ -76,6 +76,7 @@ interface DragSnapshot {
 }
 
 const COL_LABEL: Record<BoardStateColumn, string> = {
+  backlog: "board.colBacklog",
   attention: "board.colAttention",
   working: "board.colWorking",
   review: "board.colReview",
@@ -84,10 +85,12 @@ const COL_LABEL: Record<BoardStateColumn, string> = {
 
 /** The dot / card-edge colour each column wears, all @theme tokens: warn is
  *  the attention bell's colour, accent marks the actively-working agent,
- *  pr-open is the green PR glyph, info is the settled bullet. A card's left
- *  edge repeats its column's colour so the stack scans without reading the
+ *  pr-open is the green PR glyph, info is the settled bullet, and backlog is
+ *  deliberately neutral (nothing has happened there yet). A card's left edge
+ *  repeats its column's colour so the stack scans without reading the
  *  headers. */
 const COL_ACCENT: Record<BoardStateColumn, string> = {
+  backlog: "var(--color-fg-faint)",
   attention: "var(--color-warn)",
   working: "var(--color-accent)",
   review: "var(--color-pr-open)",
@@ -146,7 +149,7 @@ export function BoardView() {
   const liveTasks = useMemo(() => tasks.filter(w => !w.archived), [tasks]);
   const archivedTasks = useMemo(() => tasks.filter(w => w.archived), [tasks]);
   const colTasks = useMemo(() => {
-    const cols: Record<BoardStateColumn, Task[]> = { attention: [], working: [], review: [], settled: [] };
+    const cols: Record<BoardStateColumn, Task[]> = { backlog: [], attention: [], working: [], review: [], settled: [] };
     for (const w of liveTasks) {
       const c = columnOf.get(w.id);
       if (c && c !== "archived") cols[c].push(w);
