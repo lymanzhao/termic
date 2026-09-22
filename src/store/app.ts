@@ -23,6 +23,7 @@ import { failCliQueuedPromptsInTabs } from "@/lib/cliPromptReports";
 import { hydrateScheduled, scheduledOf } from "@/lib/scheduledQueue";
 import { focusTerminalTab, focusMainTab, focusPaneTab } from "@/lib/tabFocus";
 import { agentDisplayName, STICKY_DONE_MS } from "@/lib/agents";
+import { visitMayClearWorking } from "@/lib/taskBoardState";
 import { scoped } from "@/lib/profileScope";
 
 /** An agent tab closed via the "X", snapshotted just before its session
@@ -207,6 +208,13 @@ export interface AppState {
    *  re-read status. Startup only. See `syncAgentHooks` in the store body. */
   syncAgentHooks: () => Promise<void>;
   setActiveTask: (id: string | null) => void;
+  /** The board's drop-on-Settled command: the focus-clear write applied to
+   *  EVERY terminal tab of the task instead of only the active one. Same
+   *  clearable guard as setActiveTask (done always; working only for agents
+   *  read from their terminal), `unread` cleared on every terminal tab, which
+   *  is what dismisses attention. No-op (writes nothing) when no tab holds
+   *  anything clearable. */
+  clearTaskWorkState: (taskId: string) => void;
   /** Union `ids` into mountedTasks WITHOUT changing the active task, so their
    *  TaskViews mount (and their agents spawn) while focus stays put. Agent
    *  Race uses this to boot N agents at once from one action. */
@@ -637,10 +645,9 @@ function reseatBottomAtPinBoundary(
  *  re-asserts working the way a repainting title used to. The spinner stayed
  *  gone for the rest of the turn. Reported from a real session.
  *
- *  So the escape hatch survives exactly where it is still needed. */
-function visitMayClearWorking(s: AppState, cli: string | undefined): boolean {
-  return !(cli && s.agentHooksInstalled[cli] === true);
-}
+ *  So the escape hatch survives exactly where it is still needed. The
+ *  predicate itself lives in lib/taskBoardState.ts (the board's drop matrix
+ *  shares it); this store passes its hooks map as plain data. */
 
 export function isTabOnScreenIn(s: AppState, taskId: string, tabId?: string): boolean {
   if (s.activeTaskId !== taskId) return false;
@@ -963,7 +970,7 @@ export const useApp = create<AppState>((set, get) => ({
             nt = { ...nt, unread: null };
           }
           const clearable = t.workState === "done"
-            || (t.workState === "working" && visitMayClearWorking(s, t.cli));
+            || (t.workState === "working" && visitMayClearWorking(s.agentHooksInstalled, t.cli));
           if (t.id === activeId && clearable) {
             nt = {
               ...nt,
@@ -979,6 +986,37 @@ export const useApp = create<AppState>((set, get) => ({
       });
     }
   },
+
+  clearTaskWorkState: (taskId) => set(s => {
+    const list = s.tabs[taskId];
+    if (!list?.length) return s;
+    const now = Date.now();
+    let changed = false;
+    const next = list.map(t => {
+      if (t.type !== "terminal") return t;
+      // Same guard as setActiveTask's focus clear. Unlike focus, there is no
+      // single "active tab" here: the command means the WHOLE task is seen.
+      const clearable = t.workState === "done"
+        || (t.workState === "working" && visitMayClearWorking(s.agentHooksInstalled, t.cli));
+      if (!t.unread && !clearable) return t;
+      changed = true;
+      return {
+        ...t,
+        unread: null,
+        ...(clearable ? {
+          workState: "idle" as const,
+          workProgress: null,
+          workProgressKind: null,
+          workClearedAt: now,
+        } : {}),
+      };
+    });
+    // Bear trap 8: an unchanged tabs object must not go through the setter.
+    // Every settled-column drop that lands on an already-clear task lands
+    // here, and the write would re-run every mounted task's selectors.
+    if (!changed) return s;
+    return { tabs: { ...s.tabs, [taskId]: next } };
+  }),
 
   setView: (page) => set({ view: { page }, activeTaskId: null }),
   // Opening Settings does NOT clear `activeTaskId` or change `view.page`
@@ -2264,7 +2302,7 @@ export const useApp = create<AppState>((set, get) => ({
         const patch: Partial<TerminalTab> = {};
         if (t.unread) patch.unread = null;
         if (t.workState === "done"
-            || (t.workState === "working" && visitMayClearWorking(s, t.cli))) {
+            || (t.workState === "working" && visitMayClearWorking(s.agentHooksInstalled, t.cli))) {
           patch.workState = "idle";
           patch.workProgress = null;
           patch.workProgressKind = null;

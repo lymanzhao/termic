@@ -18,40 +18,50 @@
 // view unmounts with the overlay, so idle cost is zero by construction.
 //
 // Drag discipline: hand-rolled pointer events, the same pattern as the
-// sidebar's task reorder. Only two drags mean anything: reorder within a
-// same-project group (settle -> `task_reorder`, whose Rust contract is
-// same-project ids) and drop-to-archive (-> the shared `confirmAndArchive`,
-// inheriting its confirm dialog and spinner). Everything else snaps back
-// without a write.
+// sidebar's task reorder. Columns are derived, never stored, so a drop cannot
+// SET a status; instead a cross-column drop is a COMMAND (the "drag as
+// command" model, docs/ui.md "Board view"): reorder within the origin group
+// (settle -> `task_reorder`, whose Rust contract is same-project ids),
+// drop-to-archive (-> the shared `confirmAndArchive`, inheriting its confirm
+// dialog and spinner), drop-on-Settled (-> `clearTaskWorkState`, the
+// focus-clear write on every terminal tab) and drop-on-In-review (->
+// CreatePrDialog, the same entry the command palette uses). Everything else
+// snaps back without a write, and so does a command that would be a no-op
+// (nothing to clear, main checkout): the matrix lives in
+// boardDropCommand() in src/lib/taskBoardState.ts.
 
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Archive } from "lucide-react";
+import { Archive, Check, GitPullRequest, Zap } from "lucide-react";
 import { EMPTY_TABS, selectTaskTabs, useApp } from "@/store/app";
 import { usePrefs } from "@/store/prefs";
 import { usePr } from "@/store/pr";
+import { useUI } from "@/store/ui";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
 import { TaskWorkBadge } from "@/components/TaskWorkBadge";
 import { TaskPrBadge } from "@/components/TaskPrBadge";
+import { DockerSandboxIcon, SandboxIcon, sandboxModeText } from "@/components/SandboxIcon";
 import { taskLabel } from "@/lib/taskLabel";
 import { taskWorkBadge, type WorkStatePrefs } from "@/lib/taskWorkState";
 import {
   BOARD_STATE_COLUMNS,
   boardCellGroups,
+  boardDropCommand,
   boardLanes,
   taskBoardColumn,
   type BoardColumn,
   type BoardStateColumn,
 } from "@/lib/taskBoardState";
 import { selectBoardColumnKey } from "@/lib/boardColumnKey";
-import { agentDisplayName } from "@/lib/agents";
+import { agentDisplayName, isTerminalCli } from "@/lib/agents";
 import { groupOf } from "@/lib/projectGroups";
 import { accentCss } from "@/lib/accents";
 import { confirmAndArchive } from "@/lib/archiveTask";
 import { taskReorder } from "@/lib/ipc";
+import { effectiveSandboxMode, isSandboxEnforced } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import type { Agent, Project, Task } from "@/lib/types";
+import type { Agent, Project, Tab, Task, TerminalTab } from "@/lib/types";
 import type { TFunction } from "i18next";
 
 /** Everything a card needs that is the SAME for every card, hoisted so N
@@ -63,7 +73,12 @@ interface CardContext {
   workPrefs: WorkStatePrefs;
 }
 
-type DragTarget = { kind: "archive" } | { kind: "reorder" } | null;
+type DragTarget =
+  | { kind: "archive" }
+  | { kind: "settle" }
+  | { kind: "createPr" }
+  | { kind: "reorder" }
+  | null;
 
 interface DragSnapshot {
   taskId: string;
@@ -73,6 +88,10 @@ interface DragSnapshot {
   grabDY: number;
   width: number;
   target: DragTarget;
+  // Which commands THIS card's drop could ever run, fixed at drag start so
+  // the settled/review columns can advertise their hint for the whole drag.
+  canSettle: boolean;
+  canCreatePr: boolean;
 }
 
 const COL_LABEL: Record<BoardStateColumn, string> = {
@@ -172,6 +191,7 @@ export function BoardView() {
     id: string; projectId: string; lane: string; column: BoardStateColumn;
     groupIds: string[]; x: number; y: number; started: boolean;
     grabDX: number; grabDY: number; width: number; target: DragTarget;
+    canSettle: boolean; canCreatePr: boolean;
   } | null>(null);
   // A completed drop still fires a click on the card, which would activate
   // the task the user only meant to move. Same suppression pattern as the
@@ -192,11 +212,19 @@ export function BoardView() {
     const groupIds = liveTasks
       .filter(u => u.project_id === w.project_id && u.cli === lane && columnOf.get(u.id) === column)
       .map(u => u.id);
+    // Which commands this card's drop could run, computed once: the settled
+    // and review columns advertise their drop hints for the whole drag only
+    // when the command would not be a guaranteed no-op.
+    const hooks = useApp.getState().agentHooksInstalled;
     armedRef.current = {
       id: w.id, projectId: w.project_id, lane, column, groupIds,
       x: e.clientX, y: e.clientY, started: false,
       grabDX: e.clientX - rect.left, grabDY: e.clientY - rect.top, width: rect.width,
       target: null,
+      canSettle: column !== "settled"
+        && boardDropCommand(column, "settled", w, useApp.getState().tabs[w.id] ?? EMPTY_TABS, hooks) != null,
+      canCreatePr: column !== "review"
+        && boardDropCommand(column, "review", w, useApp.getState().tabs[w.id] ?? EMPTY_TABS, hooks) != null,
     };
     document.addEventListener("pointermove", onDragPointerMove);
     document.addEventListener("pointerup", onDragPointerUp);
@@ -243,12 +271,27 @@ export function BoardView() {
         next.splice(insertAt === -1 ? rest.length : insertAt, 0, armed.id);
         // No-op guard (bear trap 8): identical order writes nothing.
         if (next.some((id, i) => id !== base[i])) setPreviewBoth({ projectId: armed.projectId, ids: next });
+      } else if (cell) {
+        // Outside the origin group a drop on Settled / In review is a
+        // command, not a status write (boardDropCommand for the matrix and
+        // the gates). Everything else snaps back.
+        const col = cell.dataset.column as BoardColumn | undefined;
+        const w = useApp.getState().tasks.find(u => u.id === armed.id);
+        if (col && w) {
+          const cmd = boardDropCommand(
+            armed.column, col, w,
+            useApp.getState().tabs[armed.id] ?? EMPTY_TABS,
+            useApp.getState().agentHooksInstalled,
+          );
+          if (cmd) target = cmd;
+        }
       }
     }
     armed.target = target;
     setDrag({
       taskId: armed.id, x: e.clientX, y: e.clientY,
       grabDX: armed.grabDX, grabDY: armed.grabDY, width: armed.width, target,
+      canSettle: armed.canSettle, canCreatePr: armed.canCreatePr,
     });
   };
 
@@ -271,6 +314,20 @@ export function BoardView() {
       // confirmAndArchive owns the dialog, the delete-branch checkbox, the
       // open-PR warning and the spinner; the board just hands the task over.
       if (w) void confirmAndArchive(w);
+      return;
+    }
+    if (armed.target?.kind === "settle") {
+      // "I've seen this": the focus-clear write on every terminal tab. The
+      // attention/done badge goes, the derivation moves the card on its own;
+      // a no-op was already filtered out by the matrix at drag time.
+      useApp.getState().clearTaskWorkState(armed.id);
+      return;
+    }
+    if (armed.target?.kind === "createPr") {
+      // Same one-call entry as the command palette and the PR card. The
+      // dialog seeds its title from the task, handles cancel, and reports
+      // create errors inline; nothing here is board-specific.
+      useUI.getState().openCreatePr(armed.id);
       return;
     }
     if (!pv || pv.projectId !== armed.projectId) return;
@@ -339,6 +396,7 @@ export function BoardView() {
                 preview={preview}
                 dragTarget={drag?.target ?? null}
                 dragSourceId={drag?.taskId ?? null}
+                dragHint={col === "settled" ? !!drag?.canSettle : col === "review" ? !!drag?.canCreatePr : false}
                 onCardPointerDown={onCardPointerDown}
                 onCardClick={onCardClick}
               />
@@ -412,6 +470,12 @@ export function BoardView() {
             {drag.target?.kind === "archive" && (
               <Archive className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-dim)]" />
             )}
+            {drag.target?.kind === "settle" && (
+              <Check className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-dim)]" />
+            )}
+            {drag.target?.kind === "createPr" && (
+              <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-dim)]" />
+            )}
           </div>
         </div>
       )}
@@ -429,7 +493,7 @@ function groupByLane(tasks: Task[], laneIds: string[]): { lane: string; tasks: T
 
 // ─── Column ──────────────────────────────────────────────────────────────
 
-function BoardColumnView({ column, laneIds, tasksByLane, projectOrder, projectById, projectAccent, ctx, preview, dragTarget, dragSourceId, onCardPointerDown, onCardClick }: {
+function BoardColumnView({ column, laneIds, tasksByLane, projectOrder, projectById, projectAccent, ctx, preview, dragTarget, dragSourceId, dragHint, onCardPointerDown, onCardClick }: {
   column: BoardStateColumn;
   laneIds: string[];
   tasksByLane: { lane: string; tasks: Task[] }[];
@@ -440,18 +504,28 @@ function BoardColumnView({ column, laneIds, tasksByLane, projectOrder, projectBy
   preview: { projectId: string; ids: string[] } | null;
   dragTarget: DragTarget;
   dragSourceId: string | null;
+  /** True while a drag is in flight whose card could run THIS column's
+   *  command (drop-on-Settled / drop-on-In-review); shows the dashed hint
+   *  the whole drag, the way the Archived column advertises itself. */
+  dragHint: boolean;
   onCardPointerDown: (e: React.PointerEvent, w: Task, lane: string, column: BoardStateColumn) => void;
   onCardClick: (w: Task) => void;
 }) {
   const { t } = useTranslation("chrome");
   const count = tasksByLane.reduce((n, g) => n + g.tasks.length, 0);
   const accent = COL_ACCENT[column];
+  const isCommandTarget =
+    (column === "settled" && dragTarget?.kind === "settle")
+    || (column === "review" && dragTarget?.kind === "createPr");
 
   return (
     <section
       data-board-cell
       data-column={column}
-      className="flex w-[280px] shrink-0 flex-col rounded-[10px] bg-[var(--color-bg-1)]"
+      className={cn(
+        "flex w-[280px] shrink-0 flex-col rounded-[10px] bg-[var(--color-bg-1)]",
+        isCommandTarget && "ring-1 ring-inset ring-[var(--color-accent-soft)]",
+      )}
     >
       <header className="flex shrink-0 items-center gap-2 px-2.5 pb-1 pt-2.5">
         <span className="h-[6px] w-[6px] shrink-0 rounded-full" style={{ backgroundColor: accent }} />
@@ -464,6 +538,11 @@ function BoardColumnView({ column, laneIds, tasksByLane, projectOrder, projectBy
         </span>
       </header>
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2.5 pb-2.5">
+        {dragHint && (
+          <div className="rounded-lg border border-dashed border-[var(--color-border)] px-2 py-2 text-center text-[11.5px] text-[var(--color-fg-faint)]">
+            {t(column === "settled" ? "board.settleHint" : "board.reviewHint")}
+          </div>
+        )}
         {tasksByLane.map(({ lane, tasks }) => (
           <div key={lane} data-board-lane={lane} className="flex flex-col gap-2">
             {/* Lane divider only when it discriminates: a column holding one
@@ -515,7 +594,6 @@ function LaneGroups({ lane, column, tasks, projectOrder, projectById, projectAcc
   onCardClick: (w: Task) => void;
 }) {
   const groups = boardCellGroups(tasks, projectOrder);
-  const multiProject = groups.length > 1;
   return (
     <>
       {groups.map(g => {
@@ -525,15 +603,16 @@ function LaneGroups({ lane, column, tasks, projectOrder, projectById, projectAcc
           : g.tasks;
         return (
           <div key={g.projectId} data-board-project-group={g.projectId} className="flex flex-col">
-            {multiProject && (
-              <div className="flex items-center gap-1.5 px-1 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-[var(--color-fg-faint)]">
-                <span
-                  className="h-1.5 w-1.5 shrink-0 rounded-full"
-                  style={{ backgroundColor: projectAccent(project) ?? "var(--color-fg-faint)" }}
-                />
-                <span className="truncate">{project?.name ?? g.projectId}</span>
-              </div>
-            )}
+            {/* Always on (GH #318 feedback): on a one-project board nothing
+                else names the project, and the header is how a card from
+                another project reads at a glance when one appears. */}
+            <div className="flex items-center gap-1.5 px-1 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.05em] text-[var(--color-fg-faint)]">
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: projectAccent(project) ?? "var(--color-fg-faint)" }}
+              />
+              <span className="truncate">{project?.name ?? g.projectId}</span>
+            </div>
             {/* While the pointer holds cards over this group, the accent ring
                 is the "this is where the drop lands" signal; everywhere else
                 is not a target and stays quiet. */}
@@ -581,6 +660,17 @@ function BoardCard({ task: w, ctx, column, isDragSource, onPointerDown, onClick 
   // task can never wear two different badges on two surfaces.
   const badge = taskWorkBadge(tabs, ctx.workPrefs);
   const label = taskLabel(w, ctx.useBranchAsTaskName);
+  // Agent sessions inside the task (the closest thing to subtasks): the
+  // sidebar's counting pattern - main-pane terminal tabs whose cli is an
+  // actual agent, not the shell/custom sentinel. The chips only render when
+  // they discriminate: a single-session task is what the lane already says.
+  const agentTabs = tabs.filter((t): t is TerminalTab =>
+    t.type === "terminal" && !t.paneId && !isTerminalCli(t.cli, ctx.agents));
+  const sessionCount = agentTabs.length;
+  const primaryIcon = resolveIconId(w.cli, ctx.agents);
+  const extraIcons = sessionCount > 1
+    ? [...new Set(agentTabs.map(x => resolveIconId(x.cli, ctx.agents)))].filter(id => id !== primaryIcon)
+    : [];
   // The card's left edge repeats its column's accent (softened, so a stack
   // reads as tint, not stripes). color-mix with a theme token: if a theme
   // drops the variable the invalid value is discarded and the default
@@ -604,22 +694,76 @@ function BoardCard({ task: w, ctx, column, isDragSource, onPointerDown, onClick 
       )}
     >
       <div className="flex items-center gap-2">
-        <span className={cn("shrink-0", CLI_BRAND_COLOR[resolveIconId(w.cli, ctx.agents)] || "text-[var(--color-fg-faint)]")}>
-          <CliIcon cli={resolveIconId(w.cli, ctx.agents)} className="h-3.5 w-3.5" />
+        <span className={cn("shrink-0", CLI_BRAND_COLOR[primaryIcon] || "text-[var(--color-fg-faint)]")}>
+          <CliIcon cli={primaryIcon} className="h-3.5 w-3.5" />
         </span>
         <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{label}</span>
         <span className="shrink-0 tabular-nums text-[10.5px] text-[var(--color-fg-faint)]">{ageLabel(w.created, t)}</span>
       </div>
       <div className="flex items-center gap-1.5">
+        <span className="shrink-0 text-[11px] leading-none text-[var(--color-fg-dim)]">
+          {agentDisplayName(w.cli, ctx.agents)}
+        </span>
+        {extraIcons.length > 0 && (
+          <span
+            title={t("board.sessionCount", { count: sessionCount })}
+            className="flex shrink-0 items-center gap-0.5"
+          >
+            {extraIcons.map(id => (
+              <span key={id} className={cn(CLI_BRAND_COLOR[id] || "text-[var(--color-fg-faint)]")}>
+                <CliIcon cli={id} className="h-3 w-3" />
+              </span>
+            ))}
+            <span className="tabular-nums text-[10.5px] text-[var(--color-fg-faint)]">×{sessionCount}</span>
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--color-fg-faint)]">{w.branch}</span>
         <span className="flex shrink-0 items-center gap-1.5">
           <TaskLocationIcon isMainCheckout={w.is_main_checkout} />
+          <TaskSandboxBadge task={w} tabs={tabs} t={t} />
           <TaskPrBadge task={w} />
           {badge && <TaskWorkBadge reason={badge} />}
         </span>
       </div>
     </div>
   );
+}
+
+/** The card's cage badge, the sidebar's precedence verbatim (Docker first -
+ *  Docker tasks store `sandbox_mode: "off"` because the cages are mutually
+ *  exclusive; then YOLO, only a warning OUTSIDE a cage since a cage
+ *  auto-enables it; then the sandbox mode). Colors are live status, so
+ *  `active` follows whether any terminal tab has actually spawned. */
+function TaskSandboxBadge({ task: w, tabs, t }: {
+  task: Task;
+  tabs: Tab[];
+  t: TFunction;
+}) {
+  const mode = effectiveSandboxMode(w);
+  const active = tabs.some(x => x.type === "terminal" && !!x.ptyId);
+  if (w.docker_sandbox_enabled) {
+    return (
+      <span title={t("unifiedBar.sbDockerTip")}>
+        <DockerSandboxIcon active={active} className="h-3 w-3" />
+      </span>
+    );
+  }
+  if (!!w.yolo && !isSandboxEnforced(mode)) {
+    return (
+      <Zap
+        className={cn("h-3 w-3 shrink-0 text-[var(--color-err)]", active ? "opacity-100" : "opacity-40")}
+        fill="currentColor"
+      />
+    );
+  }
+  if (mode !== "off") {
+    return (
+      <span title={sandboxModeText(mode, t).desc}>
+        <SandboxIcon mode={mode} active={active} className="h-3 w-3" />
+      </span>
+    );
+  }
+  return null;
 }
 
 /** The archived column's card: read-only, single-row compact. Restore stays

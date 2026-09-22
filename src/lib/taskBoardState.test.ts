@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   BOARD_STATE_COLUMNS,
   boardCellGroups,
+  boardDropCommand,
   boardLanes,
   taskBoardColumn,
+  taskHasClearableWork,
 } from "./taskBoardState";
 import type { Agent, Tab, Task } from "./types";
 import type { WorkStatePrefs } from "./taskWorkState";
@@ -165,5 +167,75 @@ describe("boardCellGroups", () => {
 describe("BOARD_STATE_COLUMNS", () => {
   it("is the display order: backlog leads, settled closes the lifecycle", () => {
     expect(BOARD_STATE_COLUMNS).toEqual(["backlog", "attention", "working", "review", "settled"]);
+  });
+});
+
+describe("boardDropCommand", () => {
+  // The hooks map is plain data: true = the agent reports its own state, so
+  // a user gesture may not clear its spinner.
+  const hooks = { claude: true };
+
+  it("the archived column archives through any source", () => {
+    expect(boardDropCommand("settled", "archived", task(), [], hooks)).toEqual({ kind: "archive" });
+    expect(boardDropCommand("backlog", "archived", task(), [], hooks)).toEqual({ kind: "archive" });
+  });
+
+  it("a drop on settled settles only when there is something to clear", () => {
+    // Attention unread, done, and a terminal-read spinner all clear.
+    expect(boardDropCommand("attention", "settled", task(),
+      [tab({ unread: { reason: "attention" } })], hooks)).toEqual({ kind: "settle" });
+    expect(boardDropCommand("attention", "settled", task(),
+      [tab({ workState: "done" })], hooks)).toEqual({ kind: "settle" });
+    expect(boardDropCommand("review", "settled", task(),
+      [tab({ workState: "working" })], {})).toEqual({ kind: "settle" });
+    // Nothing clearable: snap back rather than a command that does nothing.
+    expect(boardDropCommand("backlog", "settled", task(), [], hooks)).toBeNull();
+    expect(boardDropCommand("backlog", "settled", task(), [tab({})], hooks)).toBeNull();
+  });
+
+  it("a hooked agent's live spinner is not clearable", () => {
+    // Same rule as the focus clear: for an agent that reports its own state
+    // the spinner is live truth, and clearing it destroyed state nothing
+    // put back for the rest of the turn. The clearable check reads the TAB's
+    // cli (real terminal tabs carry it), so the fixture tab has to too.
+    expect(boardDropCommand("attention", "settled", task(),
+      [tab({ workState: "working", cli: "claude" })], hooks)).toBeNull();
+  });
+
+  it("a drop on review opens the PR dialog except from review itself or a main checkout", () => {
+    expect(boardDropCommand("settled", "review", task(), [], hooks)).toEqual({ kind: "createPr" });
+    expect(boardDropCommand("backlog", "review", task(), [], hooks)).toEqual({ kind: "createPr" });
+    // Same gate as the review column: a main checkout never polls a PR, so
+    // a created one could never move the card again.
+    expect(boardDropCommand("settled", "review", task({ is_main_checkout: true }), [], hooks)).toBeNull();
+    // The card is already in review: a drop there is not a command.
+    expect(boardDropCommand("review", "review", task(), [], hooks)).toBeNull();
+  });
+
+  it("terminal columns and same-column drops are never commands", () => {
+    for (const target of ["backlog", "working", "attention"] as const) {
+      expect(boardDropCommand("settled", target, task(), [tab({ workState: "done" })], hooks)).toBeNull();
+    }
+    expect(boardDropCommand("settled", "settled", task(), [tab({ workState: "done" })], hooks)).toBeNull();
+    expect(boardDropCommand("attention", "attention", task(),
+      [tab({ unread: { reason: "attention" } })], hooks)).toBeNull();
+  });
+});
+
+describe("taskHasClearableWork", () => {
+  it("sees attention, done and a clearable spinner across all terminal tabs", () => {
+    expect(taskHasClearableWork([tab({ unread: { reason: "attention" } })], {})).toBe(true);
+    expect(taskHasClearableWork([tab({ workState: "done" })], {})).toBe(true);
+    expect(taskHasClearableWork([tab({ workState: "working" })], {})).toBe(true);
+    // The signal can sit on any tab, not just the first.
+    expect(taskHasClearableWork([tab({ id: "a", workState: "idle" }), tab({ id: "b", workState: "done" })], {}))
+      .toBe(true);
+  });
+
+  it("non-terminal tabs and clean terminal tabs never count", () => {
+    expect(taskHasClearableWork([{ id: "d", type: "diff", title: "d", unread: { reason: "attention" } } as Tab], {}))
+      .toBe(false);
+    expect(taskHasClearableWork([tab({ workState: "idle" }), tab({})], {})).toBe(false);
+    expect(taskHasClearableWork([], {})).toBe(false);
   });
 });

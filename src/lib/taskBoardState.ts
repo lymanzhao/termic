@@ -82,6 +82,68 @@ export function taskBoardColumn(
   return "settled";
 }
 
+// ── Drop commands ("drag as command") ────────────────────────────────────
+//
+// Columns are derived and never stored, so a drag onto a column cannot SET a
+// status. What a drop can do is perform the real action that column stands
+// for; the derivation then moves the card on its own. The guard below is the
+// SAME one the focus clear in store/app.ts uses - moved here so board and
+// focus share one implementation and this module stays store-free (the caller
+// passes `agentHooksInstalled` as plain data).
+
+/** Can a user gesture (focus, or the board's drop-on-Settled) clear a
+ *  "working" state? Only for agents whose state is READ from their terminal:
+ *  for an agent that reports its own state via hooks the spinner is live
+ *  truth, and clearing it destroyed state nothing put back for the rest of
+ *  the turn. */
+export function visitMayClearWorking(hooksInstalled: Record<string, boolean>, cli: string | undefined): boolean {
+  return !(cli && hooksInstalled[cli] === true);
+}
+
+/** Does this task hold anything a "mark settled" drop would clear? Attention
+ *  counts: `unread` is what the attention column derives from, so clearing it
+ *  is what lets the card fall through to Settled. */
+export function taskHasClearableWork(tabs: Tab[], hooksInstalled: Record<string, boolean>): boolean {
+  return tabs.some(t => t.type === "terminal"
+    && (t.unread != null
+        || t.workState === "done"
+        || (t.workState === "working" && visitMayClearWorking(hooksInstalled, t.cli))));
+}
+
+export type BoardDropCommand =
+  | { kind: "archive" }
+  | { kind: "settle" }
+  | { kind: "createPr" };
+
+/** What a drop of `task` (sitting in `source`) onto `target` means. Null =
+ *  not a drop target, the card snaps back. Cross-column drops only: a drop
+ *  inside the origin group is a reorder the caller resolves first, so
+ *  settled->settled and review->review never read as commands.
+ *
+ *  - archived -> archive, through the shared confirmAndArchive flow
+ *  - settled  -> the focus-clear write on every terminal tab ("I've seen
+ *    this"), only when there is something to clear
+ *  - review   -> open CreatePrDialog, gated the same way the review column
+ *    itself is: a main checkout never polls a PR, so a created one could
+ *    never move the card out of here again */
+export function boardDropCommand(
+  source: BoardColumn,
+  target: BoardColumn,
+  task: Task,
+  tabs: Tab[],
+  hooksInstalled: Record<string, boolean>,
+): BoardDropCommand | null {
+  if (target === "archived") return { kind: "archive" };
+  if (target === source) return null;
+  if (target === "settled") {
+    return taskHasClearableWork(tabs, hooksInstalled) ? { kind: "settle" } : null;
+  }
+  if (target === "review") {
+    return task.is_main_checkout ? null : { kind: "createPr" };
+  }
+  return null;
+}
+
 /** Swimlane order: the agent registry's order first (built-ins lead, and a
  *  user who reordered their agents sees the same order here), then any cli id
  *  the registry does not know (a task outliving a deleted custom agent),
