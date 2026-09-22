@@ -65,6 +65,22 @@ export const HOOK_OSC_SESSION_PREFIX = "session ";
 export const HOOK_OSC_WORKING_BODY = "agent working";
 export const HOOK_OSC_DONE_BODY = "agent done";
 
+/** Prefix of the body that reports work the agent has DELEGATED and not
+ *  finished: `agent delegated: <count> <label> <ids>`. See
+ *  `lib/delegatedWork.ts` for the grammar and the policy, and
+ *  docs/agent-hooks.md "Delegated work" for the measurements.
+ *
+ *  It replaces SILENCE. A done hook that found outstanding work used to exit 0
+ *  having written nothing, and nothing is exactly what a model mid-token looks
+ *  like, so the tab could not tell "still thinking" from "stopped, waiting on a
+ *  subagent" from "stopped, and a dev server will keep it stopped forever".
+ *
+ *  Prefix-matched like `HOOK_OSC_SESSION_PREFIX` rather than exact-matched like
+ *  ready, and routed before `notifyAttention` for the same reason every trusted
+ *  body is: an unrecognised trusted body falls through to a needs-you badge.
+ *  KEEP IN SYNC with `DELEGATED_BODY_PREFIX` in `agent_hooks.rs`. */
+export const HOOK_OSC_DELEGATED_PREFIX = "agent delegated: ";
+
 /** The session id in a trusted `session <uuid>` body, or null.
  *
  *  Validated as a UUID rather than taken verbatim, and that is not politeness:

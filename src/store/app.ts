@@ -2701,8 +2701,21 @@ export const useApp = create<AppState>((set, get) => ({
     // unrecoverable, leaving no spinner for the rest of a long turn until the
     // user clicked the tab. The user-driven exits (keypress in term.onData,
     // focus in setActiveTask) are unchanged and still clear to "idle".
+    //
+    // A SUBMIT ends the stickiness on the spot, whatever the clock says. The
+    // oscillation this guards against happens with nothing in between; a
+    // working signal that follows something the user sent is a new turn, and
+    // holding "done" over it shows a finished badge on an agent that is
+    // visibly working. Measured from termic-workstate-dev.log: done at
+    // :40.238, the user typed at :40.5, the agent's first working hook at
+    // :46.363 was refused as sticky, and the tab claimed done for the two
+    // seconds until the 8s window expired. `lastInputAt` is stamped by every
+    // send path, and nothing the AGENT does touches it, which is what makes
+    // it the right question here. Same test the delegated verdict uses
+    // (lib/delegatedWork.ts).
     const doneAt = cur.workDoneAt ?? 0;
-    if (cur.workState === "done" && state === "working"
+    const askedSince = (cur.lastInputAt ?? 0) > doneAt;
+    if (cur.workState === "done" && state === "working" && !askedSince
         && (doneAt === 0 || Date.now() - doneAt < STICKY_DONE_MS)) {
       logWorkState("refused", `${where} rule=sticky-done ageMs=${doneAt ? Date.now() - doneAt : "never"}`);
       return s;
@@ -2742,7 +2755,11 @@ export const useApp = create<AppState>((set, get) => ({
       } else if (effective === "working") {
         const clearedAt = cur.workClearedAt ?? 0;
         const GRACE_MS = 5_000;
-        if (clearedAt > 0 && Date.now() - clearedAt < GRACE_MS) {
+        // Same exemption, same reason: the grace is for a spinner the user
+        // dismissed re-arming itself, not for the turn they started
+        // afterwards by typing.
+        const askedSinceClear = (cur.lastInputAt ?? 0) > clearedAt;
+        if (clearedAt > 0 && !askedSinceClear && Date.now() - clearedAt < GRACE_MS) {
           effective = "idle";
           // The one that hides a spinner on a task that is still working: the
           // user clicked to dismiss it and a `working` inside the grace window

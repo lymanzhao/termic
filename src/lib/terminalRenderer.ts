@@ -12,6 +12,7 @@ import type { Terminal } from "@xterm/xterm";
 import { usePrefs } from "@/store/prefs";
 import { terminalFontReady, isTerminalFontReady } from "@/lib/terminalFontReady";
 import { keepAtlasCanvasConnected } from "@/lib/atlasCanvasGuard";
+import { guardAtlasPageVersions } from "@/lib/atlasPageVersionGuard";
 import { onReturnFromAway } from "@/lib/userPresence";
 import * as ipc from "@/lib/ipc";
 
@@ -378,7 +379,14 @@ export function loadTerminalRenderer(term: Terminal, log?: RendererLog): { dispo
       a.onContextLoss(() => { note("onContextLoss (xterm, not restored)"); recoverFromContextLoss(a); });
       // Atlas swaps (font/theme/dpr). Microtask: the event fires before the
       // renderer stores the new atlas; its warm-up runs later, on idle.
-      a.onChangeTextureAtlas(() => queueMicrotask(() => { if (!disposed) keepAtlasCanvasConnected(a); }));
+      a.onChangeTextureAtlas(() => queueMicrotask(() => {
+        if (disposed) return;
+        keepAtlasCanvasConnected(a);
+        // A swap hands the renderer a WHOLE NEW TextureAtlas (font size, theme
+        // or dpr change), unguarded and starting its page versions at 0 again.
+        // Re-guarding here is what keeps GH #314 fixed across a Cmd +/-.
+        guardAtlasPageVersions(a);
+      }));
       term.loadAddon(a);
       addon = a;
       retries = 0;
@@ -387,6 +395,9 @@ export function loadTerminalRenderer(term: Terminal, log?: RendererLog): { dispo
       // Initial atlas (born inside loadAddon; fires the event too early for
       // the addon to forward it). Park before the idle warm-up rasterizes.
       keepAtlasCanvasConnected(a);
+      // Same edge for GH #314: guard the pages this atlas already has and
+      // subscribe for the ones it will create.
+      guardAtlasPageVersions(a);
       note("webgl attached");
     } catch (e) {
       // xterm threw before swapping any renderer in, so its DOM renderer

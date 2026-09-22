@@ -41,12 +41,17 @@ const h = vi.hoisted(() => {
       FakeWebglAddon.instances.push(this);
     }
     onContextLoss(cb: () => void) { this.lossCb = cb; }
-    onChangeTextureAtlas() {}
+    // Recorded, not ignored: the atlas-swap guards (scratch canvas, page
+    // versions) hang off this event, and a stub that drops the callback
+    // makes their wiring untestable.
+    atlasCb: (() => void) | null = null;
+    onChangeTextureAtlas(cb: () => void) { this.atlasCb = cb; }
     dispose() { this.disposed = true; }
   }
   class FakeCanvasAddon {
     dispose() {}
   }
+  const guardSpy = vi.fn();
   // happy-dom has no layout, so a real ResizeObserver would never fire. This
   // stub hands the callback back to the test, which is the only way to drive
   // the reveal branch (0 -> non-zero) rather than the focus path beside it.
@@ -65,7 +70,7 @@ const h = vi.hoisted(() => {
   // happen anyway.
   const offs: Array<() => void> = [];
   const prefs = { terminalRenderer: "webgl" as string };
-  return { FakeWebglAddon, FakeCanvasAddon, FakeResizeObserver, offs, prefs };
+  return { FakeWebglAddon, FakeCanvasAddon, FakeResizeObserver, offs, prefs, guardSpy };
 });
 
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: h.FakeWebglAddon }));
@@ -89,6 +94,7 @@ vi.mock("@/lib/terminalFontReady", () => ({
   terminalFontReady: Promise.resolve(),
 }));
 vi.mock("@/lib/atlasCanvasGuard", () => ({ keepAtlasCanvasConnected: () => {} }));
+vi.mock("@/lib/atlasPageVersionGuard", () => ({ guardAtlasPageVersions: h.guardSpy }));
 vi.mock("@/lib/ipc", () => ({}));
 
 import type { Terminal } from "@xterm/xterm";
@@ -149,6 +155,7 @@ describe("loadTerminalRenderer context-loss recovery", () => {
     RO.instances = [];
     h.offs.length = 0;
     h.prefs.terminalRenderer = "webgl";
+    h.guardSpy.mockClear();
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -675,5 +682,57 @@ describe("loadTerminalRenderer context-loss recovery", () => {
     expect(Fake.instances.length).toBe(1);
     window.dispatchEvent(new Event("focus"));
     expect(Fake.instances.length).toBe(1);
+  });
+
+  // GH #314. The guard is what stops a merged atlas page inheriting a texture
+  // unit's cached version and drawing the previous page's bitmap. Its failure
+  // mode is silence: nothing throws, the terminal just garbles again after a
+  // long session, so the WIRING is what has to be pinned here.
+  describe("atlas page version guard wiring (#314)", () => {
+    it("guards the atlas the addon is born with", () => {
+      const term = makeTerm();
+      loadTerminalRenderer(term);
+      expect(h.guardSpy).toHaveBeenCalledWith(Fake.instances[0]);
+    });
+
+    it("re-guards on an atlas SWAP, which is a whole new atlas starting at 0", async () => {
+      const term = makeTerm();
+      loadTerminalRenderer(term);
+      h.guardSpy.mockClear();
+      // Zoom, theme or dpr change: xterm hands the renderer a fresh
+      // TextureAtlas whose page versions restart, so an unguarded one brings
+      // the bug straight back.
+      Fake.instances[0].atlasCb!();
+      await Promise.resolve();  // the handler defers by a microtask
+      expect(h.guardSpy).toHaveBeenCalledWith(Fake.instances[0]);
+    });
+
+    it("does not guard a disposed renderer's swap", async () => {
+      const term = makeTerm();
+      const r = loadTerminalRenderer(term);
+      const addon = Fake.instances[0];
+      r.dispose();
+      h.guardSpy.mockClear();
+      addon.atlasCb!();
+      await Promise.resolve();
+      expect(h.guardSpy).not.toHaveBeenCalled();
+    });
+
+    it("guards the fresh atlas a context-loss rebuild brings with it", () => {
+      const term = makeTerm();
+      loadTerminalRenderer(term);
+      h.guardSpy.mockClear();
+      Fake.instances[0].canvas.dispatchEvent(new Event("webglcontextlost"));
+      vi.advanceTimersByTime(CONTEXT_REATTACH_DELAY_MS);
+      expect(Fake.instances.length).toBe(2);
+      expect(h.guardSpy).toHaveBeenCalledWith(Fake.instances[1]);
+    });
+
+    it("has nothing to guard on the canvas renderer", () => {
+      h.prefs.terminalRenderer = "canvas";
+      const term = makeTerm();
+      loadTerminalRenderer(term);
+      expect(h.guardSpy).not.toHaveBeenCalled();
+    });
   });
 });

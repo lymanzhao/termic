@@ -13,7 +13,7 @@ import { TaskWorkBadge } from "@/components/TaskWorkBadge";
 import { TaskPrBadge } from "@/components/TaskPrBadge";
 import { GroupActionsMenuItems } from "@/components/sidebar/GroupActionsMenuItems";
 import { taskLabel } from "@/lib/taskLabel";
-import { taskWorkBadge } from "@/lib/taskWorkState";
+import { taskWorkBadge, taskDelegatedWork } from "@/lib/taskWorkState";
 import { groupOf, projectSections, sortSectionsActiveFirst } from "@/lib/projectGroups";
 import { accentCss } from "@/lib/accents";
 import { projectSetGroup } from "@/lib/ipc";
@@ -67,8 +67,9 @@ export function Dashboard() {
   // that actually differs between rows.
   const useBranchAsTaskName = usePrefs(s => s.useBranchAsTaskName);
   const settledHighlight    = usePrefs(s => s.settledHighlight);
+  const attentionIndicator  = usePrefs(s => s.attentionIndicator);
   const workingIndicator    = usePrefs(s => s.workingIndicator);
-  const rowCtx: TaskRowContext = { agents, useBranchAsTaskName, workPrefs: { settledHighlight, workingIndicator } };
+  const rowCtx: TaskRowContext = { agents, useBranchAsTaskName, workPrefs: { settledHighlight, workingIndicator, attentionIndicator } };
 
   const hasActiveTask = (projId: string) =>
     tasks.some(w => w.project_id === projId && !w.archived);
@@ -311,6 +312,11 @@ function DashboardTaskRow({ task: w, ctx }: { task: Task; ctx: TaskRowContext })
   // Same helper, same precedence as the sidebar (attention > done > working),
   // so one task can never wear two different badges on two surfaces.
   const badge = taskWorkBadge(tabs, ctx.workPrefs);
+  // Passed so the dashboard draws the same mark the sidebar does: the ring
+  // for delegated work, the outlined dot when some of it came back. Without
+  // it the same task reads as a plain spinner here and a ring there, which is
+  // the drift `taskWorkBadge` exists to prevent.
+  const held = taskDelegatedWork(tabs, ctx.workPrefs);
 
   return (
     // A div with a button role, not a <button>: the PR chip is itself a button
@@ -362,7 +368,7 @@ function DashboardTaskRow({ task: w, ctx }: { task: Task; ctx: TaskRowContext })
           resolved and never kicks a fetch of its own. */}
       <span className="ml-auto flex shrink-0 items-center gap-2 pl-2">
         <TaskPrBadge task={w} />
-        {badge && <TaskWorkBadge reason={badge} />}
+        {badge && <TaskWorkBadge reason={badge} delegated={held} />}
       </span>
     </div>
   );
@@ -377,6 +383,11 @@ function RecentChip({ task: w, ctx, projectName, onOpen }: {
   const tabs = useApp(selectTaskTabs(w.id));
   const { agents, useBranchAsTaskName } = ctx;
   const badge = taskWorkBadge(tabs, ctx.workPrefs);
+  // Passed so the dashboard draws the same mark the sidebar does: the ring
+  // for delegated work, the outlined dot when some of it came back. Without
+  // it the same task reads as a plain spinner here and a ring there, which is
+  // the drift `taskWorkBadge` exists to prevent.
+  const held = taskDelegatedWork(tabs, ctx.workPrefs);
   return (
     <button
       data-dashboard-recent-task-id={w.id}
@@ -391,7 +402,7 @@ function RecentChip({ task: w, ctx, projectName, onOpen }: {
         <CliIcon cli={resolveIconId(w.cli, agents)} className="h-3.5 w-3.5" />
       </span>
       <span className="min-w-0 truncate font-medium">{taskLabel(w, useBranchAsTaskName)}</span>
-      {badge && <TaskWorkBadge reason={badge} />}
+      {badge && <TaskWorkBadge reason={badge} delegated={held} />}
     </button>
   );
 }

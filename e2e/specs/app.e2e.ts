@@ -566,6 +566,44 @@ describe("more dialogs open", () => {
     });
   });
 
+  // The wizard opens on the LAYOUT step, and its last step is still the
+  // project picker that carries Finish. Both halves matter: the step was
+  // inserted at the front, which renumbers every other one, and an off-by-one
+  // there shows the wrong body or strands the Finish button on a step nobody
+  // reaches. Also the only place the worktree explanation is guaranteed to be
+  // seen, which is why it goes first.
+  it("opens on the layout step, and finishes on the last step that has content", async () => {
+    await browser.execute(() => window.__termic!.useUI.getState().openWelcome());
+    await waitForText("Welcome to Termic");
+    await waitForText("is one piece of work inside it");
+    // The distinction the step exists for, in the words a user needs: a
+    // worktree is a folder, not a way of making a branch.
+    await waitForText("Worktree");
+    await waitForText("Main checkout");
+    await snap("welcome-layout-step.png");
+
+    // Jump to the last pip rather than clicking Next four times: the pips are
+    // the thing the renumbering would break, and this asserts the count too.
+    const pips = await browser.execute(() =>
+      [...document.querySelectorAll('[aria-label^="Step "]')].map(
+        el => el.getAttribute("aria-label")),
+    );
+    // FOUR, not five. The wizard opens with no repos directory set, so it
+    // has nothing to suggest and drops the project picker rather than
+    // showing a step whose only content is "nothing to suggest". The finish
+    // button moves onto the step before it.
+    expect(pips).toEqual(["Step 1", "Step 2", "Step 3", "Step 4"]);
+    await clickWhenVisible('[aria-label="Step 4"]');
+    await waitForText("Pick your theme");
+    await waitForText("Get started");
+
+    await browser.execute(() => window.__termic!.useUI.getState().closeWelcome());
+    await browser.waitUntil(async () => (await flag("welcomeOpen")) === false, {
+      timeout: 5_000,
+      timeoutMsg: "welcome never closed",
+    });
+  });
+
   it("race dialog opens for a project", async () => {
     await browser.execute(() => {
       const proj = window.__termic!.useApp
@@ -968,7 +1006,15 @@ describe("history view", () => {
     await openHistory();
 
     const box = await listBox();
-    expect(box.rows).toBeGreaterThan(first.rows);
+    // Only when this run actually added rows. The profile is reused between
+    // `make e2e` runs and every spec archives its tasks, so on a machine that
+    // has run the suite a few times the archive is ALREADY taller than the
+    // window, `need` comes out <= 0, and "more rows than before" is a
+    // condition nothing in this test can satisfy. It failed that way at 29
+    // rows against 29. What the case is actually about is the two assertions
+    // below, which hold either way.
+    if (need > 0) expect(box.rows).toBeGreaterThan(first.rows);
+    expect(box.rows).toBeGreaterThanOrEqual(first.rows);
     // Content genuinely overflows, and the overflow lives in the SCROLLER (not
     // spilling out of the window).
     expect(box.scrollHeight).toBeGreaterThan(box.clientHeight);

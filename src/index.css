@@ -668,6 +668,54 @@ html.termic-mod-held .xterm .xterm-cursor-pointer { cursor: pointer; }
   animation: termic-progress-indeterminate 1.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
 
+/* Background-work ring (BackgroundRing.tsx): an agent that has stopped
+   generating and is waiting on something it delegated. Deliberately NOT the
+   working spinner, which turns once a second and says "a model is running
+   right now". This can be true for hours while nothing is being computed, so
+   it has to read as alive without reading as busy.
+
+   It TURNS, and the reason is phase. Every animation starts when its element
+   mounts, so several of these on screen are always out of step with each
+   other, and there is no cheap way to make CSS animations share a clock. A
+   breathing version made that visible and ugly: four rings at four different
+   brightnesses read as four different states, a semaphore rather than one
+   repeated mark. Rotation has no such problem, because eight evenly spaced
+   dashes are rotationally symmetric: two rings at different angles are the
+   SAME picture, so phase drift is invisible by construction.
+
+   8s per turn. The eye does not see the turn, it sees a dash arrive where
+   its neighbour was, which is an eighth of it: one second, the spinner's own
+   beat at an eighth of its speed. 12s put that beat at 1.5s and the ring
+   looked frozen; 4s put it at half a second and it looked hurried.
+
+   Rotation via the `rotate` PROPERTY, never `transform`. Anything that also
+   carries a static transform (a `translate3d` for pixel snapping, say) makes
+   the implicit `from` that transform, the `to` a rotate, the two different
+   transform lists, so the engine interpolates matrices, and the matrix of a
+   360 degree rotation IS the identity. Identity to identity: an animation
+   that looks right everywhere except on screen. `rotate` composes with
+   `transform` instead of replacing it. */
+@keyframes termic-drift {
+  from { rotate: 0deg; }
+  to   { rotate: 360deg; }
+}
+.termic-drift {
+  animation: termic-drift 8s linear infinite;
+}
+/* The working spinner, on the same keyframes at eight times the speed. One
+   turn a second is the pace everything else on a desktop spins at, and
+   sharing the keyframes is what keeps the two marks from drifting apart in
+   how they are built. */
+.termic-spin {
+  animation: termic-drift 1s linear infinite;
+}
+/* Reduced motion stops it. The SHAPE is what says "background work"; the
+   turn only says "still", and a static dashed ring still reads as the mark
+   it is. */
+@media (prefers-reduced-motion: reduce) {
+  .termic-drift { animation: none; }
+}
+
 /* Drop-target ring — applied to a terminal host while a file is dragged over
    it (see src/lib/terminalDrop.ts). Inset box-shadow paints a ring WITHOUT
    affecting layout, so it can't perturb xterm's fit()/cell grid mid-drag. */

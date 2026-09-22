@@ -22,6 +22,8 @@ import { TabContextMenu } from "./TabContextMenu";
 import { focusMainTab } from "@/lib/tabFocus";
 import { visibleCliIds, agentDisplayName, isTerminalEntry } from "@/lib/agents";
 import { cn } from "@/lib/utils";
+import { delegatedTitle } from "@/lib/delegatedWork";
+import { BackgroundRing } from "@/components/ui/BackgroundRing";
 import { formatTerminalTitle } from "@/lib/terminalTitle";
 import { fileIconUrl, folderIconUrl } from "@/lib/explorer/iconResolver";
 
@@ -345,16 +347,43 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
   // The "working" state is force-cleared by TerminalPane's demoters /
   // absolute ceiling, so the spinner can't spin forever.
   const workingIndicator = usePrefs(s => s.workingIndicator);
+  // Its own opt-out (Settings -> Notifications). Off falls back to the
+  // background-work ring, because the turn is still not over.
+  const partialDoneIndicator = usePrefs(s => s.partialDoneIndicator);
+  // The tab strip used to draw done and the bell whatever these said, so
+  // turning them off quietened the sidebar and left the strip lit.
+  const settledHighlight = usePrefs(s => s.settledHighlight);
+  const attentionIndicator = usePrefs(s => s.attentionIndicator);
   // Failed run/setup tab (GH #54 + exit-code plumbing): the script exited
   // non-zero. Outranks everything else — a red flag on a background setup
   // tab is the whole point of surfacing it without stealing focus.
   const showFailed  = tab.type === "terminal" && !!(tab as TerminalTab).runTab?.failed;
-  const showBell    = !showFailed && reason === "attention";
-  const showDone    = !showFailed && !showBell && workState === "done";
+  const showBell    = attentionIndicator && !showFailed && reason === "attention";
+  const showDone    = settledHighlight && !showFailed && !showBell && workState === "done";
   const showWorking = workingIndicator && !showFailed && !showBell && !showDone && workState === "working";
+  // Work the agent delegated and has not finished (lib/delegatedWork.ts). It
+  // qualifies the badge rather than replacing it: with `working` it says the
+  // model loop has STOPPED and the spinner is waiting on a subagent, not
+  // thinking; with `done` it says the turn ended and left a shell running.
+  const delegated = tab.type === "terminal" ? tab.delegatedWork : null;
+  const delegatedText = delegated ? delegatedTitle(delegated, tChrome) : "";
+  // Some of it came back, the rest runs on. Outranks done (it is the more
+  // accurate statement about the same moment) but never a bell.
+  const showPartial = workingIndicator && partialDoneIndicator && !showFailed && !showBell && !!delegated?.partial;
+  // The turn is over and something it started is still running. Lowest
+  // priority in the chain below: it draws only in a slot nothing else wanted,
+  // and it is a hollow ring rather than the done bullet because the done was
+  // already announced. Without it the decoration is invisible in the common
+  // case, since a done on the tab you are WATCHING is acknowledged straight to
+  // idle and idle draws no badge at all.
+  const showDelegated = workingIndicator && !showFailed && !showBell && !showDone && !showWorking && !!delegated;
+  // The ring stands in for the spinner whenever the agent is only WAITING on
+  // delegated work: its own loop has stopped, so a spinner claims a model is
+  // running. See `BackgroundRing`.
+  const ringInsteadOfSpinner = showWorking && !!delegated && !showPartial;
   // Something already occupies the trailing slot at rest, so the action button
   // (close ×, or the pin on a pinned tab) waits for hover.
-  const slotTaken = showFailed || showBell || showDone || showWorking || !!tab.dirty;
+  const slotTaken = showFailed || showBell || showDone || showWorking || showDelegated || showPartial || !!tab.dirty;
   const iconId = tab.type === "terminal" ? resolveIconId(tab.cli, agents) : "";
   const color = tab.type === "terminal" ? CLI_BRAND_COLOR[iconId] : "text-[var(--color-fg-dim)]";
   const isRenaming = renaming !== null;
@@ -495,7 +524,18 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
         // flex pill — without min-w-0 the span keeps its intrinsic
         // width and pushes the pill larger, defeating the fixed-cell
         // layout. Title attr surfaces the full text on hover.
-        <span className={cn("min-w-0 flex-1 truncate", tab.preview && "italic")} title={tab.liveTitle && !tab.customTitle ? tab.liveTitle : undefined}>
+        // The work state rides the TITLE, not the badge, and that is not a
+        // convenience. The badge sits in a slot the close button takes over on
+        // hover (`group-hover:opacity-0` below), so its own tooltip can never
+        // be reached by a pointer: you hover the mark and get "Close tab". The
+        // name is the one part of the pill nothing covers.
+        <span
+          className={cn("min-w-0 flex-1 truncate", tab.preview && "italic")}
+          title={[
+            tab.liveTitle && !tab.customTitle ? tab.liveTitle : "",
+            delegatedText,
+          ].filter(Boolean).join("\n") || undefined}
+        >
           {visibleTitle}
         </span>
       )}
@@ -546,7 +586,7 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
           Priority: failed > attention > done > dirty > none. */}
       {!isRenaming && (
         <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
-          {(showFailed || showBell || showDone || showWorking) ? (
+          {(showFailed || showBell || showDone || showWorking || showDelegated || showPartial) ? (
             <span
               // DOM hook for the e2e suite. The badge is the user-visible
               // proof of a tab's work state, so specs assert on this instead
@@ -554,9 +594,17 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
               // in sync with the priority chain above.
               data-testid="work-badge"
               data-work-state={
-                showFailed ? "failed" : showBell ? "attention" : showDone ? "done" : "working"
+                showFailed ? "failed" : showBell ? "attention" : showPartial ? "partial"
+                  : showDone ? "done" : showWorking ? "working" : "delegated"
               }
-              className="absolute inset-0 flex items-center justify-center transition-opacity group-hover:opacity-0"
+              // Separate attribute, not a fifth `data-work-state`: it can
+              // accompany either of two states and specs assert on both.
+              data-delegated={delegated ? delegated.label : undefined}
+              // Own compositing layer for good, not just while the
+              // transition runs: WebKit snaps a layer to whole pixels, so a
+              // badge at a fractional offset jumps when one appears on
+              // hover. See the sidebar's copies and Dialog's content box.
+              className="absolute inset-0 flex items-center justify-center transition-opacity group-hover:opacity-0 [transform:translate3d(0,0,0)]"
             >
               {showFailed && (
                 <span className="text-[var(--color-err)]" title={t("tabBar.failedTip")}>
@@ -568,17 +616,50 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
                   <Bell className="h-3.5 w-3.5" strokeWidth={2.5} />
                 </span>
               )}
-              {showDone && (
-                <span title={tChrome("taskWorkBadge.done")} aria-label={tChrome("taskWorkBadge.doneAria")}>
+              {showPartial && (
+                <span
+                  title={delegatedText}
+                  aria-label={delegatedText}
+                >
+                  <span
+                    className="block h-2 w-2 rounded-full border-[1.5px]"
+                    style={{ borderColor: "var(--color-info)" }}
+                  />
+                </span>
+              )}
+              {!showPartial && showDone && (
+                <span
+                  title={delegatedText
+                    ? tChrome("taskWorkBadge.doneDelegatedRunning", { held: delegatedText })
+                    : tChrome("taskWorkBadge.done")}
+                  aria-label={tChrome("taskWorkBadge.doneAria")}
+                >
                   <span
                     className="block h-2 w-2 rounded-full"
                     style={{ backgroundColor: "var(--color-info)" }}
                   />
                 </span>
               )}
-              {showWorking && (
-                <span className="text-[var(--color-fg-faint)]" title={tChrome("taskWorkBadge.working")} aria-label={tChrome("taskWorkBadge.workingAria")}>
-                  <Spinner size={14} />
+              {showDelegated && !showPartial && (
+                <span
+                  className="text-[var(--color-fg-faint)]"
+                  title={delegatedText}
+                  aria-label={delegatedText}
+                >
+                  <BackgroundRing size={14} />
+                </span>
+              )}
+              {showWorking && !showPartial && (
+                <span
+                  className="text-[var(--color-fg-faint)]"
+                  title={ringInsteadOfSpinner ? delegatedText : tChrome("taskWorkBadge.working")}
+                  aria-label={ringInsteadOfSpinner ? delegatedText : tChrome("taskWorkBadge.workingAria")}
+                >
+                  {/* The ring, not the spinner, whenever the model has stopped
+                      and only delegated work is outstanding. A turn waiting on
+                      a monitoring agent can run for hours, and a 1s spinner
+                      reads as a hang long before that. */}
+                  {ringInsteadOfSpinner ? <BackgroundRing size={14} /> : <Spinner size={14} />}
                 </span>
               )}
             </span>

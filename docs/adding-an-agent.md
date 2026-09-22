@@ -55,6 +55,13 @@ agent doing it again.
 - **`resume_args`** — the cwd-based resume. Right for a worktree; see §2.
 - **`session_id_args` / `resume_id_args`** — see §2. Getting this wrong is
   invisible until two tasks share a conversation.
+- **`resume_picker_args`** — the args that open the agent's OWN session
+  picker (claude: `--resume` with no id). Opened when a stored id fails to
+  resume, instead of a fresh session (GH #311). Measure three things before
+  filling it: the picker actually opens with termic's `name_args` after it,
+  picking a session makes the agent REPORT the id (a hook, §5, so the next
+  relaunch resumes it), and leaving the picker exits (termic then starts a
+  fresh session once). Empty is the honest default until measured.
 - **`sandbox_allowed_paths`** — see §4. These grant **`file-write*`**.
 - **`signals`** — leave empty unless you have CAPTURED titles (§3).
 
@@ -206,6 +213,20 @@ share one cwd, so "resume the last session here" is another task's conversation.
 3. **Neither**. `resume_args` only; repo-root tasks start fresh. agy used to
    be here, until its hook proved it could report `conversationId`: it is now
    a capture agent (`--conversation {UUID}`), learned the codex way.
+
+**When a stored id stops resolving** (the transcript was deleted, the id was
+never written, or claude holds it as a background session), the resume exits
+within `RESUME_FAILURE_MS`. With `resume_picker_args` the next spawn opens the
+agent's picker and the toast carries the agent's own reason, read from the raw
+output of that first window (`lib/resumeTail.ts`: xterm's buffer can lag the
+exit, Rust drains every byte before emitting it). Without one, a fresh session,
+as before. There used to be a "Resume it" banner here; it outlived the failure
+and came back on every relaunch, which is why this is a toast and the agent's
+own picker rather than anything termic keeps on screen.
+
+Measured on claude 2.1.278: `--resume --name <task>` opens the picker; picking
+fires `SessionStart` with `source: resume`, the chosen id and entrypoint `cli`,
+which the READY hook reports; Esc exits 1 with no `SessionStart`.
 
 **The id is not always a UUID.** devin's is a slug (`brassy-polish`). The TS
 parser (`hookOscSessionId`) and the hook's charset guard both have to accept

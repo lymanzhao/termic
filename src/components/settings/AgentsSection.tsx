@@ -1081,6 +1081,12 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
             />
           </Field>
         </div>
+        <Field label={t("agents.card.resumePickerLabel")} hint={t("agents.card.resumePickerHint")}>
+          <ArgsInput value={agent.capabilities?.resume_picker_args || []}
+            onChange={resume_picker_args => onPatchCaps({ resume_picker_args })}
+            className="font-mono" placeholder={inheritedPlaceholder(inherited, a => a.capabilities?.resume_picker_args, "--resume")}
+          />
+        </Field>
         <Field label={t("agents.card.nameArgsLabel")} hint={t("agents.card.nameArgsHint")}>
           <ArgsInput value={agent.capabilities?.name_args || []}
             onChange={name_args => onPatchCaps({ name_args })}

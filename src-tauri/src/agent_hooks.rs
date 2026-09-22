@@ -100,7 +100,15 @@ use std::path::{Path, PathBuf};
 // v14 bounds every terminal write (`bound_emits`): a hook blocked writing to a
 // dead tab's pty held the tty lock and hung every new claude. Stale-and-
 // harmful: a v13 install can still wedge.
-pub const SCHEMA_VERSION: u32 = 14;
+// v15 makes a HELD done speak. Every done guard that withholds (claude's
+// `background_tasks`, grok's `backgroundTasks`, agy's `fullyIdle`) used to
+// `exit 0` writing nothing, which is byte-for-byte what a model mid-token
+// writes; it now reports `agent delegated: <count> <label> <ids>`. Stale-and-
+// harmful: a v14 install keeps the silent script, so a tab whose agent left a
+// shell running spins until the 20-minute ceiling and every later turn in
+// that session is swallowed too. That is the whole bug, so an install that
+// does not re-sync does not get the fix.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Directory we create inside the agent's config dir. Also the prefix that
 /// identifies our entries for removal, which is why it must never be renamed
@@ -240,6 +248,66 @@ const READY_BODY: &str = "agent ready for input";
 /// `lib/agentHooks.ts`.
 const WORKING_BODY: &str = "agent working";
 const DONE_BODY: &str = "agent done";
+
+/// Prefix of the body reporting work the agent DELEGATED and has not finished,
+/// `agent delegated: <count> <label> <ids>`. It replaces the `exit 0` the done
+/// guard used to take, which wrote nothing at all and was therefore
+/// indistinguishable from a model mid-token. KEEP IN SYNC with
+/// `HOOK_OSC_DELEGATED_PREFIX` in `lib/agentHooks.ts`.
+const DELEGATED_BODY_PREFIX: &str = "agent delegated: ";
+
+/// claude's task types, in the order the label is chosen, mapped to the wire
+/// labels `lib/delegatedWork.ts` accepts. AGENT-OWNED types come first, and
+/// that ordering is the policy: a payload holding both a subagent and a shell
+/// is an agent waiting on its subagent, not one that has handed back. `shell`
+/// is last for the same reason.
+///
+/// Absent, and deliberately: `monitor` / `monitor_ws` (an artifact watch that
+/// never ends), `dream`, `auto-mode scan`, and any type a future release adds.
+/// An unrecognised type reports nothing outstanding and the turn is done, which
+/// is the direction to fail in once hooks own a tab.
+/// Appended to every done guard that can report a hold, claude's and grok's
+/// alike: both payloads spell an entry's id `"id":"..."`, and the ids are what
+/// termic compares one turn's outstanding set against the last one's.
+///
+/// Shared rather than copied because the two guards differ only in the KEY
+/// they slice (`background_tasks` vs grok's camelCase `backgroundTasks`) and
+/// the type spellings they know. Everything after `$tasks` is set is identical,
+/// and two copies of a shell loop is two things to fix.
+const DELEGATED_IDS: &str = concat!(
+    "# The ids of everything outstanding. termic compares one turn's set\n",
+    "# against the last one's: work that was already outstanding cannot be\n",
+    "# what THIS turn is waiting on, which is how a shell left running stops\n",
+    "# holding every later turn open. Ids only, never displayed, and anything\n",
+    "# that is not plainly an id is dropped.\n",
+    "if [ -n \"$dlg\" ]; then\n",
+    "  ids=''\n",
+    "  rest=$tasks\n",
+    "  i=0\n",
+    "  while [ \"$i\" -lt 20 ]; do\n",
+    "    case \"$rest\" in\n",
+    "      *'\"id\":\"'*) rest=${rest#*'\"id\":\"'}; id=${rest%%'\"'*} ;;\n",
+    "      *) break ;;\n",
+    "    esac\n",
+    "    i=$((i+1))\n",
+    "    case \"$id\" in ''|*[!0-9A-Za-z_-]*) continue ;; esac\n",
+    "    ids=\"$ids,$id\"\n",
+    "  done\n",
+    "  ids=${ids#,}\n",
+    "  [ -n \"$ids\" ] || ids='-'\n",
+    "  dlg=\"$dlg $ids\"\n",
+    "fi\n",
+);
+
+#[cfg(test)]
+const DELEGATED_LABELS: [(&str, &str); 6] = [
+    ("subagent", "subagent"),
+    ("workflow", "workflow"),
+    ("teammate", "teammate"),
+    ("cloudsession", "cloud_session"),
+    ("MCPtask", "mcp_task"),
+    ("shell", "shell"),
+];
 
 /// Prefix of the body that reports subscription usage (GH #277). Written by the
 /// STATUS LINE, not by a hook, but it rides the same OSC 777 channel and the
@@ -861,15 +929,31 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
             "# Only DELEGATED work means the agent itself is still going. An\n",
             "# ambient monitor (an artifact watch) never ends, so it must not\n",
             "# hold the turn open. Unknown types fall through to done.\n",
+            "dlg=''\n",
             "case \"$flat\" in\n",
             "  *'\"background_tasks\":['*)\n",
             "    tasks=${flat##*'\"background_tasks\":['}\n",
             "    tasks=${tasks%%]*}\n",
-            "    case \"$tasks\" in\n",
-            "      *'\"type\":\"subagent\"'*|*'\"type\":\"workflow\"'*|\\\n",
-            "      *'\"type\":\"shell\"'*|*'\"type\":\"teammate\"'*|\\\n",
-            "      *'\"type\":\"cloudsession\"'*|*'\"type\":\"MCPtask\"'*) exit 0 ;;\n",
-            "    esac\n",
+            "    # Agent-owned types first: a payload holding a subagent AND\n",
+            "    # the shell that subagent backgrounded is an agent waiting on\n",
+            "    # its subagent, and must be labelled as one.\n",
+            "    for pair in 'subagent subagent' 'workflow workflow' \\\n",
+            "                'teammate teammate' 'cloudsession cloud_session' \\\n",
+            "                'MCPtask mcp_task' 'shell shell'; do\n",
+            "      key=${pair%% *}\n",
+            "      n=0\n",
+            "      rest=$tasks\n",
+            "      while :; do\n",
+            "        case \"$rest\" in\n",
+            "          *'\"type\":\"'\"$key\"'\"'*)\n",
+            "            rest=${rest#*'\"type\":\"'\"$key\"'\"'}\n",
+            "            n=$((n+1))\n",
+            "            ;;\n",
+            "          *) break ;;\n",
+            "        esac\n",
+            "      done\n",
+            "      if [ \"$n\" -gt 0 ]; then dlg=\"$n ${pair#* }\"; break; fi\n",
+            "    done\n",
             "    ;;\n",
             "esac\n",
         ),
@@ -951,11 +1035,71 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
             "  *[!0-9a-fA-F-]*) sid='' ;;\n",
             "esac\n",
         ),
+        // grok reports the same thing claude does, in camelCase, and says so
+        // itself. From the hooks reference embedded in the 1.0.40 binary:
+        // "`Stop` input also carries `backgroundTasks` and `sessionCrons`, so a
+        // hook can distinguish 'session is done' from 'session is paused
+        // waiting for background work to wake it back up'", each entry
+        // carrying `id`, `type` (`shell`, `monitor`, or `subagent`), `status`,
+        // and `agentType`. It also states the difference from claude outright:
+        // "`backgroundTasks[].type` is only `shell`, `monitor`, or `subagent`;
+        // Claude's other labels (`workflow`, `teammate`, ...)" do not occur.
+        //
+        // So `monitor` is the ambient type here, the same trap claude's
+        // `monitor_ws` is, and it is excluded for the same reason: a watch
+        // outlives every turn.
+        //
+        // Read out of the shipped binary's own documentation, NOT yet observed
+        // on a live wire, which is a weaker provenance than everything else in
+        // this file. It is safe at that strength and a guessed EVENT would not
+        // be: an absent field leaves `$dlg` empty and the script emits the
+        // plain done it emits today, so the failure mode is no change at all.
+        // The probe that would settle it is in docs/agent-hooks.md.
+        //
+        // Gated on `Stop`. One script serves `StopCancelled` too (see
+        // `hooks_for`), and that one is an INTERRUPT: the turn is over
+        // whatever is still in flight, so it must never report a hold. The
+        // closing quote in the pattern is what keeps `"Stop"` from matching
+        // `"StopCancelled"`.
+        ("grok", Signal::Done) => concat!(
+            "flat=$(cat | tr -d '[:space:]')\n",
+            "dlg=''\n",
+            "tasks=''\n",
+            "case \"$flat\" in\n",
+            "  *'\"hook_event_name\":\"Stop\"'*)\n",
+            "    case \"$flat\" in\n",
+            "      *'\"backgroundTasks\":['*)\n",
+            "        tasks=${flat##*'\"backgroundTasks\":['}\n",
+            "        tasks=${tasks%%]*}\n",
+            "        for pair in 'subagent subagent' 'shell shell'; do\n",
+            "          key=${pair%% *}\n",
+            "          n=0\n",
+            "          rest=$tasks\n",
+            "          while :; do\n",
+            "            case \"$rest\" in\n",
+            "              *'\"type\":\"'\"$key\"'\"'*)\n",
+            "                rest=${rest#*'\"type\":\"'\"$key\"'\"'}\n",
+            "                n=$((n+1))\n",
+            "                ;;\n",
+            "              *) break ;;\n",
+            "            esac\n",
+            "          done\n",
+            "          if [ \"$n\" -gt 0 ]; then dlg=\"$n ${pair#* }\"; break; fi\n",
+            "        done\n",
+            "        ;;\n",
+            "    esac\n",
+            "    ;;\n",
+            "esac\n",
+        ),
         ("agy", Signal::Done) => concat!(
             "flat=$(cat | tr -d '[:space:]')\n",
             "# agy states it outright: anything but true means work continues.\n",
+            "# It does not say WHAT is outstanding, so the generic label, and no\n",
+            "# ids: with nothing to compare, termic always reads it as new work\n",
+            "# and waits for agy rather than announcing over it.\n",
+            "dlg=''\n",
             "case \"$flat\" in\n",
-            "  *'\"fullyIdle\":false'*) exit 0 ;;\n",
+            "  *'\"fullyIdle\":false'*) dlg='1 work -' ;;\n",
             "esac\n",
         ),
         // Name the tool in the ATTENTION body, because this hook is the signal
@@ -1127,6 +1271,16 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
         _ => "",
     };
 
+    // The id list is the same in both dialects, so it is appended rather than
+    // written twice. agy is absent on purpose: it reports that work exists
+    // without naming any, so there is nothing to compare and its report stays
+    // `1 work -` (see `delegatedVerdict`, which then always reads it as new).
+    let guard = if matches!((agent, sig), ("claude", Signal::Done) | ("grok", Signal::Done)) {
+        format!("{guard}{DELEGATED_IDS}")
+    } else {
+        guard.to_string()
+    };
+
     // Every agent writes straight to the terminal termic handed it. See
     // `uses_terminal_sequence` for why claude does not use its own channel.
     //
@@ -1199,6 +1353,29 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
             "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
              if [ -n \"$ctx\" ]; then\n\
                emit() {{ printf '\\033]{done}\\007\\033]{NOTIFY_PREFIX}{CONTEXT_BODY_PREFIX}%s\\007' \"$ctx\" > \"$1\" 2>/dev/null; }}\n\
+             else\n\
+               emit() {{ printf '\\033]{done}\\007' > \"$1\" 2>/dev/null; }}\n\
+             fi\n\
+             emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true",
+            done = Signal::Done.payload()
+        )
+    } else if matches!((agent, sig),
+        ("claude", Signal::Done) | ("agy", Signal::Done) | ("grok", Signal::Done)) {
+        // The done guard used to `exit 0` here, writing nothing. Nothing is
+        // what a model mid-token also writes, so a tab could not tell a turn
+        // still running from a turn that ended while a `sleep 900` it
+        // backgrounded kept its `Stop` payload populated for the rest of the
+        // session. It now reports what is outstanding and lets termic decide
+        // (`lib/delegatedWork.ts`), which is the same division of labour as
+        // everywhere else here: the script reads the protocol, the state
+        // machine sets policy.
+        //
+        // `%s` again, never the format string: `$dlg` is built from an
+        // agent-controlled payload.
+        format!(
+            "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
+             if [ -n \"$dlg\" ]; then\n\
+               emit() {{ printf '\\033]{NOTIFY_PREFIX}{DELEGATED_BODY_PREFIX}%s\\007' \"$dlg\" > \"$1\" 2>/dev/null; }}\n\
              else\n\
                emit() {{ printf '\\033]{done}\\007' > \"$1\" 2>/dev/null; }}\n\
              fi\n\
@@ -3456,7 +3633,6 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
             .arg(&script)
             .env("TERMIC_TASK_ID", "t1")
             .env("TERMIC_PTY", &pty)
-            .env_remove("GROK_HOOK_EVENT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3971,6 +4147,27 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         }
     }
 
+    // Same contract as the usage body, one signal along. The delegated report
+    // shares OSC 777 and the trusted `termic` title with ready, attention and
+    // the session id, and the handler routes them apart on the body alone.
+    #[test]
+    fn the_delegated_body_is_not_confusable_with_the_other_signals() {
+        for other in [ATTENTION_BODY, READY_BODY, WORKING_BODY, DONE_BODY,
+                      SESSION_BODY_PREFIX, USAGE_BODY_PREFIX] {
+            assert!(
+                !DELEGATED_BODY_PREFIX.starts_with(other) && !other.starts_with(DELEGATED_BODY_PREFIX),
+                "{DELEGATED_BODY_PREFIX:?} vs {other:?} are confusable"
+            );
+        }
+        // Pinned against HOOK_OSC_DELEGATED_PREFIX in lib/agentHooks.ts, which
+        // cannot import this. The two are the halves of one contract.
+        assert_eq!(DELEGATED_BODY_PREFIX, "agent delegated: ");
+        // It must also survive claude's OWN notification ignore list, the way
+        // every body on this channel has to (lib/agents.ts
+        // BUILTIN_NOTIFY_IGNORE.claude), or the report is dropped silently.
+        assert!(!DELEGATED_BODY_PREFIX.contains("is waiting for your input"));
+    }
+
     #[test]
     fn the_status_line_claims_an_empty_slot_and_never_a_users_own() {
         let prefix = "/home/u/.claude/termic-hooks/";
@@ -4156,8 +4353,10 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // The upgrade path rests entirely on this. An install from the build
         // before the current set must read as stale, or `agent_hooks_sync`
         // skips it and the user keeps that set forever: v3 types into startup
-        // dialogs, v4 holds a tab on `working` for the rest of the session.
-        assert_eq!(SCHEMA_VERSION, 14, "bump me with the hook set, or installs go stale silently");
+        // dialogs, v4 holds a tab on `working` for the rest of the session,
+        // v14 says nothing at all when a done is held and spins until the
+        // ceiling.
+        assert_eq!(SCHEMA_VERSION, 15, "bump me with the hook set, or installs go stale silently");
     }
 
     #[test]
@@ -4233,15 +4432,18 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // A WHITELIST, not a non-empty test. The delegated types hold the turn
         // open; anything else, named or not, lets done through. See the guard.
         for held in ["subagent", "workflow", "shell", "teammate"] {
-            assert!(claude.contains(&format!(r#""type":"{held}""#)),
+            assert!(claude.contains(&format!("'{held} ")),
                 "{held} must hold the turn open");
         }
         // The types that never end must NOT appear. `monitor` is the artifact
         // watch (an ambient websocket monitor); it outlives every turn.
         for never in ["monitor", "dream", "auto-modescan"] {
-            assert!(!claude.contains(&format!(r#""type":"{never}""#)),
+            assert!(!claude.contains(&format!("'{never} ")),
                 "{never} must never hold the turn open");
         }
+        // And the hold is REPORTED now, never silent: see
+        // `a_held_done_reports_what_it_is_holding_for`.
+        assert!(!claude.contains("exit 0 ;;"), "a hold must write, not exit");
         // Sliced out of the array, not matched across the whole payload:
         // `last_assistant_message` is the agent's own prose.
         assert!(claude.contains(r#"tasks=${flat##*'"background_tasks":['}"#),
@@ -4285,20 +4487,50 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     /// assertion happily agreed with.
     #[cfg(unix)]
     fn done_emits_for(payload: &str) -> bool {
+        done_output_for("claude", payload).contains(DONE_BODY)
+    }
+
+    /// What the delegated report says, minus its OSC wrapper, or None when the
+    /// script reported a plain done. `<count> <label> <ids>`, the grammar
+    /// `parseDelegatedBody` in `lib/delegatedWork.ts` accepts.
+    #[cfg(unix)]
+    fn delegated_for(agent: &str, payload: &str) -> Option<String> {
+        let out = done_output_for(agent, payload);
+        let rest = out.split(DELEGATED_BODY_PREFIX).nth(1)?;
+        Some(rest.trim_end_matches('\u{7}').trim().to_string())
+    }
+
+    /// Run an agent's generated Done script against a real payload and return
+    /// everything it wrote. `TERMIC_PTY` points at a temp file, which is
+    /// exactly how the script addresses a pty: a plain path it redirects into.
+    ///
+    /// This executes the shell rather than asserting on the source, because
+    /// every bug this guard has had was a semantic one that a substring
+    /// assertion happily agreed with.
+    #[cfg(unix)]
+    fn done_output_for(agent: &str, payload: &str) -> String {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
         let dir = unique_test_dir("hook");
         let script = dir.join("done.sh");
         let pty = dir.join("pty");
-        std::fs::write(&script, script_body("claude", Signal::Done)).unwrap();
+        std::fs::write(&script, script_body(agent, Signal::Done)).unwrap();
         std::fs::write(&pty, "").unwrap();
 
-        let mut child = Command::new("/bin/sh")
-            .arg(&script)
+        // grok's script refuses to run unless grok is the caller, and claude's
+        // refuses when it IS: the two share `~/.claude/settings.json`, so each
+        // gates on `GROK_HOOK_EVENT` in the opposite direction. The harness
+        // has to answer that the way the real runtime does, per agent, or a
+        // grok script silently writes nothing and every assertion here reads
+        // as "the guard held".
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&script)
             .env("TERMIC_TASK_ID", "t1")
-            .env("TERMIC_PTY", &pty)
-            .env_remove("GROK_HOOK_EVENT")
+            .env("TERMIC_PTY", &pty);
+        if agent == "grok" { cmd.env("GROK_HOOK_EVENT", "stop"); }
+        else { cmd.env_remove("GROK_HOOK_EVENT"); }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -4313,7 +4545,7 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         let mut out = String::new();
         std::fs::File::open(&pty).unwrap().read_to_string(&mut out).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        out.contains(DONE_BODY)
+        out
     }
 
     /// codex's Done hook with a rollout on disk: done, plus the context the way
@@ -5180,6 +5412,133 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert!(!done_emits_for(&stop_payload(both)), "the subagent must still hold");
     }
 
+    // Holding is not the same as saying nothing, which is what this used to do.
+    // A silent hook is byte-for-byte a model mid-token, so the tab span until
+    // the 20-minute ceiling cleared it with no badge and no bell. Every case
+    // that holds must now REPORT, in the grammar `parseDelegatedBody` accepts.
+    #[test]
+    #[cfg(unix)]
+    fn a_held_done_reports_what_it_is_holding_for() {
+        let subagent = r#"{"id":"a1","type":"subagent","status":"running","description":"Explore","agent_type":"Explore"}"#;
+        assert_eq!(delegated_for("claude", &stop_payload(subagent)).as_deref(),
+            Some("1 subagent a1"));
+
+        // Counted, so the chip can say "2 subagents" rather than guessing.
+        let two = format!("{subagent},{}",
+            r#"{"id":"a2","type":"subagent","status":"running","description":"Plan","agent_type":"Plan"}"#);
+        assert_eq!(delegated_for("claude", &stop_payload(&two)).as_deref(),
+            Some("2 subagent a1,a2"));
+
+        // Measured in C (docs/agent-hooks.md): a subagent that backgrounds its
+        // own shell puts BOTH in the parent's payload. The parent is waiting on
+        // its subagent, so the label has to say subagent, or the detached-work
+        // grace would start ticking on an orchestration that is running fine.
+        let mixed = format!("{subagent},{}",
+            r#"{"id":"b1","type":"shell","status":"running","description":"sleep 70","command":"sleep 70"}"#);
+        assert_eq!(delegated_for("claude", &stop_payload(&mixed)).as_deref(),
+            Some("1 subagent a1,b1"), "agent-owned work names the hold");
+
+        // The wire labels the TS side accepts, which are not all the payload's
+        // own spellings.
+        for (ty, label) in [("cloudsession", "cloud_session"), ("MCPtask", "mcp_task"),
+                            ("teammate", "teammate"), ("workflow", "workflow")] {
+            let task = format!(r#"{{"id":"x1","type":"{ty}","status":"running","description":"d"}}"#);
+            assert_eq!(delegated_for("claude", &stop_payload(&task)).as_deref(),
+                Some(format!("1 {label} x1").as_str()), "wrong label for {ty}");
+        }
+
+        // A plain done reports no delegation at all, and an ambient watch is a
+        // plain done (the regression above).
+        assert_eq!(delegated_for("claude", &stop_payload("")), None);
+        let watch = r#"{"id":"m1","type":"monitor","status":"running","description":"Artifact live updates"}"#;
+        assert_eq!(delegated_for("claude", &stop_payload(watch)), None);
+    }
+
+    // The ids are the whole mechanism behind "this turn is not waiting on it":
+    // termic compares one turn's set against the last one's. An id it cannot
+    // read is dropped rather than passed through, because the body is built
+    // from an agent-controlled payload.
+    #[test]
+    #[cfg(unix)]
+    fn the_delegated_report_carries_ids_and_drops_junk() {
+        let hostile = r#"{"id":"ok-1_2","type":"shell","status":"running","command":"x"},
+                         {"id":"no;rm -rf","type":"shell","status":"running","command":"y"}"#;
+        assert_eq!(delegated_for("claude", &stop_payload(hostile)).as_deref(),
+            Some("2 shell ok-1_2"), "count is of TYPES, the id list is filtered");
+
+        // Nothing readable at all still reports the hold, with `-` for "no ids".
+        // termic then treats every report as new work, which waits rather than
+        // announcing: the conservative direction.
+        let noid = r#"{"type":"shell","status":"running","command":"x"}"#;
+        assert_eq!(delegated_for("claude", &stop_payload(noid)).as_deref(), Some("1 shell -"));
+    }
+
+    // grok's dialect, from the hooks reference embedded in its own binary:
+    // camelCase `backgroundTasks`, and only three types, `monitor` among them.
+    // Synthetic payloads in that documented shape; the values are placeholders.
+    #[test]
+    #[cfg(unix)]
+    fn grok_reads_its_own_camelcase_dialect() {
+        let stop = |tasks: &str| format!(
+            r#"{{"sessionId":"s1","hook_event_name":"Stop","hookEventName":"stop",
+               "stopHookActive":false,"reason":"end_turn","lastAssistantMessage":"ok",
+               "backgroundTasks":[{tasks}],"sessionCrons":[]}}"#
+        );
+        let shell = r#"{"id":"bg1","type":"shell","status":"running","command":"npm run dev"}"#;
+        let sub = r#"{"id":"sa1","type":"subagent","status":"running","agentType":"general"}"#;
+        let mon = r#"{"id":"m1","type":"monitor","status":"running","description":"watch"}"#;
+
+        assert_eq!(delegated_for("grok", &stop(shell)).as_deref(), Some("1 shell bg1"));
+        assert_eq!(delegated_for("grok", &stop(sub)).as_deref(), Some("1 subagent sa1"));
+        // A monitor is grok's ambient type, the same trap claude's `monitor_ws`
+        // is: it outlives every turn, so it must not hold one open.
+        assert_eq!(delegated_for("grok", &stop(mon)), None);
+        assert!(done_output_for("grok", &stop(mon)).contains(DONE_BODY));
+        assert_eq!(delegated_for("grok", &stop("")), None);
+        // Agent-owned wins the label when both are outstanding, so the
+        // detached grace never starts on a running subagent.
+        assert_eq!(delegated_for("grok", &stop(&format!("{shell},{sub}"))).as_deref(),
+            Some("1 subagent bg1,sa1"));
+
+        // claude's SNAKE_CASE key must not be read here, or a hook reading the
+        // wrong dialect would silently report nothing for every grok turn.
+        let snake = r#"{"hook_event_name":"Stop","background_tasks":[
+            {"id":"b1","type":"shell","status":"running"}]}"#;
+        assert_eq!(delegated_for("grok", snake), None);
+
+        // ONE script serves `StopCancelled` too, and that is an interrupt: the
+        // turn is over whatever is still in flight. The closing quote in the
+        // pattern is what keeps this from matching `"Stop"`.
+        let cancelled = format!(
+            r#"{{"hook_event_name":"StopCancelled","reason":"user_interrupt",
+               "backgroundTasks":[{shell}]}}"#
+        );
+        assert_eq!(delegated_for("grok", &cancelled), None,
+            "an interrupt must never report a hold");
+        assert!(done_output_for("grok", &cancelled).contains(DONE_BODY));
+    }
+
+    // agy says work is outstanding without saying what, and that is the shape
+    // the generic label exists for. No ids, so termic never reads it as carried
+    // over and never puts the detached-work clock on it: it waits for agy.
+    #[test]
+    #[cfg(unix)]
+    fn agy_reports_a_hold_without_naming_it() {
+        assert_eq!(delegated_for("agy", r#"{"fullyIdle":false}"#).as_deref(), Some("1 work -"));
+        assert_eq!(delegated_for("agy", r#"{"fullyIdle":true}"#), None);
+        assert!(done_output_for("agy", r#"{"fullyIdle":true}"#).contains(DONE_BODY));
+    }
+
+    // The labels the script sends and the labels Rust documents are one list.
+    #[test]
+    fn every_documented_label_is_in_the_script() {
+        let s = script_body("claude", Signal::Done);
+        for (ty, label) in DELEGATED_LABELS {
+            assert!(s.contains(&format!("'{ty} {label}'")),
+                "the script must map {ty} to {label}");
+        }
+    }
+
     // The agent's own prose must not be able to hold its spinner down. A turn
     // that discusses `"type":"shell"` (this one did) serialises that text into
     // `last_assistant_message`, which is why the array is sliced out first.
@@ -5504,3 +5863,5 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert!(strays.is_empty(), "temp file left behind");
     }
 }
+
+

@@ -35,10 +35,13 @@ import { loadTerminalRenderer, awaitTerminalFonts } from "@/lib/terminalRenderer
 import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
-import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, HOOK_OSC_SESSION_PREFIX, HOOK_OSC_WORKING_BODY, HOOK_OSC_DONE_BODY, hookOscSessionId } from "@/lib/agentHooks";
+import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, HOOK_OSC_SESSION_PREFIX, HOOK_OSC_WORKING_BODY, HOOK_OSC_DONE_BODY, HOOK_OSC_DELEGATED_PREFIX, hookOscSessionId } from "@/lib/agentHooks";
+import { parseDelegatedBody, delegatedVerdict, isAgentOwned, delegatedChipText, DELEGATED_DETACHED_GRACE_MS, type DelegatedWork } from "@/lib/delegatedWork";
+import { lastAgentLine } from "@/lib/resumeTail";
 import { parseUsageBody } from "@/lib/agentUsage";
 import { parseContextBody } from "@/lib/agentContext";
 import { FooterAgentChip } from "./AgentChip";
+import { footerChipMode, moreMarkerClass } from "./footerChipMode";
 import { activeFooterAgent, footerAgentIds, footerAgentKey } from "@/lib/footerAgents";
 import { useAgentUsage } from "@/store/agentUsage";
 import { useAgentContext } from "@/store/agentContext";
@@ -59,7 +62,7 @@ import * as ipc from "@/lib/ipc";
 import { maybeRebuildDockerImageForLaunch } from "@/lib/dockerDailyRebuild";
 import { loginShell, loginShellArgs } from "@/lib/loginShell";
 import { usePrefs, useResolvedThemeFull, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
-import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, spawnResumeShape, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
+import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, spawnResumeShape, resumeIdArgsForCli, resumePickerArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
 import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { ReviewCommentsBar } from "./ReviewCommentsBar";
@@ -152,6 +155,19 @@ function visibleTailRows(t: Terminal, n: number): string[] {
 function ceilingOverrideMs(): number | null {
   try {
     const raw = localStorage.getItem("workDoneCeilingMs");
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 1000 ? n : null;
+  } catch { return null; }
+}
+
+/** Debug override for the detached-work grace, in ms, read the same way and
+ *  for the same reason as the ceiling's: the real value is five minutes, and a
+ *  spec that waited that out would be the slowest in the suite by an order of
+ *  magnitude. Clamped to >= 1000 ms. */
+function delegatedGraceOverrideMs(): number | null {
+  try {
+    const raw = localStorage.getItem("delegatedGraceMs");
     if (!raw) return null;
     const n = Number(raw);
     return Number.isFinite(n) && n >= 1000 ? n : null;
@@ -275,6 +291,24 @@ export function TerminalPane({ task, tab, active }: Props) {
   /** The hook turn-edge handler, set where the terminal is wired so the OSC
    *  777 handler (registered earlier) can reach it. */
   const hookTurnRef = useRef<((sub: string, origin: string) => void) | null>(null);
+  /** The hook's DELEGATED report handler, set alongside `hookTurnRef` for the
+   *  same reason: the OSC 777 handler is registered before it exists. */
+  const hookDelegatedRef = useRef<((w: DelegatedWork) => void) | null>(null);
+  /** What the LAST done hook on this pty reported outstanding, which is the
+   *  only thing the carried-over rule compares against (`delegatedVerdict`).
+   *
+   *  Deliberately not the tab field: that one is display, and it is cleared at
+   *  the start of every turn so a stale chip cannot outlive the turn that
+   *  earned it. This is memory, and it has to survive exactly that, or the
+   *  second turn of a session with a shell left running would look like the
+   *  first and be held all over again. Cleared only by a done that reports
+   *  nothing outstanding, and by a respawn. */
+  const delegatedSeenRef = useRef<DelegatedWork | null>(null);
+  /** Wall clock of that report. The carried-over rule needs to know whether a
+   *  HUMAN started the turn that has just ended, and "was there input after
+   *  the last done hook" is how that is asked: every send path stamps
+   *  `lastInputAt`, and a `<task-notification>` resume stamps nothing. */
+  const delegatedSeenAtRef = useRef(0);
   /** Logged once per pty: the first agent-native OSC 133 that was ignored. */
   const native133LoggedRef = useRef(false);
   /** Has a hook for THIS pty actually reached us? Installed is not the same as
@@ -347,6 +381,25 @@ export function TerminalPane({ task, tab, active }: Props) {
   const lastSpawnWasResumeRef = useRef(false);
   const failedResumeRef = useRef(false);
   const RESUME_FAILURE_MS = 2000;
+  // GH #311. Set by a failed stored-id resume when the agent has a session
+  // picker: the NEXT spawn opens that picker instead of minting a fresh
+  // session, so the user continues the conversation they meant to. The id
+  // they pick comes back over the hooks (`session <id>` OSC), as any
+  // `/resume` does. `pickerSpawnRef` marks the spawn that IS the picker, so
+  // leaving it (Esc exits 1) falls through to a fresh session exactly once
+  // rather than looping back into the picker.
+  const pickerNextRef = useRef(false);
+  const pickerSpawnRef = useRef(false);
+  // What a resume attempt printed in its first RESUME_FAILURE_MS, raw. A
+  // failed resume says why and exits within a second, and xterm writes
+  // asynchronously, so its buffer can still lack that last line when the exit
+  // lands; Rust drains every byte before it emits the exit, so this cannot.
+  // Only filled inside that window, so the hot data path pays nothing else.
+  const resumeTailRef = useRef("");
+  // Open only while a resume spawn is inside RESUME_FAILURE_MS: the survive
+  // timer and the exit both close it, so the data path checks one boolean and
+  // nothing else for the rest of the session's life (GH #311 review).
+  const resumeTailOpenRef = useRef(false);
 
   const patchTab = useApp(s => s.patchTab);
   const markAttention = useApp(s => s.markAttention);
@@ -1373,6 +1426,17 @@ const captureArmedRef = useRef(false);
     // env and possibly a different sandbox mode, so it has to demonstrate
     // delivery again rather than inherit a claim the previous process earned.
     hookSeenRef.current = false;
+    delegatedSeenRef.current = null;
+    delegatedSeenAtRef.current = 0;
+    // The DISPLAY too, not just the memory. A restart gets a fresh process,
+    // and whatever the old one had running is either gone with it or no longer
+    // this tab's to report: a restarted agent showing "1 shell" from a process
+    // that no longer exists is a lie the user cannot clear.
+    {
+      const held = (useApp.getState().tabs[task.id]
+        ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.delegatedWork;
+      if (held) patchTab(task.id, tab.id, { delegatedWork: null, delegatedSince: 0 });
+    }
     native133LoggedRef.current = false;
     agentReadyPatchedRef.current = false;
     // Reset sender classification so signal-silent agents (agy, custom CLIs)
@@ -1431,6 +1495,19 @@ const captureArmedRef = useRef(false);
         dbg("state→working", reason);
         localBusy = true;
         workingStartedAtRef.current = Date.now();
+        // A new turn, so last turn's delegated report is stale: whatever it
+        // named is either finished or about to be re-reported by this turn's
+        // own done, ~a second later. Clearing it here rather than on every
+        // working hook is deliberate. The working hook is a HEARTBEAT, many
+        // times per turn, and writing an unchanged value through a store
+        // setter on a PTY-driven path is bear trap 8 (docs/performance.md):
+        // Zustand copies the whole state and every mounted tab re-runs its
+        // selectors. This runs on the edge only, and only when there is
+        // something to clear. `delegatedSeenRef` is NOT cleared: it is the
+        // memory the carried-over rule needs.
+        const held = (useApp.getState().tabs[task.id]
+          ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.delegatedWork;
+        if (held) patchTab(task.id, tab.id, { delegatedWork: null, delegatedSince: 0 });
       } else if (workingStartedAtRef.current === 0) {
         // The absolute ceiling fired mid-turn and cleared the clock. It does
         // not go through here (it calls `fireDone` directly, so `localBusy` is
@@ -1883,6 +1960,17 @@ const captureArmedRef = useRef(false);
         hookTurnRef.current?.(body === HOOK_OSC_WORKING_BODY ? "C" : "D", "hook");
         return false;
       }
+      // A done that found work outstanding. Routed here, with working and
+      // done, because it is the third thing that hook can say and the only one
+      // that used to be said by staying silent. A body we cannot parse is
+      // DROPPED rather than passed on: it is trusted, so falling through would
+      // reach the user as a needs-you banner reading "agent delegated: ...".
+      if (trusted && body.startsWith(HOOK_OSC_DELEGATED_PREFIX)) {
+        const work = parseDelegatedBody(body.slice(HOOK_OSC_DELEGATED_PREFIX.length));
+        if (work) hookDelegatedRef.current?.(work);
+        else logWorkState("hook-delegated-unparsed", `cli=${tab.cli} body=${JSON.stringify(body.slice(0, 120))}`);
+        return false;
+      }
       if (trusted && body === HOOK_OSC_READY_BODY) {
         wdlog("OSC 777 ready (termic hook)", body);
         dbg("osc777-ready", body.slice(0, 200));
@@ -2029,6 +2117,17 @@ const captureArmedRef = useRef(false);
       if (sub === "C") {
         goWorking(`${origin} C`);
       } else if (sub === "D") {
+        // A done that reports nothing outstanding is the agent saying the
+        // whole thing is finished, leftovers included. Drop both the chip and
+        // the memory the carried-over rule compares against: the next hold
+        // starts from nothing, which is what "new work" should mean.
+        if (origin === "hook") {
+          delegatedSeenRef.current = null;
+          delegatedSeenAtRef.current = 0;
+          const held = (useApp.getState().tabs[task.id]
+            ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.delegatedWork;
+          if (held) patchTab(task.id, tab.id, { delegatedWork: null, delegatedSince: 0 });
+        }
         // 133;D is a hard "command ended" — no need to wait SETTLE_MS.
         goIdle(`${origin} D`, 0, true);
         // devin keeps its context window nowhere live, only in its session
@@ -2055,6 +2154,79 @@ const captureArmedRef = useRef(false);
       }
     };
     hookTurnRef.current = hookTurn;
+
+    // The done hook found work outstanding. Until this existed the hook wrote
+    // NOTHING here, which is byte-for-byte what a model mid-token writes, so
+    // the tab span on until the 20-minute liveness ceiling cleared it with no
+    // badge and no bell. See docs/agent-hooks.md "Delegated work".
+    const hookDelegated = (work: DelegatedWork) => {
+      if (!workDoneEnabled) return;
+      const live = useApp.getState().tabs[task.id]
+        ?.find(t => t.id === tab.id) as TerminalTab | undefined;
+      // Did a person ask for the turn that just ended? Input AFTER the last
+      // report is the test. A resume never stamps `lastInputAt`, so an agent
+      // cycling through its own task notifications can never look finished.
+      const humanAsked = (live?.lastInputAt ?? 0) > delegatedSeenAtRef.current;
+      const prev = delegatedSeenRef.current;
+      const verdict = delegatedVerdict(prev, work, humanAsked);
+      delegatedSeenRef.current = work;
+      delegatedSeenAtRef.current = Date.now();
+      // The line to grep when a tab reads wrong. Everything the rule saw and
+      // everything it decided, because "the badge was wrong" is answerable
+      // from this and unanswerable without it.
+      logWorkState("hook-delegated",
+        `cli=${tab.cli} task=${JSON.stringify(task.name)}`
+        + ` held=${delegatedChipText(work)} verdict=${verdict}`
+        + ` agentOwned=${isAgentOwned(work)} humanAsked=${humanAsked}`
+        + ` was=[${prev?.ids.join(",") ?? ""}] now=[${work.ids.join(",")}]`);
+      if (verdict === "shrank") {
+        // Something came back and the rest runs on. Not a finished turn, so
+        // no done and no bell, but it is the one thing a user watching a
+        // three-subagent turn wants to see, and it gets its own badge.
+        patchTab(task.id, tab.id, {
+          delegatedWork: { ...work, partial: true },
+          delegatedSince: Date.now(),
+        });
+        goWorking(`delegated ${work.label} (partial)`);
+        return;
+      }
+      if (verdict === "carried") {
+        // Everything outstanding was ALREADY outstanding when this pty's last
+        // turn ended, so it cannot be what this turn is waiting on: the turn
+        // is over and these are leftovers. This is the whole compounding half
+        // of the bug. Measured: one `sleep 900` backgrounded in turn one held
+        // the `Stop` of every later turn in the session, including a one-word
+        // reply that used no tools at all.
+        //
+        // Keep the report on the tab: the turn ended, the shell did not, and
+        // an idle tab that says "1 shell" is the honest rendering of that.
+        // Refresh it unless it is the same report: the count can fall as
+        // leftovers finish, and a chip that says 2 shells when one is left is
+        // the sort of wrong nobody notices. Compared rather than written
+        // blindly because this runs on a PTY-driven path (bear trap 8).
+        const shown = live?.delegatedWork;
+        const same = shown?.label === work.label && shown?.count === work.count
+          && shown?.ids.join() === work.ids.join();
+        if (!same) patchTab(task.id, tab.id, { delegatedWork: work });
+        const wasWorking = localBusy || live?.workState === "working";
+        if (!wasWorking) return;
+        localBusy = false;
+        // `force`, and this is the one place it is load-bearing outside the
+        // ceiling. claude's `pending` screen patterns (lib/agents.ts) include
+        // "N shells still running", which is on screen for exactly as long as
+        // the leftover shell lives, so `fireDone`'s screen-scan hold would
+        // defer this done forever. That scan is the FALLBACK for the payload
+        // fact this hook has just read directly; it must not overrule it.
+        fireDone(i18n.t("chrome:delegated.carriedOver", { held: delegatedChipText(work) }),
+          "done", false, true, true);
+        return;
+      }
+      // New work, so the turn is genuinely still going. Stay working, and
+      // record WHEN so the detached-work grace has something to measure from.
+      patchTab(task.id, tab.id, { delegatedWork: work, delegatedSince: Date.now() });
+      goWorking(`delegated ${work.label}`);
+    };
+    hookDelegatedRef.current = hookDelegated;
     term.parser.registerOscHandler(133, (data) => {
       const sub = (data.split(";")[0] || "").toUpperCase();
       // termic's hooks no longer speak 133, so for an agent that HAS them,
@@ -2204,14 +2376,23 @@ const captureArmedRef = useRef(false);
       resumeOverride: task.resume_override ?? undefined,
       failedResume: failedResumeRef.current,
     });
-    const resumeOverride = captureResumeOverride ?? (decision.kind === "override" ? decision.override : undefined);
-    const useIdResume = decision.kind === "resume-id" || decision.kind === "mint";
+    // The agent's own picker, once, right after a stored id failed (see
+    // pickerNextRef). It replaces every resume path for this one spawn: no
+    // mint (the user picks the session), no --continue, no stored id.
+    const pickerArgs = isAgent && pickerNextRef.current ? resumePickerArgsForCli(tab.cli) : [];
+    const openPicker = pickerArgs.length > 0;
+    pickerNextRef.current = false;
+    pickerSpawnRef.current = openPicker;
+    const resumeOverride = openPicker ? undefined
+      : captureResumeOverride ?? (decision.kind === "override" ? decision.override : undefined);
+    const useIdResume = !openPicker && (decision.kind === "resume-id" || decision.kind === "mint");
     const sessionUuid =
-      decision.kind === "mint" ? crypto.randomUUID()
+      openPicker ? undefined
+      : decision.kind === "mint" ? crypto.randomUUID()
       : decision.kind === "resume-id" ? storedUuid
       : undefined;
-    const resumeKnown = decision.kind === "resume-id";
-    const shouldResume = decision.kind === "cwd-resume";
+    const resumeKnown = !openPicker && decision.kind === "resume-id";
+    const shouldResume = !openPicker && decision.kind === "cwd-resume";
     // What this spawn actually did about resuming. NOT `decision.kind` alone:
     // a capture-resume agent (codex, opencode) resumes through
     // `captureResumeOverride`, which decideResume never sees. Pure + unit
@@ -2255,7 +2436,9 @@ const captureArmedRef = useRef(false);
         // Override owns its own "session not found" handling (claude shows
         // the resume picker), so it never counts as a resume for the fast-
         // exit fallback — only real resume-id / cwd-resume spawns do.
-        lastSpawnWasResumeRef.current = resumeShape.isResume;
+        // The picker is not a resume attempt: leaving it is the user's choice,
+        // handled below, and must not read as "the stored id failed".
+        lastSpawnWasResumeRef.current = !openPicker && resumeShape.isResume;
         hasHistoryLocalRef.current = false;
         // Agent: resolve the executable through the registry (users can
         // repoint `claude` etc. in Settings → Agent CLIs). Shell / custom:
@@ -2309,6 +2492,7 @@ const captureArmedRef = useRef(false);
           sessionUuid,
           resumeKnown,
           resumeOverride,
+          picker: openPicker ? pickerArgs : undefined,
           unattended: !!(tab as TerminalTab).unattended,
           task,
         });
@@ -2500,6 +2684,8 @@ const captureArmedRef = useRef(false);
         // args. Cleared in the exit handler if we never reach the
         // timeout (the rapid-exit branch fires first).
         window.setTimeout(() => {
+          // Past the window a failed resume dies in: stop collecting its tail.
+          resumeTailOpenRef.current = false;
           if (cancelled || ptyRef.current !== ptyId) return;
           if (hasHistoryLocalRef.current) return;
           hasHistoryLocalRef.current = true;
@@ -2557,8 +2743,15 @@ const captureArmedRef = useRef(false);
           : null;
         // Cleared to "" once sent, so a respawn of this tab never retypes it.
         let sudoInputPending = !!sudoInstallInput;
+        const tailDecoder = new TextDecoder();
+        resumeTailRef.current = "";
+        resumeTailOpenRef.current = lastSpawnWasResumeRef.current;
         const unlistenData = await ipc.onPtyData(ptyId, (u8) => {
           term.write(u8);
+          if (resumeTailOpenRef.current) {
+            resumeTailRef.current = (resumeTailRef.current
+              + tailDecoder.decode(u8, { stream: true })).slice(-2000);
+          }
           // Same wait-for-the-prompt as AuxTerminal's initialInput: bytes
           // written before zsh's line editor is up are echoed twice.
           if (sudoInputPending && !cancelled) {
@@ -2639,13 +2832,6 @@ const captureArmedRef = useRef(false);
             if (!cancelled) setSudoOffer(show);
           });
         }
-        // Rust holds this PTY's output until the ack lands, because a Tauri
-        // event emitted before `listen()` registers reaches nobody. Without
-        // it an agent that prints its banner and one OSC title at startup and
-        // then blocks on stdin can lose both to the spawn round trip and show
-        // an empty terminal with no live title, for good.
-        ipc.ptyAttached(ptyId).catch(() => {});
-
         const unlistenExit = await ipc.onPtyExit(ptyId, (code) => {
           ptyRef.current = null;
           // Run/setup tabs (GH #54): surface a non-zero exit as "failed" on
@@ -2675,6 +2861,19 @@ const captureArmedRef = useRef(false);
               + ` afterMs=${Date.now() - spawnStartedAtRef.current} fastExit=${fastExit}`
               + ` storedId=${resumeShape.usedStoredSessionId}`);
           }
+          // Leaving the agent's picker (GH #311): Esc exits 1 with no session
+          // picked. Start fresh ONCE, which is what used to happen straight
+          // away. A session the user DID pick was reported over the hooks
+          // (sessionReportedRef), or at least chosen with Enter
+          // (submittedSinceSpawnRef, for an agent with no hook to report it),
+          // and ITS later exit is an ordinary one: the exited banner, not a
+          // surprise fresh session.
+          if (pickerSpawnRef.current && !sessionReportedRef.current && !submittedSinceSpawnRef.current) {
+            pickerSpawnRef.current = false;
+            failedResumeRef.current = true;
+            setGen(g => g + 1);
+            return;
+          }
           if (fastExit && lastSpawnWasResumeRef.current) {
             // Rapid exit during a resume attempt = the stored session
             // doesn't resolve anymore (id-CLI: log rotated / deleted;
@@ -2702,8 +2901,27 @@ const captureArmedRef = useRef(false);
               // why. Measured cause: a SECOND Codex holding the same thread
               // ("already has an active writer"), which is what made clicking
               // R look like it did nothing.
+              // The agent says WHY on its way out ("No conversation found",
+              // "running as a background session ... claude attach"), and that
+              // line is the most useful thing here, so it rides the toast.
+              const why = lastAgentLine(resumeTailRef.current);
+              // With a picker, open it instead of starting over (GH #311): the
+              // conversation is usually still there, only termic's pointer is
+              // stale. Without one, the fresh session is still the fallback,
+              // and the agent's own line says what to do next.
+              const hasPicker = resumePickerArgsForCli(tab.cli).length > 0;
+              pickerNextRef.current = hasPicker;
+              // The session picked is remembered only if the agent REPORTS it,
+              // which is the hooks' job. Without them the picker still gets the
+              // user their conversation now, but the next relaunch cannot find
+              // it again, and that has to be said rather than discovered.
+              const remembers = useApp.getState().agentHooksInstalled[tab.cli] === true;
               useUI.getState().pushToast(
-                i18n.t("task:terminal.resumeFailed", { agent: agentDisplayName(tab.cli) }),
+                (hasPicker
+                  ? i18n.t("task:terminal.resumeFailedPicker", { agent: agentDisplayName(tab.cli) })
+                    + (remembers ? "" : i18n.t("task:terminal.resumeFailedRemember"))
+                  : i18n.t("task:terminal.resumeFailed", { agent: agentDisplayName(tab.cli) }))
+                + (why ? i18n.t("task:terminal.resumeFailedSaid", { agent: agentDisplayName(tab.cli), why }) : ""),
                 "info",
               );
               useApp.getState().setTabSessionId(task.id, tab.id, "");
@@ -2760,6 +2978,18 @@ const captureArmedRef = useRef(false);
           setExited(true);
         });
         unlistenExitRef.current = unlistenExit;
+        // Rust holds this PTY's output until the ack lands, because a Tauri
+        // event emitted before `listen()` registers reaches nobody. Without
+        // it an agent that prints its banner and one OSC title at startup and
+        // then blocks on stdin can lose both to the spawn round trip and show
+        // an empty terminal with no live title, for good.
+        //
+        // AFTER the exit listener, not before it: a process that has already
+        // exited has its buffered output released by this ack, and the waiter
+        // fires pty-exit right behind it. Acking first left the exit to race
+        // `onPtyExit`'s own round trip, and a lost exit is a failed resume
+        // that neither opens the picker nor starts fresh (GH #311 review).
+        ipc.ptyAttached(ptyId).catch(() => {});
 
         // Input: pipe xterm keystrokes back to PTY. User input is the
         // canonical "I've seen and addressed the done bullet" signal —
@@ -3094,6 +3324,7 @@ const captureArmedRef = useRef(false);
     // take, and now that firing it costs nothing but a cleared spinner (see
     // below) there is no reason to keep it tight.
     const absoluteCeilingMs = ceilingOverrideMs() ?? 1_200_000;
+    const detachedGraceMs = delegatedGraceOverrideMs() ?? DELEGATED_DETACHED_GRACE_MS;
     const id = window.setInterval(() => {
       // Same gate as the rest of the state machine — workDoneCapable reads
       // the LIVE registry, so a Settings toggle (or a kind change) takes
@@ -3141,6 +3372,36 @@ const captureArmedRef = useRef(false);
           && Date.now() - lastDataAtRef.current >= QUIET_MS) {
         escAtRef.current = 0;
         interruptWork(`interrupt then quiet (quietMs=${Date.now() - lastDataAtRef.current})`);
+        return;
+      }
+      // DETACHED work, and the one case in this whole state machine that no
+      // signal can decide. A `Stop` only fires once the model loop has
+      // stopped, so a shell in its payload is always detached (a foreground
+      // one produces no `Stop` at all, measured), but detached does not mean
+      // abandoned: the agent is re-invoked when that shell exits. Two runs
+      // with byte-identical payloads went opposite ways, one resuming after
+      // 75s and one never. So this is a clock, and it is the only clock here
+      // that is honest about being one.
+      //
+      // Agent-owned work (a subagent, a workflow) is excluded: it is measured
+      // to come back on its own, and putting a clock on it would announce over
+      // a healthy orchestration. Those keep the 20-minute ceiling below.
+      if (cur && cur.type === "terminal" && cur.workState === "working"
+          && cur.delegatedWork && !isAgentOwned(cur.delegatedWork)
+          && (cur.delegatedSince ?? 0) > 0
+          && Date.now() - (cur.delegatedSince ?? 0) >= detachedGraceMs) {
+        logWorkState("delegated-grace",
+          `cli=${tab.cli} held=${delegatedChipText(cur.delegatedWork)}`
+          + ` ageMs=${Date.now() - (cur.delegatedSince ?? 0)}`
+          + " detached work outlived the grace; calling the turn over");
+        // Announced, unlike the ceiling: the ceiling fires because termic does
+        // not know what the agent is doing, and stopping a spinner on that
+        // basis is all it has earned. This one fires on a fact the agent
+        // reported, that its loop stopped with only detached work left, so
+        // saying so is honest. `force` for the same reason the carried-over
+        // path needs it: "N shells still running" is on the screen.
+        fireDone(`detached work grace (${detachedGraceMs}ms)`,
+          "done", false, true);
         return;
       }
       // The absolute ceiling runs for HOOK-OWNING agents too, and is the only
@@ -3459,6 +3720,9 @@ export function FooterBar({ task, sandboxWarning }: {
   const activeAgent = useApp(
     s => activeFooterAgent(s.tabs[task.id] ?? EMPTY_TABS, s.activeTab[task.id], task.cli ?? "claude"),
   );
+  // Null when the task runs one agent: nothing can ever be hidden, so the
+  // marker is not in the DOM at all rather than permanently hidden by CSS.
+  const moreClass = moreMarkerClass(agentIds, activeAgent);
 
   // no right-split agent queue state needed; split panes show their own queue via SplitView
 
@@ -3570,20 +3834,40 @@ export function FooterBar({ task, sandboxWarning }: {
             account has spent. They were two chips and two panels, which the
             account pill's own comment already argued against ("forms one unit
             with the usage chip"). */}
-        {agentIds.map(id => (
-          <FooterAgentChip
-            key={id}
-            taskId={task.id}
-            agentId={id}
-            cwd={task.path}
-            docker={!!task.docker_sandbox_enabled}
-            visible={isActiveTask}
-            // Never true for a single-agent task, which is every task until
-            // somebody opens a second agent in one: nothing to choose between,
-            // so nothing to drop.
-            secondary={agentIds.length > 1 && id !== activeAgent}
-          />
-        ))}
+        {/* The chips get their OWN box so the group can shed width from the
+            left without ever pushing the sandbox status off the end. Without
+            it the chips are all shrink-0 inside an ml-auto group, so five
+            agents simply ran past the bar and under the right panel. */}
+        <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+          {agentIds.map(id => (
+            <FooterAgentChip
+              key={id}
+              taskId={task.id}
+              agentId={id}
+              cwd={task.path}
+              docker={!!task.docker_sandbox_enabled}
+              visible={isActiveTask}
+              // Undefined for the active agent, which is what pins its chip
+              // on screen at every width.
+              hideClass={footerChipMode(agentIds, activeAgent, id).hideClass}
+            />
+          ))}
+          {/* "There are more agents than fit." No count: the breakpoints are
+              CSS container queries rather than a ResizeObserver (this bar sits
+              under a streaming terminal and must not render on a window drag),
+              so nothing here knows how many actually fit. CSS decides whether
+              this shows, by hiding it above the width where the last chip
+              still had room. */}
+          {moreClass && (
+            <span
+              data-testid="agent-chips-more"
+              title={t("terminal.moreAgentsTip")}
+              className={cn("shrink-0 px-0.5 text-[var(--color-fg-faint)]", moreClass)}
+            >
+              ···
+            </span>
+          )}
+        </div>
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}

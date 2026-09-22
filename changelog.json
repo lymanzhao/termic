@@ -1,6 +1,11 @@
 {
   "versions": [
     {
+      "version": "1.7.0",
+      "date": "2026-09-22",
+      "summary": "Agents now report the work they hand off, and every status mark says what it means."
+    },
+    {
       "version": "1.6.0",
       "date": "2026-09-18",
       "summary": "Context window in the footer, plan usage for more agents, and quieter notifications."

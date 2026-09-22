@@ -264,3 +264,43 @@ after hooks still guard at runtime. And anything read out of `window.__termic`
 is annotated at the boundary: the store is loosely typed, so an unannotated
 value passed into another `execute` arrives as WebdriverIO's `HTMLElement`
 union and every use of it is an implicit any.
+
+## Where the time goes, and how to find out
+
+`TERMIC_E2E_TIMING=1 npx wdio run wdio.conf.ts --spec <file>` writes
+per-test durations to `.e2e/timings.txt`, slowest-first with
+`sort -rn`. The spec reporter gives a per-FILE total, which tells you a file
+is slow and nothing about why; without the per-test numbers you end up
+optimising a 300ms sleep inside a seven minute file.
+
+Measured on `agent.e2e.ts`, 73 tests: **11 of them were 315s of 470s**, and
+42 tests together were 14s. Slowness is always a handful of cases.
+
+Two causes, and only one of them is fixable:
+
+**A WebDriver command costs roughly two seconds here.** Not the app, the
+protocol round trip. A case that read one chip through fifteen
+`getAttribute` / `getText` calls took 50s; the same assertions read in a
+single `browser.execute` returning an object took 20s. Batch reads that
+belong to one moment. It is also more correct: fifteen round trips describe
+the DOM across fifteen seconds, which is a slideshow, not a snapshot.
+
+**The rest is the app's own timers, and it is not waste.** `SETTLE_MS` is
+5s, `STICKY_DONE_MS` 8s, byte-quiet 4s, and a case proving a badge does NOT
+appear has to outlast them. The fixture's two `sleep 16`s exist because a
+done fires ~5s after a stage ends and the sticky window runs 8s from there.
+Shortening those buys seconds and removes the thing being tested. Where a
+timer is genuinely unusable in a test (the 20 minute liveness ceiling) the
+app takes a `localStorage` override and the spec sets it; that is the
+escape hatch, and it is not worth adding for a 5s timer.
+
+Things that sound like causes and were measured not to be: window occlusion
+(a run with the e2e window forced always-on-top came out SLOWER, 7m14s
+against 6m28s), and fixed sleeps (21 of them across the suite, ~20s total).
+
+**Never create data through the UI when a file will do.** `app.e2e.ts` built
+a tall History list by creating and archiving twenty tasks, one IPC round
+trip each, minutes of a window sitting on a screen doing nothing visible.
+`wdio.conf.ts`'s `onPrepare` now writes those archived records straight to
+disk. An archived task has no worktree by definition, so a JSON file is the
+whole truth.

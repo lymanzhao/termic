@@ -8611,6 +8611,23 @@ fn procmon_open_window(app: AppHandle) -> Result<(), String> {
     .min_inner_size(560.0, 320.0)
     .build()
     .map_err(|e| e.to_string())?;
+    // Remember WHERE the monitor was, never how big. The window-state plugin
+    // puts saved bounds back verbatim and does not honour min_inner_size, and
+    // its saved 880x620 came back as 440x310 logical on a 2x display, under
+    // this window's own 560x320 minimum. At 440 the row grid's first column
+    // collapses and the process name renders at ZERO width: the title is in
+    // the DOM and invisible, so every row reads as bare numbers. Measured both
+    // ways, with the saved entry present the webview is 440 CSS px wide and
+    // the name span is 0px; with it deleted, 880 and 85px, which is what
+    // `activity.e2e.ts` "names the agent row after the tab" asserts. A monitor
+    // panel is a fixed-shape table, so opening at its designed size every time
+    // costs less than remembering one that can come back unusable. PROCMON_WINDOW
+    // is in `skip_initial_state` for this reason (as "main" is, which restores
+    // its own size and then clamps up).
+    {
+        use tauri_plugin_window_state::{StateFlags, WindowExt};
+        let _ = win.restore_state(StateFlags::POSITION);
+    }
     // A window closed by its red button never unmounts React cleanly, so
     // the frontend's `procmon_stop` may not run. Drop the session here too:
     // there is no thread to stop, but a stale session would keep a dead
@@ -13030,13 +13047,16 @@ fn resolve_task_git_path(w: &Task, path: &str) -> Result<(PathBuf, String), Stri
 /// are shipped as base64 only under the same 20 MB ceiling the preview
 /// channel uses — a bigger one would jank the webview, so it degrades to the
 /// "binary" summary rather than being sent.
-fn diff_sides_kind(abs: Option<&Path>, sides: [Option<&Vec<u8>>; 2]) -> &'static str {
+///
+/// `ext_probe` is only ever extension-checked, never opened, so it may name a
+/// file that no longer exists — the whole point for a deleted image, whose
+/// only remaining side lives in the object store.
+fn diff_sides_kind(ext_probe: &Path, sides: [Option<&Vec<u8>>; 2]) -> &'static str {
     let present = || sides.into_iter().flatten();
     if present().all(|b| std::str::from_utf8(b).is_ok()) {
         return "text";
     }
-    let is_image = abs
-        .and_then(preview_mime_for_ext)
+    let is_image = preview_mime_for_ext(ext_probe)
         .is_some_and(|m| m.starts_with("image/"));
     if is_image && present().all(|b| b.len() as u64 <= PREVIEW_CAP) {
         return "image";
@@ -13100,7 +13120,11 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
         _ => (show_head(), read_worktree()),
     };
     let fp = modified_path.as_deref().map(file_fp).unwrap_or_default();
-    let kind = diff_sides_kind(modified_path.as_deref(), [original.as_ref(), modified.as_ref()]);
+    // `safe_task_path` canonicalizes, so a deleted file leaves `modified_path`
+    // empty — but a deleted image still has an extension to classify on, so
+    // fall back to the unresolved join. Only `.extension()` is read off it.
+    let ext_probe = modified_path.clone().unwrap_or_else(|| cwd.join(&rel_path));
+    let kind = diff_sides_kind(&ext_probe, [original.as_ref(), modified.as_ref()]);
     let b64 = |side: &Option<Vec<u8>>| {
         side.as_ref().map(|b| base64::engine::general_purpose::STANDARD.encode(b))
     };
@@ -13115,7 +13139,7 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
         original: if kind == "text" { text(&original) } else { String::new() },
         modified: if kind == "text" { text(&modified) } else { String::new() },
         mime: (kind == "image")
-            .then(|| modified_path.as_deref().and_then(preview_mime_for_ext).map(str::to_string))
+            .then(|| preview_mime_for_ext(&ext_probe).map(str::to_string))
             .flatten(),
         original_data: if kind == "image" { b64(&original) } else { None },
         modified_data: if kind == "image" { b64(&modified) } else { None },
@@ -18999,6 +19023,14 @@ pub struct AgentCapabilities {
     /// `{UUID}` which expands to the previously-minted uuid.
     #[serde(default)]
     pub resume_id_args: Vec<String>,
+    /// Args that open the agent's OWN session picker (GH #311), used when a
+    /// stored session id fails to resume instead of silently starting fresh.
+    /// No `{UUID}`: the user picks, and the id comes back over the hooks
+    /// (`SessionStart` with `source: resume`), so termic reads no session
+    /// files. Empty → no picker, the fresh fallback stays. Filled only where
+    /// measured; see docs/adding-an-agent.md.
+    #[serde(default)]
+    pub resume_picker_args: Vec<String>,
     /// Always-applied args (every spawn). Useful for things like
     /// `--name {WORKSPACE_SLUG}` so claude's /resume picker shows
     /// termic's task name. Placeholders: {WORKSPACE_SLUG},
@@ -19049,6 +19081,11 @@ fn default_agents() -> Vec<Agent> {
                 // resumes that same id.
                 session_id_args: vec!["--session-id".into(), "{UUID}".into()],
                 resume_id_args:  vec!["--resume".into(),     "{UUID}".into()],
+                // `--resume` with no id opens claude's own session picker.
+                // Measured on 2.1.278: picking one fires SessionStart with
+                // `source: resume` and the chosen id (entrypoint `cli`), which
+                // the READY hook reports; Esc exits 1 with no SessionStart.
+                resume_picker_args: vec!["--resume".into()],
                 // Surface termic's task name in claude's /resume
                 // picker + prompt box + terminal title. Stamped on the mint
                 // spawn only (gated to the first id spawn in spawnArgsForCli).
@@ -19122,6 +19159,7 @@ fn default_agents() -> Vec<Agent> {
                 // later resume answered with it), and the id is STABLE across
                 // resumes, so storing it once is enough.
                 resume_id_args: vec!["resume".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec![],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19178,6 +19216,7 @@ fn default_agents() -> Vec<Agent> {
                 // as codex (`cliSupportsCaptureResume`).
                 session_id_args: vec![],
                 resume_id_args: vec!["--conversation".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec![],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19236,6 +19275,7 @@ fn default_agents() -> Vec<Agent> {
                 // mint (new UUID) and the resume (same UUID) flag.
                 session_id_args: vec!["--session-id".into(), "{UUID}".into()],
                 resume_id_args:  vec!["--session-id".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec!["--name".into(), "{WORKSPACE_SLUG}".into()],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19288,6 +19328,7 @@ fn default_agents() -> Vec<Agent> {
                 // then `-r <uuid> -p "what word?"` answered "banana".
                 session_id_args: vec!["--session-id".into(), "{UUID}".into()],
                 resume_id_args: vec!["--resume".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 // No `--name` equivalent in grok's help; its session title is
                 // model-generated and lands in the terminal title instead.
                 name_args: vec![],
@@ -19345,6 +19386,7 @@ fn default_agents() -> Vec<Agent> {
                 // resume are byte-identical.
                 session_id_args: vec!["--session-id".into(), "{UUID}".into()],
                 resume_id_args: vec!["--session-id".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec!["--name".into(), "{WORKSPACE_SLUG}".into()],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19386,6 +19428,7 @@ fn default_agents() -> Vec<Agent> {
                 resume_args: vec!["--continue".into()],
                 session_id_args: vec![],
                 resume_id_args: vec!["--session".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec![],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19465,6 +19508,7 @@ fn default_agents() -> Vec<Agent> {
                 // a live 1.0.2 through `--provider echo`: `muse resume <uuid>`
                 // prints "resumed session <uuid>" and redraws the prior turns.
                 resume_id_args: vec!["resume".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 name_args: vec![],
                 signals: AgentSignals::default(),
                 match_output: false,
@@ -19581,6 +19625,7 @@ fn default_agents() -> Vec<Agent> {
                 resume_args: vec!["--continue".into()],
                 session_id_args: vec![],
                 resume_id_args: vec!["--resume".into(), "{UUID}".into()],
+                resume_picker_args: vec![],
                 // No --name flag; devin generates its own session title and
                 // puts it on the terminal title as `devin: <title>`.
                 name_args: vec![],
@@ -19766,6 +19811,10 @@ pub(crate) fn load_settings_in(id: &ProfileId) -> Settings {
             c.resume_id_args = d.resume_id_args.clone();
             migrated = true;
         }
+        if c.resume_picker_args.is_empty() && !d.resume_picker_args.is_empty() {
+            c.resume_picker_args = d.resume_picker_args.clone();
+            migrated = true;
+        }
         if c.name_args.is_empty() && !d.name_args.is_empty() {
             c.name_args = d.name_args.clone();
             migrated = true;
@@ -19795,7 +19844,12 @@ pub(crate) fn load_settings_in(id: &ProfileId) -> Settings {
     // a read-only filesystem or transient I/O error shouldn't fail the
     // load (in-memory state is still correct).
     if migrated {
-        let _ = save_settings_inner(&s);
+        // To the profile this was loaded FROM (GH #316). `save_settings_inner`
+        // writes the ROOT file, so a non-root profile that needed a migration
+        // had its settings written over the root profile on every load (the
+        // root's accounts and paths went with them), and never received the
+        // migration itself, so the next load did it again.
+        let _ = save_settings_in(id, &s);
     }
     s
 }
@@ -21981,7 +22035,7 @@ pub fn run() {
         // deterministic order (restore → clamp-up → position → show)
         // instead of letting the plugin's on_window_ready hook race the
         // setup code. The plugin still SAVES bounds on move/resize/close.
-        .plugin(tauri_plugin_window_state::Builder::default().skip_initial_state("main").build())
+        .plugin(tauri_plugin_window_state::Builder::default().skip_initial_state("main").skip_initial_state(PROCMON_WINDOW).build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -22899,6 +22953,72 @@ mod tests {
             crate::delete_task_file("t2").unwrap();
             assert!(!data.join("profiles/home/tasks/t2.json").exists());
             assert!(data.join("tasks/t1.json").exists(), "the sweep took an unrelated profile's task");
+        });
+    }
+
+    /// GH #316. Loading a non-root profile whose settings need a load-time
+    /// migration wrote that profile's settings over the ROOT file, taking the
+    /// root's accounts and paths with them, on every load.
+    /// GH #311. An install from before the picker has a claude entry with no
+    /// `resume_picker_args`; the load backfills the built-in default, as it
+    /// does for the other capability lists, so a failed resume opens claude's
+    /// picker without anyone visiting Settings.
+    #[test]
+    fn an_existing_claude_entry_gains_its_session_picker_on_load() {
+        with_scratch_data_dir(|data| {
+            let mut s = crate::load_settings_in(&ProfileId::Root);
+            s.agents.iter_mut().find(|a| a.id == "claude").unwrap()
+                .capabilities.resume_picker_args.clear();
+            crate::save_settings_in(&ProfileId::Root, &s).unwrap();
+            let raw = std::fs::read_to_string(data.join("settings.json")).unwrap();
+            assert!(!raw.contains("\"resume_picker_args\": [\n        \"--resume\""), "the fixture must start without it");
+
+            let loaded = crate::load_settings_in(&ProfileId::Root);
+            let caps = &loaded.agents.iter().find(|a| a.id == "claude").unwrap().capabilities;
+            assert_eq!(caps.resume_picker_args, vec!["--resume".to_string()]);
+            // Only where measured: codex has none until someone measures it.
+            let codex = &loaded.agents.iter().find(|a| a.id == "codex").unwrap().capabilities;
+            assert!(codex.resume_picker_args.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_profile_that_needs_a_migration_writes_its_own_file_not_the_roots() {
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            let home_id = ProfileId::Slug("home".into());
+
+            let mut root = crate::load_settings_in(&ProfileId::Root);
+            root.default_tasks_path = "~/root-tasks".into();
+            let claude = root.agents.iter_mut().find(|a| a.id == "claude").unwrap();
+            claude.accounts = vec!["Personal".into(), "Work".into()];
+            claude.default_account = Some("Work".into());
+            crate::save_settings_in(&ProfileId::Root, &root).unwrap();
+            let root_before = std::fs::read_to_string(data.join("settings.json")).unwrap();
+
+            // A profile file from an older build: its symlink list is the
+            // legacy default, which the loader migrates.
+            let mut home = crate::load_settings_in(&home_id);
+            home.default_tasks_path = "~/home-tasks".into();
+            home.worktree_symlink_paths = crate::legacy_worktree_symlink_paths_v1_3();
+            crate::save_settings_in(&home_id, &home).unwrap();
+
+            let loaded = crate::load_settings_in(&home_id);
+            assert_eq!(loaded.default_tasks_path, "~/home-tasks");
+            assert_eq!(loaded.worktree_symlink_paths, crate::default_worktree_symlink_paths());
+
+            // The root file is byte-for-byte what it was.
+            assert_eq!(std::fs::read_to_string(data.join("settings.json")).unwrap(), root_before);
+            let root_after = crate::load_settings_in(&ProfileId::Root);
+            let c = root_after.agents.iter().find(|a| a.id == "claude").unwrap();
+            assert_eq!(c.accounts, vec!["Personal".to_string(), "Work".to_string()]);
+            assert_eq!(root_after.default_tasks_path, "~/root-tasks");
+
+            // And the profile's own file received the migration, so the next
+            // load has nothing left to migrate.
+            let on_disk: Settings = serde_json::from_str(
+                &std::fs::read_to_string(data.join("profiles/home/settings.json")).unwrap()).unwrap();
+            assert_eq!(on_disk.worktree_symlink_paths, crate::default_worktree_symlink_paths());
         });
     }
 
@@ -27778,6 +27898,60 @@ mod tests {
         assert!(sides.modified_data.is_some());
         assert_eq!(sides.original_bytes, 0);
         assert_eq!(sides.modified_bytes, TINY_PNG.len() as u64);
+    }
+
+    #[test]
+    fn diff_sides_reports_a_deleted_png_as_a_one_sided_image() {
+        // The delete half of add/delete symmetry: the worktree file is gone,
+        // so `safe_task_path` can't canonicalize it and the image probe has
+        // to come off the path's extension alone. That failing used to drop
+        // this to "binary", and the pane showed "Binary file · deleted"
+        // instead of the picture that was removed.
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_commit_bytes(dir.path(), "gone.png", TINY_PNG);
+        fs::remove_file(dir.path().join("gone.png")).unwrap();
+
+        let sides = task_file_diff_sides_for_task(&task_at(dir.path()), "gone.png", None).unwrap();
+        assert_eq!(sides.kind, "image");
+        assert_eq!(sides.mime.as_deref(), Some("image/png"));
+        assert!(sides.original_exists);
+        assert!(!sides.modified_exists);
+        assert!(sides.original_data.is_some());
+        assert!(sides.modified_data.is_none());
+        assert_eq!(sides.original_bytes, TINY_PNG.len() as u64);
+        assert_eq!(sides.modified_bytes, 0);
+        // No worktree file → no fingerprint; the pane hides "Viewed" on "".
+        assert!(sides.fp.is_empty());
+    }
+
+    #[test]
+    fn diff_sides_reports_a_commit_scope_deleted_png_as_a_one_sided_image() {
+        // A History diff whose right side is a blob, not the worktree: the
+        // deletion case must not depend on the file's on-disk state at all.
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_set_identity(dir.path());
+        git_commit_bytes(dir.path(), "gone.png", TINY_PNG);
+        fs::remove_file(dir.path().join("gone.png")).unwrap();
+        git_run(dir.path(), &["add", "-A"]);
+        git_run(dir.path(), &["commit", "-m", "drop gone.png"]);
+        let sha = git_head(dir.path());
+        // Recreate the file so the worktree copy exists but is irrelevant:
+        // `commit:` reads both sides from the object store either way.
+        fs::write(dir.path().join("gone.png"), TINY_PNG).unwrap();
+
+        let sides = task_file_diff_sides_for_task(
+            &task_at(dir.path()),
+            "gone.png",
+            Some(&format!("commit:{sha}")),
+        )
+        .unwrap();
+        assert_eq!(sides.kind, "image");
+        assert!(sides.original_exists);
+        assert!(!sides.modified_exists);
+        assert!(sides.original_data.is_some());
+        assert!(sides.modified_data.is_none());
     }
 
     #[test]

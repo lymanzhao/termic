@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir } from "../../wdio.conf.js";
 // Agent work-state, attention and queue flows.
@@ -40,6 +40,8 @@ import {
   waitForWorkBadgeGone,
   workBadges,
   setWindowPresence,
+  delegatedLabel,
+  workBadgeMark,
 } from "../helpers";
 
 /** ms since the task's agent tab last produced PTY bytes. Not in the DOM. */
@@ -1574,30 +1576,137 @@ describe("agent notifications", () => {
 
     const chip = await browser.$('[data-testid="usage-chip"]');
     await chip.waitForExist({ timeout: 20_000 });
+    // ONE round trip for the whole readout, not fifteen. Every `getAttribute`
+    // and `getText` is a WebDriver command, and this case was spending the
+    // best part of a minute on them; read together they also describe the
+    // chip at ONE instant rather than across the fifteen seconds it used to
+    // take to walk it, which is the difference between a snapshot and a
+    // slideshow when something is re-rendering.
+    const seen = await browser.execute(() => {
+      const q = (sel: string) => document.querySelector(sel) as HTMLElement | null;
+      const chipEl = q('[data-testid="usage-chip"]')!;
+      const fiveH = q('[data-usage-window="5h"]')!;
+      const week = q('[data-usage-window="wk"]')!;
+      return {
+        session: chipEl.dataset.usageSession,
+        weekly: chipEl.dataset.usageWeekly,
+        source: chipEl.dataset.usageSource,
+        level: chipEl.dataset.usageLevel,
+        text: chipEl.innerText,
+        gauges: document.querySelectorAll('[data-testid="usage-gauge"]').length,
+        fiveHText: fiveH.innerText,
+        weekText: week.innerText,
+        fiveHFill: fiveH.dataset.usageFill,
+        weekFill: week.dataset.usageFill,
+        weekBg: getComputedStyle(week).backgroundImage,
+      };
+    });
     // The numbers the USER reads, not the store field behind them.
-    expect(await chip.getAttribute("data-usage-session")).toBe("30");
-    expect(await chip.getAttribute("data-usage-weekly")).toBe("95");
-    expect(await chip.getAttribute("data-usage-source")).toBe("statusline");
-    expect(await chip.getAttribute("data-usage-level")).toBe("critical");
-    expect(await chip.getText()).toContain("30%");
-    expect(await chip.getText()).toContain("95%");
+    expect(seen.session).toBe("30");
+    expect(seen.weekly).toBe("95");
+    expect(seen.source).toBe("statusline");
+    expect(seen.level).toBe("critical");
+    expect(seen.text).toContain("30%");
+    expect(seen.text).toContain("95%");
     // One gauge per window, and each one is the BACKGROUND of its own number,
     // so the 5h figure can never be sitting next to the week's bar. Assert the
     // value each gauge was drawn to rather than counting elements: a gauge
     // pointed at the wrong window is the bug this readout exists to prevent,
     // and two elements of any kind would satisfy a count.
-    expect(await (await browser.$$('[data-testid="usage-gauge"]')).length).toBe(2);
-    const fiveH = await browser.$('[data-usage-window="5h"]');
-    const week = await browser.$('[data-usage-window="wk"]');
-    expect(await fiveH.getText()).toContain("30%");
-    expect(await week.getText()).toContain("95%");
-    expect(await fiveH.getAttribute("data-usage-fill")).toBe("30");
-    expect(await week.getAttribute("data-usage-fill")).toBe("95");
+    expect(seen.gauges).toBe(2);
+    expect(seen.fiveHText).toContain("30%");
+    expect(seen.weekText).toContain("95%");
+    expect(seen.fiveHFill).toBe("30");
+    expect(seen.weekFill).toBe("95");
     // The fill is a gradient with a hard stop at the percentage, so the stop
     // is the thing that has to be there: a background that lost its gradient
     // (a dropped inline style, a theme token that resolved to nothing) still
     // renders a perfectly plausible chip.
-    expect((await week.getCSSProperty("background-image")).value).toContain("gradient");
+    expect(seen.weekBg).toContain("gradient");
+  });
+
+  // A task runs as many agents as it has tabs. The footer's original rule was
+  // one hide-below-780px on a secondary chip, a width measured for the TWO-
+  // agent case, so five agents in one task never tripped it and the chips ran
+  // off the end of the bar and under the right panel.
+  //
+  // A chip is now either fully shown or not shown at all, the agent whose tab
+  // is on screen is never hidden, and a marker says so whenever anything is
+  // missing. The breakpoints are CSS container queries, so what this case can
+  // assert is the DOM contract and the geometry, not which width hides what.
+  //
+  // Tabs are added through the app's own store rather than spawned: this is a
+  // LAYOUT case, the chip renders per distinct cli whether or not a process
+  // came up, and waiting on three real spawns would buy nothing and cost the
+  // budget the case above is already written against.
+  it("hides whole chips rather than truncating them, and says when it did", async () => {
+    await ensureActiveTask(taskId!);
+    const before = (await browser.$$('[data-testid="usage-chip"]')).length;
+    const added = await browser.execute((t) => {
+      const ids: string[] = [];
+      for (const cli of ["codex", "gemini", "grok"]) {
+        const id = crypto.randomUUID();
+        window.__termic!.useApp.getState().addTab(
+          t, { id, type: "terminal", cli, title: cli } as never,
+        );
+        ids.push(id);
+      }
+      return ids;
+    }, taskId);
+    // EVERY exit removes them, including a throw half way. All the `it`s in
+    // this file share one window, and three stray agent tabs move the active
+    // tab out from under the submits that follow: leaving them behind turned
+    // one failure here into every later case in the file failing with
+    // "xterm never forwarded it".
+    try {
+      await browser.waitUntil(
+        async () => (await browser.$$('[data-testid="usage-chip"]')).length > before
+          || !!(await browser.$('[data-testid="agent-chips-more"]')).elementId,
+        { timeout: 10_000, timeoutMsg: "the extra agents changed nothing in the footer" },
+      );
+
+      // One pass in the page: wdio element arrays buy nothing here and the
+      // geometry has to be measured in the window anyway.
+      const seen = await browser.execute(() => {
+        const chips = [...document.querySelectorAll('[data-testid="usage-chip"]')];
+        const bar = document.querySelector('[data-testid="task-footer"]');
+        const right = bar ? bar.getBoundingClientRect().right : 0;
+        const shown = chips.filter(c => c.getBoundingClientRect().width > 0);
+        const marker = document.querySelector('[data-testid="agent-chips-more"]');
+        return {
+          total: chips.length,
+          shown: shown.length,
+          markerInDom: !!marker,
+          markerShown: !!marker && marker.getBoundingClientRect().width > 0,
+          escaped: shown.filter(c => c.getBoundingClientRect().right > right + 1).length,
+        };
+      });
+
+      // The marker is in the DOM whenever the task COULD be hiding an agent;
+      // CSS decides whether it is on screen, so its presence is what we pin.
+      expect(seen.markerInDom).toBe(true);
+      // One direction only, and deliberately. "A chip is hidden" implies the
+      // marker shows. The converse does NOT hold: an agent whose chip renders
+      // nothing at all (no usage feed, no account, no context) has no chip to
+      // hide, and the bar is still not showing that agent, which is what the
+      // marker says. Asserting the biconditional here is what failed: three
+      // agents with no data contributed no chips, so every chip fitted while
+      // the marker correctly reported agents the bar was not showing.
+      if (seen.shown < seen.total) expect(seen.markerShown).toBe(true);
+      // A shown chip is a WHOLE chip, never a truncated one.
+      expect(seen.shown).toBeGreaterThan(0);
+      // The reported bug itself: no chip may extend past the bar it lives in.
+      expect(seen.escaped).toBe(0);
+    } finally {
+      await browser.execute((t, ids) => {
+        const app = window.__termic!.useApp.getState();
+        for (const id of ids as string[]) app.closeTab(t, id);
+      }, taskId, added);
+      await browser.waitUntil(
+        async () => (await browser.$$('[data-testid="usage-chip"]')).length <= before,
+        { timeout: 10_000, timeoutMsg: "the extra agent tabs were not cleaned up" },
+      );
+    }
   });
 
   // Its own `it`, and the reason is the budget the case above is written
@@ -1682,13 +1791,23 @@ describe("agent notifications", () => {
     await submitToAgent(taskId!, "#usage ctx 170000 200000");
     const gauge = await browser.$('[data-testid="context-gauge"]');
     await gauge.waitForExist({ timeout: 20_000, timeoutMsg: "the context gauge never appeared" });
-    expect(await gauge.getText()).toContain("85%");
-    expect(await gauge.getText()).toContain("ctx");
-    expect(await gauge.getAttribute("data-usage-fill")).toBe("85");
-    const chip = await browser.$('[data-testid="usage-chip"]');
-    expect(await chip.getAttribute("data-context-percent")).toBe("85");
+    // One read, same reason as the case above.
+    const seen = await browser.execute(() => {
+      const g = document.querySelector('[data-testid="context-gauge"]') as HTMLElement;
+      const chipEl = document.querySelector('[data-testid="usage-chip"]') as HTMLElement;
+      return {
+        text: g.innerText,
+        fill: g.dataset.usageFill,
+        contextPercent: chipEl.dataset.contextPercent,
+        planGauges: document.querySelectorAll('[data-testid="usage-gauge"]').length,
+      };
+    });
+    expect(seen.text).toContain("85%");
+    expect(seen.text).toContain("ctx");
+    expect(seen.fill).toBe("85");
+    expect(seen.contextPercent).toBe("85");
     // The plan windows are still there beside it: one chip, both readouts.
-    expect(await (await browser.$$('[data-testid="usage-gauge"]')).length).toBe(2);
+    expect(seen.planGauges).toBe(2);
   });
 
   // Its own `it` for the budget reason the gauge screenshots have one: every
@@ -2297,6 +2416,120 @@ describe("a claude session that moves after /clear is the one resumed", () => {
   });
 });
 
+// ── a stored session that no longer resolves opens the agent's picker ─────
+//
+// GH #311. A stored id that fails to resume used to be answered with a fresh
+// session in silence, although the conversation was usually still there and
+// only termic's pointer was stale. Now, for an agent with `resume_picker_args`
+// (claude's `--resume` with no id, measured on 2.1.278), the next spawn opens
+// THAT agent's picker; the session picked there comes back over the hook OSC
+// and is what the next relaunch resumes. Leaving the picker still starts fresh.
+// `fakeclaude` reproduces claude's three shapes (scripts/fake-agent.sh).
+describe("a stored session that no longer resolves opens the agent's picker (#311)", () => {
+  // Fresh per run: the dead-session list lives in the profile and outlives a
+  // run, so a fixed id killed last time would already be dead here.
+  const PICKED = crypto.randomUUID();
+  let taskId: string | null = null;
+
+  before(() => writeFileSync(join(dataDir, "e2e-dead-sessions"), ""));
+
+  function spawnArgv(id: string): string[] {
+    const raw = readFileSync(join(dataDir, "e2e-agent-argv.log"), "utf8");
+    return raw.split("\n").filter(l => l.startsWith(id + "\t")).map(l => l.slice(id.length + 1));
+  }
+  const stored = (id: string) => browser.execute(
+    (t) => (window.__termic!.useApp.getState().tabs[t] ?? [])[0]?.sessionId ?? null, id);
+  /** Mark a session id as one the fixture cannot resume. */
+  const kill = (sid: string) => appendFileSync(join(dataDir, "e2e-dead-sessions"), sid + "\n");
+  const relaunch = async (id: string) => {
+    await browser.execute((t) => {
+      const s = window.__termic!.useApp.getState();
+      s.stopTask(t);
+      s.setActiveTask(null);
+    }, id);
+    await browser.pause(300);
+    await browser.execute((t) => window.__termic!.useApp.getState().setActiveTask(t), id);
+  };
+  const waitSpawns = (id: string, n: number, msg: string) => browser.waitUntil(
+    () => Promise.resolve(spawnArgv(id).length >= n), { timeout: 30_000, timeoutMsg: msg });
+  const toasts = () => browser.execute(() =>
+    (window.__termic!.useUI.getState().toasts as any[]).map(t => t.msg as string));
+
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("opens the picker instead of a fresh session, and says why", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("e2e-picker", true, "fakeclaude");
+    const id = taskId;
+    await waitForAgentReady(id);
+    // The minted id is only held once the spawn survives RESUME_FAILURE_MS.
+    await browser.pause(2500);
+    await submitToAgent(id, "hello");
+    await browser.waitUntil(async () => !!(await stored(id)),
+      { timeout: 10_000, timeoutMsg: "the minted id was never persisted" });
+    const minted = (await stored(id))!;
+    kill(minted);
+
+    const before = spawnArgv(id).length;
+    await relaunch(id);
+    // The doomed resume, then the picker: `--resume` with no id after it.
+    await waitSpawns(id, before + 2, "no picker spawn followed the failed resume");
+    const [resume, picker] = spawnArgv(id).slice(before);
+    expect(resume).toContain(`--resume ${minted}`);
+    expect(picker).toMatch(/(^|\s)--resume(\s|$)/);
+    expect(picker).not.toContain(minted);
+    expect(picker).not.toContain("--session-id");
+
+    // The toast offers the picker and carries the agent's own reason.
+    const said = (await toasts()).join("\n");
+    expect(said).toMatch(/Pick one to continue, or press Esc to start a new one/);
+    expect(said).toMatch(/No conversation found with session ID/);
+    // The stale id is gone; nothing is stored until the user picks.
+    expect(await stored(id)).toBe(null);
+  });
+
+  it("stores the session picked in the agent's picker, and resumes it next time", async () => {
+    const id = taskId!;
+    await waitForAgentReady(id);
+    await submitToAgent(id, `pick ${PICKED}`);
+    await browser.waitUntil(async () => (await stored(id)) === PICKED,
+      { timeout: 10_000, timeoutMsg: "the session picked in the agent's picker was not stored" });
+
+    const before = spawnArgv(id).length;
+    await relaunch(id);
+    await waitSpawns(id, before + 1, "the task never respawned");
+    expect(spawnArgv(id)[before]).toContain(`--resume ${PICKED}`);
+  });
+
+  it("starts a fresh session when the picker is left without choosing", async () => {
+    const id = taskId!;
+    await waitForAgentReady(id);
+    kill(PICKED);
+    const before = spawnArgv(id).length;
+    await relaunch(id);
+    await waitSpawns(id, before + 2, "no picker spawn followed the failed resume");
+    await waitForAgentReady(id);
+    // Leaving claude's picker is Esc alone, no Enter, which exits 1 with
+    // nothing picked. Written to the pty directly: typing through xterm would
+    // add the Enter that picking takes.
+    await browser.execute(async (t) => {
+      const st = window.__termic!.useApp.getState();
+      const ptyId = (st.tabs[t] ?? [])[0]?.ptyId;
+      await window.__termic!.ipc.ptyWrite(ptyId, [27]);
+    }, id);
+    await waitSpawns(id, before + 3, "leaving the picker did not start a fresh session");
+    const fresh = spawnArgv(id)[before + 2];
+    expect(fresh).toContain("--session-id");
+    // And exactly once: no loop back into the picker.
+    await browser.pause(2500);
+    expect(spawnArgv(id).length).toBe(before + 3);
+  });
+});
+
+
 // The same agent, added to a task from the + menu instead of being the task's
 // own. That tab is the FIRST of its cli, so every "primary" test in the spawn
 // path says yes to it, and it reports and stores a session id exactly like the
@@ -2481,5 +2714,253 @@ describe("closing the main agent tab while another tab is open", () => {
         ?.persisted_tabs ?? [];
       return durable.filter(d => d.session_id).map(d => ({ id: d.id, def: !!d.is_default }));
     }, id)).toEqual([{ id: agentTab, def: true }]);
+  });
+});
+
+// Work the agent DELEGATED and has not finished: a subagent it is waiting on,
+// a shell it backgrounded. Measured against a live claude 2.1.278; the whole
+// measurement set is in docs/agent-hooks.md "Delegated work".
+//
+// Before this, a done hook that found outstanding work wrote NOTHING, which on
+// the wire is byte-for-byte what a model mid-token writes. Three things came
+// out of that, and the three cases below are one each:
+//
+//   - the tab span with no way to tell waiting from thinking,
+//   - the hold was per SESSION, not per turn: one `sleep 900` backgrounded in
+//     turn one held the `Stop` of every later turn, including a one-word reply
+//     that used no tools,
+//   - and a detached shell that never exits held it forever, resolved only by
+//     the 20-minute liveness ceiling, which clears the spinner and tells
+//     nobody.
+//
+// The fixture's `#delegated BODY` writes exactly what the generated script
+// writes (agent_hooks.rs), so these drive the real wire format and not a
+// store poke.
+describe("delegated work", () => {
+  let taskId!: string;
+  // The real grace is five minutes. A spec that waited it out would be the
+  // slowest in the suite by an order of magnitude, so the same debug knob the
+  // ceiling has (localStorage) shortens it.
+  const GRACE_MS = 6_000;
+
+  before(async function () {
+    this.timeout(90_000);
+    await waitForAppShell();
+    await requireTermicApi();
+    await requireWorkBadges();
+    await setHooksOwnState("fakeagent", true);
+    // Read once when the sampler starts, so it has to be set before the tab
+    // mounts, which is why this is a `before` and not inline.
+    await browser.execute((ms) => localStorage.setItem("delegatedGraceMs", String(ms)), GRACE_MS);
+    // The user is AWAY. A done on the tab you are looking at is acknowledged
+    // rather than badged (`isUserWatching` in store/app.ts), so two of these
+    // cases could not tell a turn that ENDED from one that was never
+    // announced. Backgrounding the task would do it too, but then the task
+    // view holds another task and there is no visible terminal to submit
+    // into: presence says the same thing without moving anything.
+    await setWindowPresence(false);
+    taskId = await openTask("e2e-delegated");
+    await waitForAgentReady(taskId);
+  });
+
+  after(async () => {
+    await browser.execute(() => localStorage.removeItem("delegatedGraceMs"));
+    await setHooksOwnState("fakeagent", false);
+    await setWindowPresence(true);
+    if (taskId) await archiveTask(taskId);
+  });
+
+  // Agent-owned work: a subagent. Measured twice, it resumed the turn by
+  // itself after ~70s. So the turn is genuinely still going and the spinner is
+  // right, but the model loop has STOPPED, and a tab that cannot say so leaves
+  // a nine-minute orchestration looking identical to a hung one.
+  it("keeps the turn open for a subagent, and says that is what it is waiting on", async function () {
+    this.timeout(90_000);
+    // The CONTROL first: an ordinary hook turn, working, nothing delegated.
+    // Without it the opacity below is a number with nothing to compare to,
+    // and "the delegated spinner is dimmer" is the kind of claim a screenshot
+    // agrees with whether or not it is true.
+    await submitToAgent(taskId, "#hookturn");
+    await waitForWorkBadge(taskId, "working", {
+      timeout: 20_000,
+      message: "the control turn never reached working",
+    });
+    expect(await delegatedLabel(taskId)).toBe(null);
+    const plain = await workBadgeMark(taskId);
+
+    await submitToAgent(taskId, "#delegated 2 subagent a1,a2");
+    await waitForWorkBadge(taskId, "working", {
+      timeout: 20_000,
+      message: "a delegated report must leave the turn running",
+    });
+    await browser.waitUntil(async () => (await delegatedLabel(taskId)) === "subagent", {
+      timeout: 10_000,
+      timeoutMsg: `the badge never said what it was waiting on (saw ${await delegatedLabel(taskId)})`,
+    });
+
+    // Measured, not eyeballed. Both marks are small round outlines and a
+    // screenshot cannot tell them apart, so this asserts which one is drawn
+    // and how fast it turns: the working spinner every second, the
+    // background ring eight times slower. That difference is the whole claim
+    // the badge makes, and an agent waiting two hours on a monitor is the
+    // case it exists for.
+    const held = await workBadgeMark(taskId);
+    if (plain?.kind !== "spinner" || plain?.duration !== "1s") {
+      throw new Error(`the control is not the working spinner: ${JSON.stringify(plain)}`);
+    }
+    // Reduced motion stops the ring, so a machine with the setting on
+    // reports no animation and is still correct.
+    if (held?.kind !== "background" || !["8s", "0s"].includes(held?.duration ?? "")) {
+      throw new Error(`delegated work did not swap the spinner for the ring: ${JSON.stringify(held)}`);
+    }
+
+    // And it STAYS. Agent-owned work is excluded from the detached grace, on
+    // the measurement that it comes back on its own: putting a clock on it
+    // would announce over a healthy orchestration. Well past the grace, and
+    // still short of the ceiling, so a correct fire cannot be read as the bug.
+    await browser.pause(GRACE_MS * 2);
+    const badges = await workBadges(taskId);
+    if (!badges.includes("working")) {
+      throw new Error(
+        `a subagent hold was cut short by the detached grace (badges: ${badges.join()})`,
+      );
+    }
+    await snap("agent-delegated-subagent.png");
+  });
+
+  // THE compounding bug. Same ids as the previous report, so everything
+  // outstanding was already outstanding when the last turn ended: it cannot be
+  // what THIS turn is waiting on. The turn is over.
+  //
+  // Note what this case does NOT do: it never sends a plain done. Before the
+  // carried-over rule there was nothing here to end the turn at all, for the
+  // rest of the session.
+  it("ends a turn whose outstanding work all predates it", async function () {
+    this.timeout(90_000);
+    await submitToAgent(taskId, "#delegated 2 subagent a1,a2");
+    await waitForWorkBadge(taskId, "done", {
+      timeout: 30_000,
+      interval: 300,
+      message: "work that predates the turn either held it open or ended it without announcing",
+    });
+
+    // The leftovers are still running, and a tab that says so is the honest
+    // rendering of a finished turn. This is the decoration half.
+    expect(await delegatedLabel(taskId)).toBe("subagent");
+    await snap("agent-delegated-carried.png");
+
+    // And it OUTLIVES the badge. Coming back to the tab clears the done (the
+    // user has now seen it), which drops the badge entirely and would leave a
+    // tab with two subagents running looking exactly like an inert one. What
+    // is left is the lowest-priority state: a hollow ring that draws only in
+    // a slot nothing else wanted.
+    await setWindowPresence(true);
+    await browser.waitUntil(async () => (await taskViewBadge(taskId)) === "delegated", {
+      timeout: 15_000,
+      timeoutMsg: `the decoration did not outlive the done (badge ${await taskViewBadge(taskId)}`
+        + `, label ${await delegatedLabel(taskId)})`,
+    });
+    expect(await delegatedLabel(taskId)).toBe("subagent");
+    await snap("agent-delegated-idle-ring.png");
+    await setWindowPresence(false);
+  });
+
+  // The reported regression, as a case. Three background tasks reporting back
+  // one at a time: each `Stop` carries the remainder, so every set is a
+  // SUBSET of the one before. A subset test called the turn over after the
+  // first one landed and rang "done" with two still running, which is what a
+  // real session showed. One bell, at the end, and the intermediate landings
+  // show as partial.
+  it("rings once after the LAST of three, and shows the ones in between", async function () {
+    this.timeout(90_000);
+    await submitToAgent(taskId, "#delegated 3 subagent q1,q2,q3");
+    // TWO waits, and the first one is the point: the previous case leaves a
+    // `subagent` decoration on the tab, so waiting straight for that label
+    // matches the OLD one and asserts against whatever state the turn
+    // happens to be in a millisecond after a submit. The working edge clears
+    // the decoration, so "gone" is the signal that this turn has started and
+    // "back" is the signal that its own report has landed.
+    await browser.waitUntil(async () => (await delegatedLabel(taskId)) === null, {
+      timeout: 20_000,
+      timeoutMsg: "the new turn never cleared the previous report",
+    });
+    await browser.waitUntil(async () => (await delegatedLabel(taskId)) === "subagent", {
+      timeout: 20_000,
+      timeoutMsg: "the three-subagent turn never reported what it was waiting on",
+    });
+    expect(await taskViewBadge(taskId)).toBe("working");
+
+    // One lands. Still two to go, so this is NOT a done: it is partial, and
+    // it rings nothing.
+    await submitToAgent(taskId, "#delegated 2 subagent q2,q3");
+    await browser.waitUntil(async () => (await taskViewBadge(taskId)) === "partial", {
+      timeout: 20_000,
+      timeoutMsg: `a landing mid-orchestration did not read as partial (saw ${await taskViewBadge(taskId)})`,
+    });
+    await snap("agent-delegated-partial.png");
+
+    // The second lands. Still partial, still no bell.
+    await submitToAgent(taskId, "#delegated 1 subagent q3");
+    await browser.pause(1_500);
+    if ((await workBadges(taskId)).includes("done")) {
+      throw new Error("rang done with one subagent still running, which is the bug");
+    }
+
+    // The last one. NOW the turn is over, and this is the only bell.
+    await submitToAgent(taskId, "#hookdone");
+    await waitForWorkBadge(taskId, "done", {
+      timeout: 20_000,
+      message: "the turn never ended after the last subagent reported",
+    });
+    expect(await delegatedLabel(taskId)).toBe(null);
+    await snap("agent-delegated-three.png");
+  });
+
+  // Detached work, and the one case in the state machine that no signal can
+  // decide: a `Stop` only fires once the model loop has stopped, so a shell in
+  // its payload is always detached, but detached is not abandoned. Two
+  // measured runs with byte-identical payloads went opposite ways, one
+  // resuming after 75s and one never. So this is a clock, and it is the only
+  // clock here that is honest about being one.
+  it("calls the turn over when only detached work outlives the grace", async function () {
+    this.timeout(90_000);
+    // A NEW id, or the carried-over rule above would end the turn instantly
+    // and this would prove nothing.
+    await submitToAgent(taskId, "#delegated 1 shell b9");
+    await waitForWorkBadge(taskId, "working", {
+      timeout: 20_000,
+      message: "the detached report never reached working",
+    });
+    // Waited for, not asserted: the working badge lands on the turn's opening
+    // hook and the delegated report only arrives when the done hook runs, so
+    // an immediate read races the thing under test. It also has to REPLACE the
+    // previous case's `subagent`, which is why the wait is on the value.
+    await browser.waitUntil(async () => (await delegatedLabel(taskId)) === "shell", {
+      timeout: 20_000,
+      timeoutMsg: `the detached report never reached the badge (saw ${await delegatedLabel(taskId)})`,
+    });
+
+    // `done`, not merely "not working": this case has to prove the turn is
+    // ANNOUNCED at the grace. The 20-minute ceiling already stops spinners
+    // silently, and telling nobody is the failure this replaces.
+    await waitForWorkBadge(taskId, "done", {
+      timeout: GRACE_MS + 45_000,
+      interval: 500,
+      message: "a detached shell held the turn open past its grace, which is the bug",
+    });
+    // The shell did not stop existing because the turn ended, so the tab has
+    // to keep saying so. This is the decoration surviving a done, which is
+    // the half that makes an idle tab honest rather than inert.
+    if ((await delegatedLabel(taskId)) !== "shell") {
+      const state = await browser.execute((id) => {
+        const t = window.__termic!.useApp.getState().tabs[id][0] as never as
+          { workState?: string; delegatedWork?: unknown };
+        return { work: t.workState, delegated: t.delegatedWork };
+      }, taskId);
+      throw new Error(
+        `the grace done dropped the decoration: badges=${(await workBadges(taskId)).join()}`
+        + ` label=${await delegatedLabel(taskId)} store=${JSON.stringify(state)}`,
+      );
+    }
   });
 });

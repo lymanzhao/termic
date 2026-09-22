@@ -231,6 +231,20 @@ export function seed(o = {}) {
       .replaceAll("__HOME__", home)
       .replaceAll("__FIXTURE__", fixture)
       .replaceAll("__TASKS__", tasksPath);
+  // Profiles are OFF for every spec but profiles.e2e.ts, which turns them on
+  // and turns them back off in its own teardown. When that spec dies before
+  // the teardown runs (a dropped session, a crash), the profile is left
+  // enabled, and since nothing else here rewrites it, EVERY later spec in
+  // that run and EVERY later run on this machine boots into a profiled app
+  // where the fixture project is not in the active profile: they all die on
+  // `proj.id` being undefined. That happened, and it read as nine unrelated
+  // failures rather than one crash plus a poisoned fixture.
+  //
+  // So the seed owns the dormant state too, not just the projects. This is
+  // the same rule the fixture repo already follows a few lines up: restore
+  // what a crashed run cannot.
+  rmSync(path.join(dataDir, "profiles.json"), { force: true });
+  rmSync(path.join(dataDir, "profiles"), { recursive: true, force: true });
   for (const f of ["settings.json", "projects.json"]) {
     writeFileSync(
       path.join(dataDir, f),

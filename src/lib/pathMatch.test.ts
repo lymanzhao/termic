@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizePath, matchesSuffix, resolvePathClick, expandTilde, resolveAbsoluteClick } from "./pathMatch";
+import { normalizePath, matchesSuffix, resolvePathClick, expandTilde, tildePath, resolveAbsoluteClick } from "./pathMatch";
 
 describe("normalizePath", () => {
   it("strips a leading ./", () => {
@@ -126,5 +126,23 @@ describe("resolveAbsoluteClick", () => {
   it("ignores empty roots", () => {
     expect(resolveAbsoluteClick("/w/task/src/a.ts", [{ path: "", prefix: "" }, task]))
       .toEqual({ kind: "inside", rel: "src/a.ts" });
+  });
+});
+
+describe("tildePath", () => {
+  it("shortens a path under home and leaves the rest alone", () => {
+    expect(tildePath("/Users/u/.codex/hooks.json", "/Users/u")).toBe("~/.codex/hooks.json");
+    expect(tildePath("/Users/u", "/Users/u")).toBe("~");
+    expect(tildePath("/etc/hosts", "/Users/u")).toBe("/etc/hosts");
+  });
+
+  it("does not shorten a sibling that merely starts with the same letters", () => {
+    // `/Users/under` is not inside `/Users/u`, and a prefix test without the
+    // separator would turn it into `~nder`.
+    expect(tildePath("/Users/under/x", "/Users/u")).toBe("/Users/under/x");
+  });
+
+  it("returns the path unchanged when home is unknown", () => {
+    expect(tildePath("/Users/u/x", "")).toBe("/Users/u/x");
   });
 });

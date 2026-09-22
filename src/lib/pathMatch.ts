@@ -43,6 +43,15 @@ export function expandTilde(p: string, home: string): string {
   return p.startsWith("~/") ? home + p.slice(1) : p;
 }
 
+/** The inverse: shorten an absolute path under `home` to a `~/` one. For
+ *  display only, and unchanged when `home` is unknown or the path lies
+ *  outside it, so the worst case is the full path rather than a wrong one. */
+export function tildePath(p: string, home: string): string {
+  if (!home) return p;
+  if (p === home) return "~";
+  return p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
+}
+
 export type AbsoluteClick =
   | { kind: "inside"; rel: string }
   | { kind: "outside"; abs: string };

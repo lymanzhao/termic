@@ -67,6 +67,8 @@ const LS_OFFER_TOUCH_ID_SUDO = "offerTouchIdForSudo";
 const LS_CONFIRM_ACCOUNT_RESTART = "confirmBeforeAccountRestart";
 const LS_ARCHIVE_DELETE_BRANCH = "archiveDeleteBranch";
 const LS_WORKING_INDICATOR = "workingIndicator";
+const LS_PARTIAL_DONE_INDICATOR = "partialDoneIndicator";
+const LS_ATTENTION_INDICATOR = "attentionIndicator";
 const LS_DEFAULT_SANDBOX = "globalDefaultSandbox";
 const LS_DEFAULT_SANDBOX_KIND = "globalDefaultSandboxKind";
 const LS_SANDBOX_BYPASS  = "sandboxBypassPermissions";
@@ -544,6 +546,20 @@ interface PrefsState {
    *  signal stuck, so TerminalPane has an absolute ceiling that force-clears
    *  a stale "working" state regardless of sender signals. */
   workingIndicator: boolean;
+  /** Draw the PARTIALLY DONE mark: some of what an agent delegated has
+   *  reported back while the rest runs on (`lib/delegatedWork.ts`). ON by
+   *  default, because on a turn with three subagents it is the only thing
+   *  that moves between "started" and "finished".
+   *
+   *  Off is for someone who reads the intermediate mark as noise. It falls
+   *  back to the background-work ring, NOT to done: the turn genuinely is
+   *  not over, and the one thing this switch must never do is announce one
+   *  early. */
+  partialDoneIndicator: boolean;
+  /** Draw the NEEDS ATTENTION bell: the agent is blocked on you. Its own
+   *  switch since it is the one mark that is about you rather than about the
+   *  agent, and the only one that can arrive when you are not looking. */
+  attentionIndicator: boolean;
   /** Gates remote (http/https) images in the markdown preview. OFF by
    *  default: the webview sits outside the seatbelt + CONNECT proxy cage,
    *  so an `<img src="https://...">` fires an unprompted GET to whatever
@@ -867,6 +883,8 @@ interface PrefsState {
   setConfirmBeforeAccountRestart: (v: boolean) => void;
   setArchiveDeleteBranch: (v: boolean) => void;
   setWorkingIndicator: (v: boolean) => void;
+  setPartialDoneIndicator: (v: boolean) => void;
+  setAttentionIndicator: (v: boolean) => void;
   setLoadRemoteImages: (v: boolean) => void;
   setSidebarHoverReveal: (v: boolean) => void;
   setFindInFilesRegex: (v: boolean) => void;
@@ -1050,6 +1068,16 @@ const initialArchiveDeleteBranch = lsGetBool(LS_ARCHIVE_DELETE_BRANCH, false);
 // OFF by default — experimental re-introduction of the work-in-progress
 // spinner. Opt in via Settings → General.
 const initialWorkingIndicator = lsGetBool(LS_WORKING_INDICATOR, true);
+const initialPartialDoneIndicator = lsGetBool(LS_PARTIAL_DONE_INDICATOR, true);
+// Seeded from `settledHighlight` when this key is absent, which is every
+// install that predates the switch. Attention used to ride that pref, so
+// somebody who had turned the work-done UI off to stop being interrupted
+// would otherwise get bells back on upgrade: a preference silently reversed
+// is worse than one that was never offered.
+const initialAttentionIndicator = lsGetBool(
+  LS_ATTENTION_INDICATOR,
+  lsGetBool(LS_SETTLED_HIGHLIGHT, true),
+);
 // OFF by default (issue #69): closing the remote-image sandbox gap must not
 // silently start firing image requests for existing users.
 const initialLoadRemoteImages = lsGetBool(LS_LOAD_REMOTE_IMAGES, false);
@@ -1122,6 +1150,8 @@ export const usePrefs = create<PrefsState>(set => ({
   confirmBeforeAccountRestart: initialConfirmAccountRestart,
   archiveDeleteBranch: initialArchiveDeleteBranch,
   workingIndicator: initialWorkingIndicator,
+  partialDoneIndicator: initialPartialDoneIndicator,
+  attentionIndicator: initialAttentionIndicator,
   loadRemoteImages: initialLoadRemoteImages,
   sidebarHoverReveal: initialSidebarHoverReveal,
   findInFilesRegex: initialFindInFilesRegex,
@@ -1424,6 +1454,14 @@ export const usePrefs = create<PrefsState>(set => ({
   setWorkingIndicator: (v) => {
     try { localStorage.setItem(LS_WORKING_INDICATOR, v ? "1" : "0"); } catch {}
     set({ workingIndicator: v });
+  },
+  setPartialDoneIndicator: (v) => {
+    try { localStorage.setItem(LS_PARTIAL_DONE_INDICATOR, v ? "1" : "0"); } catch {}
+    set({ partialDoneIndicator: v });
+  },
+  setAttentionIndicator: (v) => {
+    try { localStorage.setItem(LS_ATTENTION_INDICATOR, v ? "1" : "0"); } catch {}
+    set({ attentionIndicator: v });
   },
   setLoadRemoteImages: (v) => {
     try { localStorage.setItem(LS_LOAD_REMOTE_IMAGES, v ? "1" : "0"); } catch {}

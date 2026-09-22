@@ -4,6 +4,51 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.7.0] - 2026-09-22
+
+Agents now report the work they hand off, and every status mark says what it means.
+
+### Features
+- **A tab says when its agent is waiting on something it started.** An agent
+  that spawns subagents or leaves a script running has stopped generating,
+  and until now that looked identical to a model mid-sentence. It gets its
+  own mark: a dotted ring that turns slowly, an outlined dot once some of
+  that work has come back, and the usual bullet when the turn really ends.
+  A turn that leaves a shell running (a dev server, say) now finishes
+  instead of spinning until it times out, and it stops swallowing the
+  completion of every later turn in that session.
+- **One ping, after the last one.** Three background agents reporting back
+  at one, two and three minutes notify you once, at the end, rather than
+  claiming the turn finished when the first one lands.
+- **Settings shows you the marks.** Notifications has one switch per mark,
+  each drawing the mark it controls, including new switches for the
+  partially-done dot and the needs-you bell.
+- **A first-run step on how Termic is laid out.** Projects, tasks, and every
+  status mark against a replica of the real sidebar, plus main checkout
+  against worktree drawn with the New Task toggle, since a worktree is a
+  second folder on disk and not everyone reads it that way.
+- **Agent hooks show what they install, one tab per file.** Paths relative
+  to your home directory, and the events each script runs on.
+- **A failed resume opens the agent's own session picker.**
+  ([#311](https://github.com/simion/termic/issues/311))
+
+### Bug fixes
+- The working spinner was thicker on a retina display than anywhere else. It
+  now lands on whole pixels on both.
+- A status mark jumped a pixel when you hovered its row.
+- A finished badge stayed on an agent that had already started working again.
+- The tab strip ignored the work-done and needs-you settings, so turning
+  them off quietened the sidebar and left the tabs lit.
+- A deleted image in a diff showed as a binary summary instead of an image.
+  ([#315](https://github.com/simion/termic/issues/315))
+- A profile's load-time migration wrote to the wrong file.
+  ([#316](https://github.com/simion/termic/issues/316))
+- Terminal glyphs could come back wrong after a theme or font change.
+  ([#314](https://github.com/simion/termic/issues/314))
+- The activity monitor remembered its size instead of its position.
+- A footer chip could render half its detail; it is now shown in full or not
+  at all.
+
 ## [1.6.0] - 2026-09-18
 
 Context window in the footer, plan usage for more agents, and quieter notifications.

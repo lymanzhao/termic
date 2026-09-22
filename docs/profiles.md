@@ -406,6 +406,15 @@ side of agent logins.
 - **`schema_version` forks.** Each profile's `settings.json` migrates
   independently, so migration code must tolerate profiles at different versions
   after a downgrade/upgrade cycle.
+- **A migration saves to the file it read (GH #316).** `load_settings_in(id)`
+  migrates on load and used to persist with `save_settings_inner`, which is the
+  ROOT writer. A non-root profile that needed a migration therefore overwrote
+  the root profile's `settings.json` with its own settings on every load (the
+  root's accounts, default tasks path and the rest went with it) and never got
+  the migration itself, so the next load did it again: one prompt in the second
+  profile's window was enough. It saves with `save_settings_in(id, …)` now.
+  Any new write inside a per-profile path has the same trap: `*_inner` means
+  root, not "this profile".
 - **Multiple windows per profile** is deferred. It needs Rust to become
   authoritative for UI state and forces either two WebGL terminals on one PTY or
   scrollback replay on every move.

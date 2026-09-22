@@ -74,16 +74,16 @@ const STALE_AFTER_MS = 15 * 60_000;
  *  which was the reason `useAgentAccounts` was lifted in the first place -
  *  they are now the same chip, so the shared owner moved down here with them.
  */
-export function FooterAgentChip({ taskId, agentId, cwd, docker, visible, secondary }: {
+export function FooterAgentChip({ taskId, agentId, cwd, docker, visible, hideClass }: {
   taskId: string;
   agentId: string;
   cwd?: string;
   docker: boolean;
   visible: boolean;
-  /** An agent the user is not currently looking at, in a task that runs more
-   *  than one. Dropped when the footer is too narrow to hold every chip, so
-   *  what survives is the agent whose tab is on screen. */
-  secondary: boolean;
+  /** The container-query class that hides this chip once the bar is too
+   *  narrow to hold it, from `footerChipMode`. Undefined for the agent whose
+   *  tab is on screen, which is never hidden at any width. */
+  hideClass: string | undefined;
 }) {
   // The account THIS agent's process is running as, which is the running one
   // and not the configured one: a switch applies on the next spawn, so between
@@ -110,16 +110,7 @@ export function FooterAgentChip({ taskId, agentId, cwd, docker, visible, seconda
       docker={docker}
       accounts={accounts}
       visible={visible}
-      // The width below which one footer cannot hold every agent's chip.
-      // Measured rather than guessed, in the e2e window: a chip with both
-      // windows and no account name renders at 174px, the sandbox status
-      // beside it takes ~92px, and the queue + Terminal controls on the left
-      // take ~214px with their labels. Two chips is 666px of an 894px bar,
-      // which is comfortable; 780 keeps a little room for the wider cases (an
-      // account name adds up to ~100px, a "N blocked" chip ~80px) before the
-      // bar's own label-shedding rules take over at 680 and 560. The two-agent
-      // case in e2e/specs/agent.e2e.ts re-measures all of this.
-      className={secondary ? "@max-[780px]:hidden" : undefined}
+      className={hideClass}
     />
   );
 }

@@ -137,6 +137,8 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       // termic's uuid; later spawns --resume that same uuid.
       session_id_args: ["--session-id", "{UUID}"],
       resume_id_args:  ["--resume",     "{UUID}"],
+      // claude's own session picker (GH #311). Mirrors the Rust default.
+      resume_picker_args: ["--resume"],
       // Display name surfaces in claude's prompt box, /resume picker, and
       // terminal title. Stamped on the mint spawn only (gated below).
       name_args: ["--name", "{WORKSPACE_SLUG}"],
@@ -872,6 +874,7 @@ export function resolveAgent(agents: Agent[], cli: string): Agent | undefined {
       resume_args: oc.resume_args?.length ? oc.resume_args : pc.resume_args,
       session_id_args: oc.session_id_args?.length ? oc.session_id_args : pc.session_id_args,
       resume_id_args: oc.resume_id_args?.length ? oc.resume_id_args : pc.resume_id_args,
+      resume_picker_args: oc.resume_picker_args?.length ? oc.resume_picker_args : pc.resume_picker_args,
       name_args: oc.name_args?.length ? oc.name_args : pc.name_args,
       signals: {
         busy: oc.signals?.busy?.length ? oc.signals.busy : pc.signals?.busy,
@@ -905,6 +908,7 @@ export function agentOverrides(agents: Agent[], cli: string): string[] {
     ["post_launch_capture", !!a.post_launch_capture],
     ["capabilities", !!(c.yolo_args?.length || c.runtime_yolo_command || c.runtime_default_command
       || c.resume_args?.length || c.session_id_args?.length || c.resume_id_args?.length
+      || c.resume_picker_args?.length
       || c.name_args?.length || s.busy?.length || s.idle?.length || s.attention?.length
       || s.pending?.length)],
   ];
@@ -931,6 +935,7 @@ function findAgent(cli: string): {
         resume_args: a.capabilities?.resume_args ?? [],
         session_id_args: a.capabilities?.session_id_args ?? [],
         resume_id_args: a.capabilities?.resume_id_args ?? [],
+        resume_picker_args: a.capabilities?.resume_picker_args ?? [],
         name_args: a.capabilities?.name_args ?? [],
       },
       env: { ...(a.env ?? {}) },
@@ -1192,6 +1197,11 @@ export function spawnArgsForCli(
      *  mint / `opts.resume` so they don't double up. The agent owns the
      *  "session not found" case, so there's no fast-exit fallback. */
     resumeOverride?: string;
+    /** Open the agent's own session picker instead of any resume block
+     *  (GH #311): the args from `resumePickerArgsForCli`. The caller passes it
+     *  only on the spawn right after a stored id failed to resume, and
+     *  suppresses the mint and `opts.resume` for it. */
+    picker?: string[];
     /** True when a prompt will be injected without a human at the keyboard.
      *  Composes UNATTENDED_SPAWN_ARGS so startup update menus can't
      *  swallow the injection. */
@@ -1216,6 +1226,10 @@ export function spawnArgsForCli(
     // Override wins outright — verbatim resume block, placeholders expanded
     // by the composed.map below. Skips minting / --continue entirely.
     resumeBlock = tokenizeArgs(override);
+  } else if (opts.picker?.length) {
+    // The agent's picker replaces the resume block. name_args still follow
+    // (below), so the session picked there keeps the task's name.
+    resumeBlock = opts.picker;
   } else if (hasIdResume && opts.sessionUuid) {
     if (opts.resumeKnown) {
       resumeBlock = caps.resume_id_args ?? [];
@@ -1280,6 +1294,12 @@ export const resumeArgsForCli = (cli: string) => findAgent(cli).caps.resume_args
  *  resumes with ITS OWN spelling (GH #169 review). */
 export const resumeIdArgsForCli = (cli: string, sessionId: string) =>
   (findAgent(cli).caps.resume_id_args ?? []).map(a => a.replaceAll("{UUID}", sessionId));
+/** The registry's args for the agent's OWN session picker (GH #311), empty
+ *  when it has none. Opened in place of a fresh session when a stored id
+ *  fails to resume, so the user continues where they meant to and termic
+ *  reads no agent's session files: the chosen id comes back over the hooks. */
+export const resumePickerArgsForCli = (cli: string) =>
+  findAgent(cli).caps.resume_picker_args ?? [];
 
 /** Per-agent env block (from Settings → Agents). Merged into the spawn
  *  env in TerminalPane; agent-side values take precedence over the

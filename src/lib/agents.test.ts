@@ -22,7 +22,7 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { resumeIdArgsForCli, cliSupportsCaptureResume, postLaunchCaptureForCli, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, spawnResumeShape, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, yoloArgsNote, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { resumeIdArgsForCli, resumePickerArgsForCli, cliSupportsCaptureResume, postLaunchCaptureForCli, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, spawnResumeShape, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, yoloArgsNote, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
 import type { ResumeDecision } from "@/lib/agents";
 
@@ -1721,5 +1721,49 @@ describe("YOLO_ARGS_NOTES", () => {
       expect(yoloArgsNote("codex")).not.toContain("—");
     }
     void i18n.changeLanguage("en");
+  });
+});
+
+// ── the agent's own session picker (GH #311) ──────────────────────────
+
+describe("resume picker", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+  const task = { id: "ws1", name: "Improve Tests", branch: "main", port: 1420, cli: "claude" } as any;
+
+  it("claude opens its picker with --resume and no id (measured on 2.1.278)", () => {
+    // Built-in fallback table: no registry entry at all.
+    expect(resumePickerArgsForCli("claude")).toEqual(["--resume"]);
+  });
+
+  it("the picker replaces every resume block and keeps the task name", () => {
+    const args = spawnArgsForCli("claude", {
+      yolo: false, resume: false, isPrimary: true, task, picker: ["--resume"],
+    });
+    expect(args).toEqual(["--resume", "--name", "improve-tests"]);
+    expect(args.join(" ")).not.toMatch(/--session-id|--continue/);
+  });
+
+  it("an agent with no picker offers none, so the fresh fallback stays", () => {
+    mockAgents.push({
+      id: "codex", display_name: "codex", command: "codex", args: [], builtin: true,
+      capabilities: { yolo_args: [], runtime_yolo_command: "", resume_args: ["resume", "--last"],
+        session_id_args: [], resume_id_args: ["resume", "{UUID}"], name_args: [] },
+    } as any);
+    expect(resumePickerArgsForCli("codex")).toEqual([]);
+  });
+
+  it("a clone inherits its parent's picker, and can set its own", () => {
+    mockAgents.push(
+      { id: "claude", display_name: "claude", command: "claude", args: [], builtin: true,
+        capabilities: { yolo_args: [], runtime_yolo_command: "", resume_args: ["--continue"],
+          session_id_args: ["--session-id", "{UUID}"], resume_id_args: ["--resume", "{UUID}"],
+          resume_picker_args: ["--resume"], name_args: [] } } as any,
+      { id: "claude-work", display_name: "claude-work", command: "claude", args: [], builtin: false,
+        extends: "claude", capabilities: {} } as any,
+      { id: "claude-own", display_name: "claude-own", command: "claude", args: [], builtin: false,
+        extends: "claude", capabilities: { resume_picker_args: ["--resume", "--all"] } } as any,
+    );
+    expect(resumePickerArgsForCli("claude-work")).toEqual(["--resume"]);
+    expect(resumePickerArgsForCli("claude-own")).toEqual(["--resume", "--all"]);
   });
 });

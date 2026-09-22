@@ -45,7 +45,8 @@ import { accentCss } from "@/lib/accents";
 import { TaskWorkBadge } from "@/components/TaskWorkBadge";
 import { TaskPrBadge } from "@/components/TaskPrBadge";
 import { GroupActionsMenuItems } from "./GroupActionsMenuItems";
-import { taskNeedsAttention, taskWorkDone, taskWorking } from "@/lib/taskWorkState";
+import { taskNeedsAttention, taskWorkDone, taskWorking, taskDelegated } from "@/lib/taskWorkState";
+import { delegatedTitle } from "@/lib/delegatedWork";
 
 /** Pick a default name for a freshly-created task (repo-root OR worktree).
  *  Format: "<agent>-N" where N is the next unused index for that CLI among
@@ -2200,6 +2201,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
   const clearTabCustomTitle = useApp(s => s.clearTabCustomTitle);
   const settledHighlight = usePrefs(s => s.settledHighlight);
   const workingIndicator = usePrefs(s => s.workingIndicator);
+  const attentionIndicator = usePrefs(s => s.attentionIndicator);
   // Row label: the typed name, or the branch when the pref is on (GH #260).
   // The typed name is still what rename edits and what the row tooltip shows,
   // so switching the pref on never hides which task this is.
@@ -2306,13 +2308,22 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
   // Priority: attention > done. ("working" intentionally not surfaced.)
   // Shared with the dashboard (src/lib/taskWorkState.ts) so the two surfaces
   // showing one task can never disagree about its badge.
-  const workPrefs = { settledHighlight, workingIndicator };
+  const workPrefs = { settledHighlight, workingIndicator, attentionIndicator };
   const hasAttention = taskNeedsAttention(tabs, workPrefs);
   const hasDone = !hasAttention && taskWorkDone(tabs, workPrefs);
   // Working aggregate is independent of settledHighlight (it's its own
   // opt-in pref) but yields to attention/done — a finished or blocked agent
   // is more actionable than one still chugging.
   const hasWorking = !hasAttention && !hasDone && taskWorking(tabs, workPrefs);
+  // Lowest rung: something the agent started is still running, and nothing
+  // else wanted the slot. `rowDelegated` is the report itself, for the
+  // tooltip; the first tab that has one speaks for the row, which matches how
+  // every other aggregate here works.
+  const hasDelegated = !hasAttention && !hasDone && !hasWorking
+    && taskDelegated(tabs, workPrefs);
+  const rowDelegated = (tabs.find(
+    t => t.type === "terminal" && !!(t as TerminalTab).delegatedWork,
+  ) as TerminalTab | undefined)?.delegatedWork;
   // Why no badge is drawn, which the work-state trace cannot answer: it records
   // DETECTION, and a correct `working` can still render nothing here. Four
   // independent ways that happens (the pref is off, attention or done outranks
@@ -2574,9 +2585,19 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
             crowd the row. The badge only renders when collapsed
             (expanded rows put per-tab badges on their children). */}
         <span className="relative flex h-[18px] w-[18px] shrink-0 items-center justify-center">
-          {collapsed && (hasAttention || hasDone || hasWorking) && (
-            <span className="absolute inset-0 flex items-center justify-center transition-opacity group-hover/wsrow:opacity-0">
-              {hasAttention ? <TaskWorkBadge reason="attention" /> : hasDone ? <TaskWorkBadge reason="done" /> : <TaskWorkBadge reason="working" />}
+          {collapsed && (hasAttention || hasDone || hasWorking || hasDelegated) && (
+            // `translate3d(0,0,0)` pins it to its own compositing layer for
+            // good. Without it the layer exists only WHILE the opacity
+            // transition runs, and WebKit pixel-snaps a layer: the badge
+            // sits at a fractional offset (a `py-[3px]` row and a truncating
+            // flex name both land on half pixels), so it jumped up and to
+            // the right on hover and back on leave. Same reason Dialog pins
+            // its content box.
+            <span className="absolute inset-0 flex items-center justify-center transition-opacity group-hover/wsrow:opacity-0 [transform:translate3d(0,0,0)]">
+              {hasAttention ? <TaskWorkBadge reason="attention" />
+                : hasDone ? <TaskWorkBadge reason="done" delegated={rowDelegated} />
+                : hasWorking ? <TaskWorkBadge reason="working" delegated={rowDelegated} />
+                : <TaskWorkBadge reason="delegated" delegated={rowDelegated} />}
             </span>
           )}
           <DropdownRoot open={menuOpen} onOpenChange={setMenuOpen}>
@@ -2885,9 +2906,13 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
       {!collapsed && terminalTabs.map(tab => {
         const isTabActive = isActive && tab.id === activeTabId;
         const isTabHot = isTabActive;
-        const showBell    = settledHighlight && tab.unread?.reason === "attention";
+        const showBell    = attentionIndicator && tab.unread?.reason === "attention";
         const showDone    = settledHighlight && !showBell && tab.workState === "done";
         const showWorking = workingIndicator && !showBell && !showDone && tab.workState === "working";
+        // An idle tab that still has something running. Lowest priority: it
+        // only ever draws in the slot nothing else wanted.
+        const showDelegated = workingIndicator && !showBell && !showDone && !showWorking
+          && !!tab.delegatedWork;
         const rawTitle = tab.customTitle ? tab.title : (tab.liveTitle || tab.title);
         const title = tab.customTitle
           ? rawTitle
@@ -2943,7 +2968,13 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                 className="min-w-0 flex-1 rounded border-0 bg-[var(--color-bg-2)] px-1 py-0 leading-tight text-[12.5px] text-[var(--color-fg)] outline-none ring-1 ring-inset ring-[var(--color-accent)]"
               />
             ) : (
-              <span className="min-w-0 flex-1 truncate">{title}</span>
+              // Same reason as the tab pill: the badge slot is taken over by
+              // the row's kebab on hover, so the state has to be on the name
+              // to be reachable at all.
+              <span
+                className="min-w-0 flex-1 truncate"
+                title={tab.delegatedWork ? delegatedTitle(tab.delegatedWork) : undefined}
+              >{title}</span>
             )}
             {/* Run tabs (GH #54): the same two controls the tab pill carries,
                 because a run is otherwise invisible (and unstoppable) from
@@ -2957,9 +2988,15 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                 appears when hovering the badge itself, not the whole
                 row — row hover keeps the badge visible. */}
             <span className="group/badge relative flex h-4 w-4 shrink-0 items-center justify-center">
-              {(showBell || showDone || showWorking) && (
-                <span className="absolute inset-0 flex items-center justify-center transition-opacity group-hover/badge:opacity-0">
-                  {showBell ? <TaskWorkBadge reason="attention" /> : showDone ? <TaskWorkBadge reason="done" /> : <TaskWorkBadge reason="working" />}
+              {(showBell || showDone || showWorking || showDelegated) && (
+                // Pinned to its own layer, same reason as the task row's
+                // badge above: a transition-only layer gets snapped into
+                // existence and the mark jumps a pixel on hover.
+                <span className="absolute inset-0 flex items-center justify-center transition-opacity group-hover/badge:opacity-0 [transform:translate3d(0,0,0)]">
+                  {showBell ? <TaskWorkBadge reason="attention" />
+                    : showDone ? <TaskWorkBadge reason="done" delegated={tab.delegatedWork} />
+                    : showWorking ? <TaskWorkBadge reason="working" delegated={tab.delegatedWork} />
+                    : <TaskWorkBadge reason="delegated" delegated={tab.delegatedWork} />}
                 </span>
               )}
               <button
@@ -2967,7 +3004,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                 onClick={(e) => { e.stopPropagation(); requestCloseTab(w.id, tab.id); }}
                 className={cn(
                   "absolute inset-0 flex items-center justify-center rounded p-0.5 text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-3)] hover:text-[var(--color-fg)]",
-                  (showBell || showDone || showWorking)
+                  (showBell || showDone || showWorking || showDelegated)
                     // Badge visible: X only on badge-slot hover
                     ? "opacity-0 group-hover/badge:opacity-100 pointer-events-none group-hover/badge:pointer-events-auto"
                     // No badge: X on row hover (original behaviour)

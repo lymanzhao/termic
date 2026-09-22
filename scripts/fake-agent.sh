@@ -113,6 +113,18 @@ set_title "✳ ${name}"
 #               agent_hooks::statusline_body generates; the wire format is
 #               pinned in lib/agentUsage.ts. It must NEVER badge the tab, which
 #               is the half a spec has to prove.
+#   #delegated BODY
+#               a hook turn whose done found work OUTSTANDING: 133;C, then the
+#               DELEGATED report instead of a 133;D, which is what claude's
+#               generated done script writes when its `Stop` payload still
+#               holds a subagent or a backgrounded shell. BODY is everything
+#               after the `agent delegated: ` prefix, e.g. `1 shell b1`. The
+#               grammar is pinned in lib/delegatedWork.ts and produced by
+#               agent_hooks.rs; send the same BODY twice to replay the case
+#               where the same work is still outstanding a turn later.
+#   #hookdone   a plain hook turn that ENDS: 133;C then 133;D, nothing
+#               outstanding. What claude writes when its `Stop` payload has an
+#               empty `background_tasks`, and the only one of these that rings.
 #   #bel        emit a REAL bell, distinct from the BEL that terminates an OSC.
 #   #iip        emit an inline PNG, then Pi's alternate-screen redraw.
 #   #hookattn   reproduce a claude PERMISSION PROMPT with termic's agent hook
@@ -139,6 +151,55 @@ spin()   { for f in 0 1 2; do set_title "${SPINNER[$f]} ${name}"; sleep 0.15; do
 # One "prompt" per stdin line: go busy (spinner title + streamed output), then
 # return to the idle glyph — the busy -> idle transition claude drives, which
 # termic turns into working -> done.
+# Resume shapes for GH #311, claude's, measured on 2.1.278:
+#   --resume <id>, with <id> listed in $TERMIC_DATA_DIR/e2e-dead-sessions:
+#     claude's "No conversation found" line and exit 1, which is what a stored
+#     id that no longer resolves does.
+#   --resume with no id: claude's session picker. A line `pick <uuid>` picks
+#     that session, reported over the hook OSC as claude's SessionStart
+#     (`source: resume`) is, and the fixture carries on as a normal agent. Any
+#     other line exits 1, which is what leaving claude's picker with Esc does.
+prev_arg=""; resume_arg=""; picker=""
+for a in "$@"; do
+  if [ "$prev_arg" = "--resume" ]; then
+    case "$a" in -*) picker=1 ;; *) resume_arg="$a" ;; esac
+  fi
+  prev_arg="$a"
+done
+[ "$prev_arg" = "--resume" ] && picker=1
+if [ -n "$resume_arg" ] && [ -n "${TERMIC_DATA_DIR:-}" ] \
+   && grep -qx "$resume_arg" "${TERMIC_DATA_DIR}/e2e-dead-sessions" 2>/dev/null; then
+  echo "No conversation found with session ID: $resume_arg"
+  exit 1
+fi
+if [ -n "$picker" ]; then
+  echo "FAKE-AGENT picker: Resume session"
+  # Esc alone leaves, with no Enter, exactly as claude's picker does; anything
+  # else is the start of a line.
+  # A terminal also writes ESC-led REPLIES to its own queries (xterm answers
+  # device-attribute and focus queries this way), so an ESC followed at once
+  # by more bytes is one of those and is skipped; a lone ESC is the key.
+  esc="$(printf '\033')"
+  while :; do
+    IFS= read -r -n1 first || exit 1
+    [ "$first" != "$esc" ] && break
+    if IFS= read -r -n1 -t 0.15 _next; then
+      while IFS= read -r -n1 -t 0.05 _more; do :; done
+      continue
+    fi
+    exit 1
+  done
+  IFS= read -r rest || true
+  choice="${first}${rest}"
+  case "$choice" in
+    "pick "*)
+      osc777 "termic;agent ready for input"
+      osc777 "termic;session ${choice#pick }"
+      echo "FAKE-AGENT resumed ${choice#pick }" ;;
+    *) exit 1 ;;
+  esac
+fi
+
 while IFS= read -r line; do
   # Strip leading interrupt bytes. A directive that reads a keystroke mid-turn
   # can be handed MORE than the one byte it consumes (xterm does not promise
@@ -303,6 +364,24 @@ while IFS= read -r line; do
       spin
       echo "FAKE-AGENT echo: ${line}"
       set_title "✳ ${name}"
+      continue ;;
+    "#hookdone")
+      osc133 C
+      spin
+      echo "FAKE-AGENT done"
+      set_title "✳ ${name}"
+      osc133 D
+      continue ;;
+    "#delegated "*)
+      # Order matters and is the measured one: the turn starts, the agent
+      # works, and the report lands where a done would have. Nothing after it,
+      # because that is the point - the real hook writes this INSTEAD of a
+      # done and then says nothing at all, possibly forever.
+      osc133 C
+      spin
+      echo "FAKE-AGENT delegated: ${line#\#delegated }"
+      set_title "✳ ${name}"
+      osc777 "termic;agent delegated: ${line#\#delegated }"
       continue ;;
     "#hookattn")
       spin

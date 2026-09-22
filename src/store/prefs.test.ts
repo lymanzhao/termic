@@ -608,3 +608,78 @@ describe("prefs: agentFooterHidden", () => {
     expect(usePrefs.getState().agentFooterHidden).toEqual({});
   });
 });
+
+// A default that ships ON, so an absent key must not read as off. The mark it
+// gates is the only thing that moves on a turn with three subagents between
+// "started" and "finished", and turning it off for everybody on upgrade would
+// look like the feature was never built.
+describe("prefs: partialDoneIndicator", () => {
+  const KEY = "partialDoneIndicator";
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("defaults to on with nothing in localStorage", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().partialDoneIndicator).toBe(true);
+  });
+
+  it("picks up a persisted off value on load", async () => {
+    localStorage.setItem(KEY, "0");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().partialDoneIndicator).toBe(false);
+  });
+
+  it("setPartialDoneIndicator persists both directions", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setPartialDoneIndicator(false);
+    expect(usePrefs.getState().partialDoneIndicator).toBe(false);
+    expect(localStorage.getItem(KEY)).toBe("0");
+    usePrefs.getState().setPartialDoneIndicator(true);
+    expect(usePrefs.getState().partialDoneIndicator).toBe(true);
+    expect(localStorage.getItem(KEY)).toBe("1");
+  });
+});
+
+// The bell used to ride `settledHighlight`, so this key is absent on every
+// existing install. Seeding it from that pref is the difference between
+// respecting a choice somebody already made and silently reversing it: a
+// user who turned the work-done UI off to stop being interrupted would
+// otherwise be interrupted again by the upgrade.
+describe("prefs: attentionIndicator", () => {
+  const KEY = "attentionIndicator";
+  const OLD = "settledHighlight";
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("defaults to on for a fresh install", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().attentionIndicator).toBe(true);
+  });
+
+  it("inherits an off work-done pref when it has no key of its own", async () => {
+    localStorage.setItem(OLD, "0");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().attentionIndicator).toBe(false);
+  });
+
+  it("its own key wins over the one it was seeded from", async () => {
+    localStorage.setItem(OLD, "0");
+    localStorage.setItem(KEY, "1");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().attentionIndicator).toBe(true);
+  });
+
+  it("setAttentionIndicator persists both directions", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setAttentionIndicator(false);
+    expect(localStorage.getItem(KEY)).toBe("0");
+    usePrefs.getState().setAttentionIndicator(true);
+    expect(localStorage.getItem(KEY)).toBe("1");
+  });
+});

@@ -53,7 +53,16 @@ const WEBGL_REACH_INS: Record<string, string> = {
   // fires for a RESTORED context and its in-place repair leaves a stale atlas.
   _canvas: "terminalRenderer",
   // lib/atlasCanvasGuard.ts — glyph-atlas scratch canvas adoption.
-  _charAtlas: "atlasCanvasGuard",
+  _charAtlas: "atlasCanvasGuard, atlasPageVersionGuard",
+  // lib/atlasPageVersionGuard.ts — GH #314. The page list we hand unique
+  // versions to, and the public event that tells us a page was created. A
+  // rename of either silently restores the garbled-glyph bug.
+  // NOT pinned: the `version` property the guard redefines. "version" matches
+  // any bundle, so a substring check for it would pass forever and imply
+  // coverage it does not have. A rename there is caught by neither test; it
+  // would show up as #314 returning.
+  _pages: "atlasPageVersionGuard",
+  onAddTextureAtlasCanvas: "atlasPageVersionGuard",
   _tmpCanvas: "atlasCanvasGuard",
   _tmpCtx: "atlasCanvasGuard",
 };

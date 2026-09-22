@@ -149,6 +149,37 @@ describe("setWorkState", () => {
     expect(getTabWorkState(taskId, tab.id)).toBe("done");
   });
 
+  it("sticky done: a submit ends the stickiness on the spot", () => {
+    const taskId = "ws1";
+    // Measured from a real session: done at :40.238, the user typed at
+    // :40.5, and the agent's first working hook at :46.363 was refused as
+    // sticky. The tab showed a finished badge for two more seconds with the
+    // agent visibly working. The oscillation this guard is for happens with
+    // NOTHING in between; a working signal after something the user sent is
+    // the next turn, whatever the clock says.
+    const doneAt = Date.now() - 1_000;
+    const tab = makeTermTab({ workState: "done", workDoneAt: doneAt, lastInputAt: doneAt + 300 });
+    addTab(taskId, tab);
+
+    useApp.getState().setWorkState(taskId, tab.id, "working");
+
+    expect(getTabWorkState(taskId, tab.id)).toBe("working");
+  });
+
+  it("sticky done: input from BEFORE the done does not end it", () => {
+    const taskId = "ws1";
+    // The submit that started the turn the done ended. Every turn has one, so
+    // reading "has this tab ever had input" instead of "since the done" would
+    // disable the guard permanently.
+    const doneAt = Date.now() - 1_000;
+    const tab = makeTermTab({ workState: "done", workDoneAt: doneAt, lastInputAt: doneAt - 5_000 });
+    addTab(taskId, tab);
+
+    useApp.getState().setWorkState(taskId, tab.id, "working");
+
+    expect(getTabWorkState(taskId, tab.id)).toBe("done");
+  });
+
   it("a busy signal past the sticky window takes the tab back to working", () => {
     const taskId = "ws1";
     // The agent is still working 9s after we called the turn done: our done

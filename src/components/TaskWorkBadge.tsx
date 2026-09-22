@@ -11,10 +11,72 @@
 import { useTranslation } from "react-i18next";
 import { Bell } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
+import { BackgroundRing } from "@/components/ui/BackgroundRing";
+import { cn } from "@/lib/utils";
+import { delegatedTitle, type DelegatedWork } from "@/lib/delegatedWork";
+import { usePrefs } from "@/store/prefs";
 import type { WorkBadgeReason } from "@/lib/taskWorkState";
 
-export function TaskWorkBadge({ reason }: { reason: WorkBadgeReason }) {
+/** `delegated`: work the agent handed off and has not finished, which
+ *  qualifies two of the three reasons rather than being a fourth. See
+ *  `lib/delegatedWork.ts`. */
+export function TaskWorkBadge(
+  { reason, delegated, preview }: {
+    /** `"delegated"` is not a work state: it is an IDLE tab that still has
+     *  something running, and it draws only because nothing outranks it. See
+     *  the chain in `TabBar` and docs/ui.md. */
+    reason: WorkBadgeReason | "delegated";
+    delegated?: DelegatedWork | null;
+    /** Documentation, not a live tab: draw the mark whatever the prefs say.
+     *  The legend explaining a mark has to keep explaining it, and the one
+     *  in the welcome wizard runs before the user has any prefs at all. */
+    preview?: boolean;
+  },
+) {
   const { t } = useTranslation("chrome");
+  // Off means the intermediate mark is noise to this user. It falls back to
+  // the ring below, never to done: the turn is not over.
+  const showPartial = usePrefs(s => s.partialDoneIndicator) || preview;
+  const held = delegated ? delegatedTitle(delegated, t) : "";
+  // PARTIALLY DONE: some of what the agent delegated has reported back and
+  // the rest runs on. Outlined, not the solid done bullet, and it rings no
+  // bell: a turn that is partly over is not over. Measured on three
+  // background subagents, where the alternative was a full "done" with two
+  // still working.
+  if (delegated?.partial && showPartial && reason !== "attention") {
+    return (
+      <span
+        data-testid="work-badge"
+        data-work-state="partial"
+        data-delegated={delegated.label}
+        className="shrink-0 flex items-center justify-center"
+        title={held}
+        aria-label={held}
+      >
+        <span
+          className="block h-2 w-2 rounded-full border-[1.5px]"
+          style={{ borderColor: "var(--color-info)" }}
+        />
+      </span>
+    );
+  }
+  // Waiting on delegated work, whether or not a turn is nominally running:
+  // the agent's own loop has STOPPED either way, so the working spinner would
+  // claim a model is computing. See `BackgroundRing`.
+  if (reason === "delegated" || (reason === "working" && delegated)) {
+    return (
+      <span
+        data-testid="work-badge"
+        data-work-state={reason === "working" ? "working" : "delegated"}
+        data-delegated={delegated ? delegated.label : undefined}
+        className="shrink-0 flex items-center justify-center text-[var(--color-fg-faint)]"
+        title={held || t("taskWorkBadge.delegated")}
+        aria-label={held || t("taskWorkBadge.delegatedAria")}
+      >
+        <BackgroundRing size={12} />
+      </span>
+    );
+  }
   if (reason === "working") {
     return (
       <span
@@ -46,8 +108,9 @@ export function TaskWorkBadge({ reason }: { reason: WorkBadgeReason }) {
     <span
       data-testid="work-badge"
       data-work-state="done"
+      data-delegated={delegated ? delegated.label : undefined}
       className="shrink-0 flex items-center justify-center"
-      title={t("taskWorkBadge.done")}
+      title={held ? t("taskWorkBadge.doneDelegated", { held }) : t("taskWorkBadge.done")}
       aria-label={t("taskWorkBadge.doneAria")}
     >
       <span

@@ -739,7 +739,17 @@ export async function mouseDrag(handle: string, dx: number, dy = 0): Promise<voi
 // helpers assert on what the user actually sees.
 
 /** What a tab's status badge can be showing. Mirrors `data-work-state`. */
-export type WorkBadge = "working" | "done" | "attention" | "failed";
+/** `delegated` is not a work state: it is the lowest-priority badge, an idle
+ *  tab that still has something the agent started running (see
+ *  `lib/delegatedWork.ts`). It draws only when nothing outranks it, which is
+ *  why it belongs in this union and not in `WorkBadgeReason`. */
+export type WorkBadge =
+  | "working" | "done" | "attention" | "failed"
+  /** Idle, with something the agent started still running. */
+  | "delegated"
+  /** Some of the delegated work reported back, the rest runs on. Outranks
+   *  done and rings nothing: a turn that is partly over is not over. */
+  | "partial";
 
 /**
  * Make sure the two prefs that gate work-state badges are on, so a spec can
@@ -1002,6 +1012,51 @@ export async function taskViewBadge(taskId: string): Promise<WorkBadge | null> {
     ) as HTMLElement | null;
     return (el?.dataset.workState as string | undefined) ?? null;
   }, taskId) as Promise<WorkBadge | null>;
+}
+
+/**
+ * What the tab strip's badge says the agent has DELEGATED and not finished
+ * (`data-delegated`, one of lib/delegatedWork.ts's wire labels), or null when
+ * it says nothing is outstanding.
+ *
+ * A separate attribute rather than a fifth `data-work-state`, because it can
+ * accompany either `working` (the agent is waiting on its own subagent) or
+ * `done` (the turn ended and left a shell running), and a spec needs to tell
+ * those two apart.
+ */
+export async function delegatedLabel(taskId: string): Promise<string | null> {
+  return browser.execute((id) => {
+    const el = document.querySelector(
+      `[data-task-id="${id}"] [data-testid="work-badge"]`,
+    ) as HTMLElement | null;
+    return (el?.dataset.delegated as string | undefined) ?? null;
+  }, taskId) as Promise<string | null>;
+}
+
+/** What the tab strip badge's mark actually IS, measured rather than looked
+ *  at: the working spinner and the background-work ring are both small round
+ *  outlines, and a screenshot cannot tell you which one you are looking at or
+ *  how fast it turns.
+ *
+ *  Both are now SVG rings, so the mark says which it is (`data-mark`)
+ *  rather than the spec sniffing CSS for the difference. `duration`
+ *  separates the two motions: the spinner turns every second, the ring every
+ *  eight. */
+export async function workBadgeMark(
+  taskId: string,
+): Promise<{ kind: string; duration: string } | null> {
+  return browser.execute((id) => {
+    const badge = document.querySelector(
+      `[data-task-id="${id}"] [data-testid="work-badge"]`,
+    ) as HTMLElement | null;
+    if (!badge) return null;
+    const mark = badge.querySelector("[data-mark]") as SVGElement | null;
+    if (!mark) return { kind: "none", duration: "0s" };
+    return {
+      kind: mark.getAttribute("data-mark") ?? "none",
+      duration: getComputedStyle(mark).animationDuration,
+    };
+  }, taskId) as Promise<{ kind: string; duration: string } | null>;
 }
 
 /**

@@ -120,24 +120,40 @@ export function useTasksPathConflicts(path: string, projectId?: string): {
   return { names: names ?? [], checking: names === null };
 }
 
-export function Toggle({ label, hint, value, onChange }: {
+export function Toggle({ label, hint, value, onChange, mark, disabled }: {
   label: string; hint?: React.ReactNode; value: boolean; onChange: (v: boolean) => void;
+  /** A sample of the thing being switched, drawn beside the label. For a
+   *  setting that governs one small mark, showing the mark answers "which
+   *  one is that" without a sentence describing a circle. */
+  mark?: React.ReactNode;
+  /** Something upstream already decides this one, so it cannot take effect.
+   *  The stored value is LEFT ALONE and shown as it is: turning a parent
+   *  off and on again should give back the same child setting, not a reset
+   *  one. Only the interaction goes away. */
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-start justify-between gap-6">
+    <div className={cn("flex items-start justify-between gap-6", disabled && "opacity-40")}>
       <div className="min-w-0 flex-1">
-        <div className="text-[14px] font-medium">{label}</div>
+        <div className="flex items-center gap-2 text-[14px] font-medium">
+          {mark && (
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center">{mark}</span>
+          )}
+          {label}
+        </div>
         {hint && <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">{hint}</div>}
       </div>
       <button
-        role="switch" aria-checked={value} onClick={() => onChange(!value)}
+        role="switch" aria-checked={value} aria-disabled={disabled || undefined}
+        disabled={disabled}
+        onClick={() => { if (!disabled) onChange(!value); }}
         style={{
           position: "relative",
           width: 36, height: 20, flexShrink: 0,
           borderRadius: 999, padding: 0, border: 0,
           background: value ? "var(--color-accent)" : "var(--color-bg-3)",
           transition: "background-color 150ms",
-          cursor: "pointer",
+          cursor: disabled ? "default" : "pointer",
           display: "inline-block",
           verticalAlign: "middle",
         }}

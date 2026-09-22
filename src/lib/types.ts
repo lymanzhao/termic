@@ -1,5 +1,9 @@
 // Mirrors the Serde structs in src-tauri/src/lib.rs. Keep in sync.
 
+// The one import here, and type-only so nothing is pulled in at runtime: the
+// shape belongs with the policy that reads it, not with the wire structs.
+import type { DelegatedWork } from "./delegatedWork";
+
 export type CLI = "claude" | "codex" | "agy" | "grok" | "opencode";
 
 /** Sandbox enforcement level. Mirrors Rust's `SandboxMode` (serialized
@@ -577,6 +581,11 @@ export interface Agent {
      *  resume the termic-owned session. Must contain `{UUID}`, which
      *  expands to the previously-minted uuid. */
     resume_id_args?: string[];
+    /** Args that open the agent's own session picker (GH #311). Used when a
+     *  stored session id fails to resume, instead of starting a fresh
+     *  session in silence. No `{UUID}`: the user picks, and the chosen id
+     *  comes back over the hooks. Empty/missing → no picker. */
+    resume_picker_args?: string[];
     /** Always-applied args (every spawn). Useful for things like
      *  `--name {WORKSPACE_SLUG}` so claude's /resume picker shows
      *  termic's task name. */
@@ -1317,6 +1326,25 @@ export interface TerminalTab extends BaseTab {
    *  title classifier (gemini/codex). `working` → spinner; `done` →
    *  blue bullet; cleared on next user keystroke (NOT on tab view). */
   workState?: "idle" | "working" | "done";
+  /** Work the agent DELEGATED and had not finished as of its last done hook:
+   *  a subagent it is waiting on, a shell it left running. Reported by the
+   *  hook (`lib/agentHooks.ts` `HOOK_OSC_DELEGATED_PREFIX`), decided by
+   *  `lib/delegatedWork.ts`, cleared by the first done that reports none.
+   *
+   *  Deliberately NOT a fourth `workState`. It qualifies the three that exist
+   *  rather than replacing them, and reads differently against each:
+   *  `working` + delegated is the agent waiting on its own subagent (the
+   *  spinner is honest, but it is not thinking); `idle`/`done` + delegated is
+   *  a finished turn that left a shell running. A fourth enum member would
+   *  have to be understood by `taskWorkState`, `waitingAgents`,
+   *  `cliAgentState` (whose `work_state` is a published CLI contract), the
+   *  sidebar, the tab bar and the dashboard, none of which have an opinion
+   *  about it. Runtime-only, like `workState` itself. */
+  delegatedWork?: DelegatedWork | null;
+  /** When `delegatedWork` was first reported for the CURRENT hold, so the
+   *  detached-work grace can be measured without a timer per tab. Cleared with
+   *  it. */
+  delegatedSince?: number;
   /** Set while a library prompt (target "new-agent") is waiting for this
    *  freshly spawned agent to come up before its prompt is injected. Drives
    *  the "starting agent" loader overlay in TerminalPane; cleared once the

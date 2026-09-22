@@ -33,9 +33,9 @@ target.
 
 | agent | ready | working | attention | done | interrupt |
 | --- | --- | --- | --- | --- | --- |
-| claude | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop`, guarded on the `background_tasks` whitelist | none exists |
-| grok | not measured | `UserPromptSubmit`, `PreToolUse` | `Notification` | `Stop` + `StopCancelled` | `StopCancelled` |
-| agy | not measured | `PreInvocation` | none exists (see below) | `Stop`, guarded on `fullyIdle` | none exists |
+| claude | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop`, guarded on the `background_tasks` whitelist, which REPORTS what it holds for (see Delegated work) | none exists |
+| grok | not measured | `UserPromptSubmit`, `PreToolUse` | `Notification` | `Stop` + `StopCancelled`, `Stop` guarded on `backgroundTasks` (see Delegated work) | `StopCancelled` |
+| agy | not measured | `PreInvocation` | none exists (see below) | `Stop`, guarded on `fullyIdle`, which reports an unlabelled hold | none exists |
 | opencode | not measured | `chat.message`, `permission.replied` | `permission.asked` | `session.idle` | `session.idle`, on the SECOND escape |
 | codex | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop` | none exists |
 | devin | `SessionStart` | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `PermissionRequest`, plus `PreToolUse` on `ask_user_question` | `Stop` | none exists |
@@ -629,6 +629,162 @@ script under `/bin/sh` against real payload shapes rather than asserting on its
 source, because every bug this guard has had was one a substring assertion
 agreed with.
 
+## Delegated work: a hold is not silence, and it is not a done either
+
+For the resulting STATES, one table with every badge and whether it
+rings, see [agent-states.md](agent-states.md). This section is the hook
+half: what is on the wire and what was measured to put it there.
+
+The guard above decides WHETHER to hold. This is what the hold then reports,
+and why holding used to be indistinguishable from a model still thinking.
+
+Until this existed, a done hook that found outstanding work took `exit 0` and
+wrote nothing. Nothing is byte-for-byte what a model mid-token writes, so a tab
+could not tell "still generating" from "stopped, waiting on a subagent" from
+"stopped, and a dev server will keep it stopped for the rest of the session".
+The hook now reports it: `agent delegated: <count> <label> <ids>` on the same
+OSC 777 channel, with the same trusted `termic` sender, told apart by its body
+prefix like the session id is (`HOOK_OSC_DELEGATED_PREFIX` in
+`lib/agentHooks.ts`, `DELEGATED_BODY_PREFIX` in `agent_hooks.rs`). The policy
+that reads it is `lib/delegatedWork.ts`; the state machine is `TerminalPane`.
+
+### What was measured
+
+Five scenarios against a live claude 2.1.278, driven through a PTY with an
+observer hook logging every payload, ms-stamped. Times are from session start.
+
+| run | what the agent did | first `Stop` | what came next |
+| --- | --- | --- | --- |
+| B | backgrounded `sleep 75` | +9.6s, `[shell]` | resumed +83.8s, `Stop` empty +85.2s |
+| C | one `Agent` subagent | +9.8s, `[subagent]` | resumed +84.0s, `Stop` empty +85.2s |
+| D | backgrounded `sleep 900` | +11.3s, `[shell]` | never |
+| F | FOREGROUND `sleep 70` | +81.2s, empty | nothing outstanding, ever |
+| A | a background command that failed on launch | +9.4s, empty | it had already resumed at +8.6s, `<status>failed</status>` |
+
+Six things follow, and each one decided part of the design:
+
+**A `Stop` only fires when the model loop has stopped.** F spent 70 seconds
+inside a foreground `Bash` call and produced no `Stop` at all. So a `shell` in
+a `Stop` payload is DETACHED by construction, never one the agent is blocked
+on, and the agent's input box is live for as long as it sits there. Measured
+directly in D: a prompt typed 104s into the hold was accepted and answered.
+
+**The hold was per SESSION, not per turn.** D's second turn was a one-word
+reply that used no tools, and the same `sleep 900` held its `Stop` too. One
+`npm run dev` swallowed every done for the rest of the session. This is the
+half that made it feel like a hang rather than a slow turn, and it is what the
+carried-over rule below fixes.
+
+**Resumption is a synthetic `UserPromptSubmit`.** Its prompt begins
+`<task-notification>` and carries `<task-id>`, `<output-file>` and
+`<status>completed|failed</status>`. Identical for a shell (B) and a subagent
+(C), and it fires for failures too (A). termic gets the re-arm free, since the
+Working hook is on `UserPromptSubmit`; what it is worth knowing for is that
+`UserPromptSubmit` does NOT mean a person typed.
+
+**`Notification` with `notification_type: "idle_prompt"` is 60s of a stopped
+loop, not an idle agent.** It fired in every run exactly 60s after the loop
+stopped, and again 60s after each later `Stop`. It also fired in C at +75.0s
+while the subagent was still running, so it cannot tell D from C. termic
+already drops the terminal-side version of it by body
+(`BUILTIN_NOTIFY_IGNORE.claude`), and it stays dropped.
+
+**Subagent tool calls fire hooks in the PARENT session.** One `session_id`
+throughout C; a subagent's own events are marked by `agent_id` and
+`agent_type`, and the main agent's carry neither. The `Stop` at +14.9s had
+`agent_id: null` and held on a `shell` that belonged to the subagent. So a
+`shell`-only payload can mean "the parent is waiting on its subagent's
+shell", which is why `shell` could not simply be dropped from the whitelist:
+that fires a false done in the middle of a healthy orchestration.
+
+**`last_assistant_message` distinguishes the cases in prose** ("STARTED" in B,
+"Still waiting, the subagent's sleep is running" in C). It is the text
+heuristic hooks exist to replace, and it is a moving target by construction.
+Not used.
+
+### What termic does with it
+
+The verdict cannot come from the payload. B and D produced byte-identical
+reports and went opposite ways. So termic asks a question the payload CAN
+answer, and puts a clock on the residue:
+
+- **Carried over.** The outstanding set is IDENTICAL to the last report AND a
+  person asked for the turn that just ended, so none of it can be what this
+  turn produced: the turn is over and these are leftovers. Fires a real,
+  announced done. This is the per-session hold, gone.
+- **Shrank.** Strictly smaller, nothing added: something reported back and
+  the rest runs on. Not a finished turn, so no bell, but it gets its own
+  badge. Both halves of this were measured wrong first, and the two traps are
+  written up in [agent-states.md](agent-states.md): a subset test rings
+  "done" with two of three subagents still running, and an unchanged set only
+  means "finished" relative to something a person asked for.
+- **Agent-owned and new** (`subagent`, `workflow`, `teammate`, `cloud
+  session`, `MCP task`, and agy's unlabelled `work`): keep the turn open with
+  no clock on it, because it is measured to come back on its own. Bounded only
+  by the existing 20-minute liveness ceiling.
+- **Detached and new** (`shell`): keep the turn open for
+  `DELEGATED_DETACHED_GRACE_MS`, then call it over and say so. Five minutes:
+  past every measured round trip (the slowest was 85s end to end), short of
+  the ceiling that clears the spinner and tells nobody. This is the only clock
+  in the state machine that is honest about being a clock, and the one number
+  here set from the cost of being wrong rather than from a measurement.
+
+Both dones pass `force`, and that is load-bearing rather than tidy. claude's
+`pending` screen patterns (`lib/agents.ts`) include `N shells still running`,
+which is on screen for exactly as long as the leftover shell lives, so
+`fireDone`'s screen-scan hold would defer these forever. That scan is the
+FALLBACK for the payload fact the hook has just read directly, and it must not
+overrule it.
+
+The report is kept on the tab after the done, which is the decoration half:
+an idle tab that says `1 shell` is the honest rendering of a finished turn
+that left something running. It is cleared on the next working EDGE (not on
+every heartbeat: writing an unchanged value through a store setter on a
+PTY-driven path is bear trap 8 in docs/performance.md), and the memory the
+carried-over rule compares against is cleared only by a done that reports
+nothing outstanding, or by a respawn.
+
+### The other agents
+
+A pass over all nine, since the mechanism is agent-agnostic and only the
+script decides when to send:
+
+| agent | reports outstanding work? | status |
+| --- | --- | --- |
+| claude | `background_tasks[].type`, six labels | measured, implemented |
+| grok | `backgroundTasks[].type`: `shell`, `monitor`, `subagent` | implemented from its own docs, see below |
+| agy | `fullyIdle: false`, unlabelled | implemented, reports `1 work -` |
+| devin | no. It HAS background shells (`cognition.ai/backgroundShellId`) and does not mention them at `Stop` | known gap, nothing to read |
+| codex, pi, opencode, copilot, muse | no such field anywhere in the shipped binary | nothing to do |
+
+**grok is the one whose provenance is weaker than everything else here, and
+deliberately so.** Its 1.0.40 binary embeds its own hooks reference, which
+states the contract outright: "`Stop` input also carries `backgroundTasks` and
+`sessionCrons`, so a hook can distinguish 'session is done' from 'session is
+paused waiting for background work to wake it back up'", each entry carrying
+`id`, `type` (`shell`, `monitor` or `subagent`), `status` and `agentType`, and
+"`backgroundTasks[].type` is only `shell`, `monitor`, or `subagent`; Claude's
+other labels (`workflow`, `teammate`, ...)" do not occur. That is read out of
+the binary, not observed on a wire, which for an EVENT name would not be good
+enough (a guessed event installs a hook that never fires and looks identical
+to one that does). For a FIELD it is, because the failure mode is no change at
+all: an absent field leaves `$dlg` empty and the script writes the same plain
+done it writes today.
+
+Two grok specifics the guard already handles. `monitor` is its ambient type,
+the same trap claude's `monitor_ws` is, so it is excluded. And one script
+serves `Stop` AND `StopCancelled` (see `hooks_for`), so the guard is gated on
+`"hook_event_name":"Stop"` with the closing quote in the pattern: an interrupt
+ends the turn whatever is still in flight.
+
+**The probe that would settle grok**, and the recipe for any future agent:
+install a hooks config whose every event logs its raw stdin with a timestamp,
+run the agent in a PTY, ask it to start something in the background without
+waiting, and watch whether a later event mentions it. Read the parent's events
+apart from a subagent's by `agent_id`. The claude table above came from
+exactly that, and it took four scenarios because the first one accidentally
+launched a command that failed instantly.
+
 ## Interrupts: the one thing hooks do not cover
 
 Measured on every agent, both keys, mid-generation:
@@ -671,7 +827,9 @@ user's consent is "hooks on for this agent", not "these exact scripts": asking
 someone to notice a version number and press a button is asking them to do our
 job, and it fails quietly, since a stale install still reports itself installed
 while reporting less than it could. v2 added the heartbeat; v3 added the
-container transport, which a v2 install does not have at all.
+container transport, which a v2 install does not have at all; v15 makes a held
+done speak, so a v14 install still spins on a tab whose agent left a shell
+running, which is the entire bug that version exists to fix.
 
 Sync only touches agents already installed, so it never introduces hooks for
 one the user declined, and re-running `install` preserves the pre-install

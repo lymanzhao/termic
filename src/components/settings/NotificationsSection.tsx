@@ -12,6 +12,11 @@ import { Block, SectionTitle, Toggle } from "./Controls";
 import { cn } from "@/lib/utils";
 import { taskLabel } from "@/lib/taskLabel";
 import { COMPLETION_SOUND_OPTIONS, COMPLETION_SOUND_SUPPORTED } from "@/lib/notificationSounds";
+import { TaskWorkBadge } from "@/components/TaskWorkBadge";
+import type { DelegatedWork } from "@/lib/delegatedWork";
+
+/** A stand-in report, so the rows can draw the marks that depend on one. */
+const HELD: DelegatedWork = { label: "subagent", count: 2, ids: [] };
 
 export function NotificationsSection() {
   const { t } = useTranslation("settings");
@@ -24,6 +29,10 @@ export function NotificationsSection() {
   const settledHighlight = usePrefs(s => s.settledHighlight);
   const setSettledHighlight = usePrefs(s => s.setSettledHighlight);
   const workingIndicator = usePrefs(s => s.workingIndicator);
+  const partialDoneIndicator = usePrefs(s => s.partialDoneIndicator);
+  const setPartialDoneIndicator = usePrefs(s => s.setPartialDoneIndicator);
+  const attentionIndicator = usePrefs(s => s.attentionIndicator);
+  const setAttentionIndicator = usePrefs(s => s.setAttentionIndicator);
   const setWorkingIndicator = usePrefs(s => s.setWorkingIndicator);
 
   return (
@@ -104,24 +113,65 @@ export function NotificationsSection() {
       </Block>
       )}
 
+      {/* One block, one row per mark, each row showing the mark it governs.
+          They were four separate blocks of prose describing small circles,
+          which is the hardest possible way to answer "which dot is that".
+
+          The order and the indent are the model: everything mid-turn hangs
+          off Working, because "do not show me busy agents" is one question,
+          and a user who answers no does not want a quieter ring instead. */}
       <Block>
-        <Toggle
-          label={t("notifications.workDone.label")}
-          hint={t("notifications.workDone.hint")}
-          value={settledHighlight}
-          onChange={setSettledHighlight}
-        />
+        <div className="text-[13px] font-medium text-[var(--color-fg)]">
+          {t("notifications.marksTitle")}
+        </div>
+        <div className="mt-3 flex flex-col gap-3.5">
+          <Toggle
+            mark={<TaskWorkBadge reason="working" preview />}
+            label={t("notifications.markWorking.label")}
+            hint={t("notifications.markWorking.hint")}
+            value={workingIndicator}
+            onChange={setWorkingIndicator}
+          />
+          {/* Both children go dim when Working is off, because neither can
+              draw: one has no switch of its own and the other's is moot.
+              Showing them live under a dead parent is a switch that does
+              nothing, which reads as a bug. */}
+          <div className={cn("ml-6 flex items-start gap-2", !workingIndicator && "opacity-40")}>
+            <span className="mt-[3px] flex h-4 w-4 shrink-0 items-center justify-center">
+              <TaskWorkBadge reason="delegated" delegated={HELD} preview />
+            </span>
+            <div className="text-[12.5px] leading-snug text-[var(--color-fg-dim)]">
+              {t("notifications.markDelegated")}
+            </div>
+          </div>
+          <div className="ml-6">
+            <Toggle
+              mark={<TaskWorkBadge reason="working" delegated={{ ...HELD, partial: true }} preview />}
+              label={t("notifications.markPartial.label")}
+              hint={t("notifications.markPartial.hint")}
+              value={partialDoneIndicator}
+              onChange={setPartialDoneIndicator}
+              disabled={!workingIndicator}
+            />
+          </div>
+          <Toggle
+            mark={<TaskWorkBadge reason="done" preview />}
+            label={t("notifications.markDone.label")}
+            hint={t("notifications.markDone.hint")}
+            value={settledHighlight}
+            onChange={setSettledHighlight}
+          />
+          <Toggle
+            mark={<TaskWorkBadge reason="attention" preview />}
+            label={t("notifications.markAttention.label")}
+            hint={t("notifications.markAttention.hint")}
+            value={attentionIndicator}
+            onChange={setAttentionIndicator}
+          />
+        </div>
       </Block>
 
-      <Block>
-        <Toggle
-          label={t("notifications.working.label")}
-          hint={t("notifications.working.hint")}
-          value={workingIndicator}
-          onChange={setWorkingIndicator}
-        />
-      </Block>
-      {/* The four settings above are all downstream of work-state detection,
+      {/* The marks above are all downstream of work-state detection,
           and agent hooks is where that detection comes from. It lives on the
           Agents page because it writes into an agent's own config, so this is
           a pointer rather than the thing itself. */}

@@ -16,6 +16,7 @@ layer above Project shipped as [docs/profiles.md](profiles.md).
 | 1 | `workspace` → `task` migration (schema v1) | v0.19.0 | a few minor releases after v0.19 | active |
 | 2 | `migrate_legacy_members()` (multi-repo) | pre-v0.19 | independent (likely already) | active |
 | 3 | `LEGACY_IDS` (pre-registry language ids) | v0.28.x | a few minor releases | active |
+| 4 | `atlasPageVersionGuard` (GH #314) | v1.6.x | `@xterm/addon-webgl` 0.20.0 stable | active |
 
 ---
 
@@ -193,3 +194,56 @@ losing its highlight is acceptable. A few minor releases.
 3. The note on `ScratchTab.syntax` in `src/lib/types.ts`.
 
 Nothing on the Rust side changes: `ScratchRecord.syntax` is an opaque `String`.
+
+---
+
+## 4. `atlasPageVersionGuard` (GH #314)
+
+**What it is.** `src/lib/atlasPageVersionGuard.ts` gives every xterm WebGL
+glyph-atlas page a version drawn from one process-wide monotonic counter,
+because xterm 0.19.0 uses a per-page counter starting at 0 as though it were a
+page identity. The consequence is that a merged atlas page inherits a texture
+unit's cached version and the unit keeps drawing the previous page's bitmap:
+every cell renders a fragment of some other glyph. Full mechanism in the
+module header and in [gotchas.md](gotchas.md).
+
+**Why it is safe to keep running.** It is additive and inert: every reach-in is
+optional-chained, the `defineProperty` is in a try/catch, and it adds no
+per-frame work (new pages arrive through the public
+`onAddTextureAtlasCanvas` event). It does not change how often textures upload,
+because a page's version already moved on every glyph rasterized into it. If
+xterm renames something the guard no-ops and we are back to the bug, not
+somewhere worse.
+
+**Safe to remove when** we ship `@xterm/addon-webgl` 0.20.0 or later.
+Upstream xtermjs/xterm.js#6038 is this bug, closed 2026-07-21, and the fix in
+0.20.0-beta.300 is the same approach: `public static nextVersion` on
+`AtlasPage`, with every `version++` replaced by
+`version = ++AtlasPage.nextVersion`. As of writing, npm `latest` for
+`@xterm/addon-webgl` is still 0.19.0 and 0.20.0 exists only as a beta, so the
+guard is load-bearing today. **Do not upgrade to the beta just to drop this**:
+the guard costs nothing and a beta of the whole xterm suite costs a lot more
+than one module.
+
+The same release also replaces the never-reset `_requestClearModel` flag with a
+monotonic `_pageLayoutVersion`, which is the second bug recorded in
+[performance.md](performance.md) bear trap 11. That one is pure upstream and
+needs nothing from us.
+
+### Purge checklist
+
+- [ ] `src/lib/atlasPageVersionGuard.ts` and `src/lib/atlasPageVersionGuard.test.ts`.
+- [ ] Both `guardAtlasPageVersions(a)` calls in `src/lib/terminalRenderer.ts`
+      (the attach path and the `onChangeTextureAtlas` microtask), plus the import.
+- [ ] The `atlas page version guard wiring (#314)` describe block and the
+      `guardSpy` mock in `src/lib/terminalRenderer.test.ts`. Keep the fake's
+      `onChangeTextureAtlas` callback recording: the scratch-canvas guard hangs
+      off the same event and still needs it.
+- [ ] `_pages` and `onAddTextureAtlasCanvas` in the `WEBGL_REACH_INS` table in
+      `src/lib/xtermInternals.test.ts`, and `atlasPageVersionGuard` from the
+      `_charAtlas` entry beside `atlasCanvasGuard`.
+- [ ] The GH #314 bullet in [gotchas.md](gotchas.md) becomes history: rewrite it
+      to say which xterm version fixed it rather than deleting it, since the
+      symptom is the thing a future reader will search for.
+- [ ] Re-verify before deleting: the bug needs ~16 atlas pages to appear, so a
+      quick check is not enough. See "Verifying a clean removal" above.

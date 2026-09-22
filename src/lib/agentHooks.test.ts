@@ -7,6 +7,11 @@ import {
   hookOscHandlerData,
   parseNotifyBody,
   CLAUDE_TERMINAL_SEQUENCE_ALLOWLIST,
+  HOOK_OSC_READY_BODY,
+  HOOK_OSC_WORKING_BODY,
+  HOOK_OSC_DONE_BODY,
+  HOOK_OSC_SESSION_PREFIX,
+  HOOK_OSC_DELEGATED_PREFIX,
 } from "@/lib/agentHooks";
 import { notificationWantsAttention, BUILTIN_NOTIFY_IGNORE } from "@/lib/agents";
 
@@ -54,6 +59,26 @@ describe("agent hook OSC sequence", () => {
     // body silently shifts.
     expect(HOOK_OSC_TITLE).not.toContain(";");
     expect(parseNotifyBody(hookOscHandlerData("multi;part;body"))).toBe("multi;part;body");
+  });
+
+  it("keeps the delegated report apart from every other body", () => {
+    // All five share OSC 777 and the trusted `termic` title, and the handler
+    // tells them apart by body alone: ready and the turn edges on an exact
+    // match, the session id and this one by prefix. A body that is a prefix of
+    // another routes to the wrong arm, and a trusted body that routes nowhere
+    // reaches the user as a banner.
+    for (const other of [HOOK_OSC_BODY, HOOK_OSC_READY_BODY, HOOK_OSC_WORKING_BODY,
+                         HOOK_OSC_DONE_BODY, HOOK_OSC_SESSION_PREFIX]) {
+      expect(HOOK_OSC_DELEGATED_PREFIX.startsWith(other)).toBe(false);
+      expect(other.startsWith(HOOK_OSC_DELEGATED_PREFIX)).toBe(false);
+    }
+    // Pinned against DELEGATED_BODY_PREFIX in agent_hooks.rs: the halves of
+    // one contract, in two languages that cannot share a constant.
+    expect(HOOK_OSC_DELEGATED_PREFIX).toBe("agent delegated: ");
+    // And it must survive the same filter every body here survives.
+    for (const pattern of BUILTIN_NOTIFY_IGNORE.claude ?? []) {
+      expect(new RegExp(pattern).test(HOOK_OSC_DELEGATED_PREFIX)).toBe(false);
+    }
   });
 
   it("ignores an OSC 777 that is not a notify", () => {

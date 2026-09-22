@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
-  taskNeedsAttention, taskWorkDone, taskWorking, taskWorkBadge,
+  taskNeedsAttention, taskWorkDone, taskWorking, taskWorkBadge, taskDelegated,
 } from "@/lib/taskWorkState";
 import type { Tab } from "@/lib/types";
+import type { DelegatedWork } from "@/lib/delegatedWork";
 
 // Only type / workState / unread matter to the helpers.
 const term = (over: Partial<Tab> = {}): Tab =>
@@ -10,7 +11,7 @@ const term = (over: Partial<Tab> = {}): Tab =>
 const edit = (over: Partial<Tab> = {}): Tab =>
   ({ id: "e", type: "edit", ...over } as Tab);
 
-const ON = { settledHighlight: true, workingIndicator: true };
+const ON = { settledHighlight: true, workingIndicator: true, attentionIndicator: true };
 
 describe("the three predicates", () => {
   it("reads attention, done and working off terminal tabs", () => {
@@ -38,16 +39,33 @@ describe("the three predicates", () => {
 });
 
 describe("the pref gates", () => {
-  it("settledHighlight off silences attention AND done", () => {
+  it("settledHighlight off silences done, and no longer the bell", () => {
+    // It used to silence both. The bell is the one mark that is about the
+    // USER rather than the agent, so it got its own switch; this pref keeps
+    // the name it has in Settings and the state it is named after.
     const tabs = [term({ unread: { reason: "attention" }, workState: "done" })];
     const p = { settledHighlight: false, workingIndicator: true };
-    expect(taskNeedsAttention(tabs, p)).toBe(false);
     expect(taskWorkDone(tabs, p)).toBe(false);
+    expect(taskNeedsAttention(tabs, p)).toBe(true);
   });
 
-  it("workingIndicator off silences only the spinner", () => {
+  it("attentionIndicator off silences the bell on its own", () => {
+    const tabs = [term({ unread: { reason: "attention" }, workState: "done" })];
+    expect(taskNeedsAttention(tabs,
+      { settledHighlight: true, attentionIndicator: false })).toBe(false);
+    // And a caller that does not pass it is asking "is anything blocked on
+    // me". Defaulting that to no would hide the mark from the surfaces that
+    // exist to show it.
+    expect(taskNeedsAttention(tabs, { settledHighlight: true })).toBe(true);
+  });
+
+  it("workingIndicator off silences every MID-TURN mark, not just the spinner", () => {
     const p = { settledHighlight: true, workingIndicator: false };
+    const held: DelegatedWork = { label: "shell", count: 1, ids: ["b1"] };
     expect(taskWorking([term({ workState: "working" })], p)).toBe(false);
+    // The ring too: turning the spinner off used to leave one in its place,
+    // which is the same claim drawn more quietly.
+    expect(taskDelegated([term({ delegatedWork: held })], p)).toBe(false);
     expect(taskWorkDone([term({ workState: "done" })], p)).toBe(true);
   });
 
@@ -58,9 +76,11 @@ describe("the pref gates", () => {
     expect(taskWorkDone([term({ workState: "done" })], { settledHighlight: true })).toBe(true);
   });
 
-  it("both prefs off draws nothing at all", () => {
+  it("every switch off draws nothing at all", () => {
     const tabs = [term({ unread: { reason: "attention" }, workState: "working" })];
-    expect(taskWorkBadge(tabs, { settledHighlight: false, workingIndicator: false })).toBe(null);
+    expect(taskWorkBadge(tabs, {
+      settledHighlight: false, workingIndicator: false, attentionIndicator: false,
+    })).toBe(null);
   });
 });
 
@@ -93,12 +113,42 @@ describe("taskWorkBadge precedence", () => {
     ], ON)).toBe("attention");
   });
 
+  it("draws delegated work last, and only when nothing else wants the slot", () => {
+    const held: DelegatedWork = { label: "shell", count: 1, ids: ["b1"] };
+    // On its own: a tab with nothing spinning and nothing to announce, that
+    // still has something running. This is the case the collapsed sidebar row
+    // showed as completely inert.
+    expect(taskWorkBadge([term({ delegatedWork: held })], ON)).toBe("delegated");
+    // And it never outranks a real state, on the same tab or another.
+    expect(taskWorkBadge([term({ workState: "working", delegatedWork: held })], ON))
+      .toBe("working");
+    expect(taskWorkBadge([term({ workState: "done", delegatedWork: held })], ON))
+      .toBe("done");
+    expect(taskWorkBadge([
+      term({ id: "a", delegatedWork: held }),
+      term({ id: "b", unread: { reason: "attention" } }),
+    ], ON)).toBe("attention");
+  });
+
+  it("gates delegated work on the spinner pref, with done unaffected", () => {
+    const held: DelegatedWork = { label: "shell", count: 1, ids: ["b1"] };
+    // Mid-turn marks are one family and one switch. The ring says an agent is
+    // busy, so "do not show me busy agents" has to cover it.
+    expect(taskDelegated([term({ delegatedWork: held })],
+      { settledHighlight: false, workingIndicator: true })).toBe(true);
+    expect(taskDelegated([term({ delegatedWork: held })],
+      { settledHighlight: true, workingIndicator: false })).toBe(false);
+    // A non-terminal tab can never carry one.
+    expect(taskDelegated([edit({ delegatedWork: held } as never)], ON)).toBe(false);
+  });
+
   it("skips a silenced higher rank instead of drawing nothing", () => {
-    // settledHighlight off removes attention and done from contention, so a
+    // settledHighlight off removes done from contention, so a
     // working agent still gets its spinner.
     expect(taskWorkBadge([
       term({ id: "a", unread: { reason: "attention" } }),
       term({ id: "b", workState: "working" }),
-    ], { settledHighlight: false, workingIndicator: true })).toBe("working");
+    ], { settledHighlight: false, workingIndicator: true, attentionIndicator: false }))
+      .toBe("working");
   });
 });
