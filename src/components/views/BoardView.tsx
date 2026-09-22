@@ -114,8 +114,12 @@ export function BoardView() {
   const setView     = useApp(s => s.setView);
   const settledHighlight  = usePrefs(s => s.settledHighlight);
   const workingIndicator  = usePrefs(s => s.workingIndicator);
+  // attentionIndicator is optional in WorkStatePrefs (upstream split it out
+  // of settledHighlight); reading it here keeps the board's attention column
+  // under the same toggle that gates the bell everywhere else.
+  const attentionIndicator = usePrefs(s => s.attentionIndicator);
   const useBranchAsTaskName = usePrefs(s => s.useBranchAsTaskName);
-  const workPrefs: WorkStatePrefs = { settledHighlight, workingIndicator };
+  const workPrefs: WorkStatePrefs = { settledHighlight, workingIndicator, attentionIndicator };
 
   // Re-render trigger for PR polls, nothing more. The pr store lives outside
   // useApp precisely so its 60s tick re-renders nobody by default; the board
@@ -136,7 +140,7 @@ export function BoardView() {
     // columnKey folds in every tab/PR/archive change that can move a card;
     // `tasks` identity covers adds, removes and reorders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, columnKey, settledHighlight, workingIndicator]);
+  }, [tasks, columnKey, settledHighlight, workingIndicator, attentionIndicator]);
 
   const lanes = useMemo(() => boardLanes(tasks, agents), [tasks, agents]);
   const projectOrder = useMemo(() => projects.map(p => p.id), [projects]);

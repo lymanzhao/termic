@@ -9,7 +9,9 @@ import type { Agent, Tab, Task } from "./types";
 import type { WorkStatePrefs } from "./taskWorkState";
 
 const prefsOn: WorkStatePrefs = { settledHighlight: true, workingIndicator: true };
-const prefsOff: WorkStatePrefs = { settledHighlight: false, workingIndicator: false };
+// attentionIndicator is optional and defaults on (upstream split it out of
+// settledHighlight), so gating attention off means saying so explicitly.
+const prefsOff: WorkStatePrefs = { settledHighlight: false, workingIndicator: false, attentionIndicator: false };
 
 let taskSeq = 0;
 function task(over: Partial<Task> = {}): Task {
