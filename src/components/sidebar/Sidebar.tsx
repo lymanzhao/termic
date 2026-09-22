@@ -2973,7 +2973,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
               // to be reachable at all.
               <span
                 className="min-w-0 flex-1 truncate"
-                title={tab.delegatedWork ? delegatedTitle(tab.delegatedWork) : undefined}
+                title={tab.delegatedWork ? delegatedTitle(tab.delegatedWork, tChrome) : undefined}
               >{title}</span>
             )}
             {/* Run tabs (GH #54): the same two controls the tab pill carries,

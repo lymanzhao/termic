@@ -514,7 +514,7 @@ function StepConcepts() {
   return (
     <div className="flex flex-col gap-3">
       <p className="text-[12.5px] text-[var(--color-fg-dim)]">
-        <Trans i18nKey="welcome.conceptIntro"
+        <Trans t={t} i18nKey="welcome.conceptIntro"
           components={{ b: <strong className="font-medium text-[var(--color-fg)]" /> }} />
       </p>
 
@@ -584,12 +584,12 @@ function StepConcepts() {
         </div>
         <p className="text-[12px] leading-snug text-[var(--color-fg-faint)]">
           <Link2 className="mr-1 inline h-3 w-3 align-[-2px]" />
-          <Trans i18nKey="welcome.conceptMainBody"
+          <Trans t={t} i18nKey="welcome.conceptMainBody"
             components={{ b: <strong className="font-medium text-[var(--color-fg-dim)]" /> }} />
         </p>
         <p className="mt-1.5 text-[12px] leading-snug text-[var(--color-fg-faint)]">
           <GitBranch className="mr-1 inline h-3 w-3 align-[-2px]" />
-          <Trans i18nKey="welcome.conceptWorktreeBody"
+          <Trans t={t} i18nKey="welcome.conceptWorktreeBody"
             components={{ b: <strong className="font-medium text-[var(--color-fg-dim)]" />, code: <code className="mx-1" /> }} />
         </p>
       </div>
