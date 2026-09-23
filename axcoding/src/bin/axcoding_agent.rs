@@ -210,8 +210,7 @@ async fn execute_tool(name: &str, args: serde_json::Value) -> String {
 }
 
 /// THE loop. Everything the agent is, in one function.
-async fn run<L: Llm>(llm: L, task: &str, max_turns: u32) -> Result<()> {
-    let llm = Arc::new(llm);
+async fn run<L: Llm>(llm: Arc<L>, task: &str, max_turns: u32) -> Result<()> {
     let specs = tool_specs();
     // The transcript is the only state.
     let mut transcript = vec![ChatMessage::user(task)];
@@ -250,6 +249,7 @@ async fn main() -> Result<()> {
     let mut provider = "anthropic".to_string();
     let mut model: Option<String> = None;
     let mut max_turns: u32 = 50;
+    let mut check_auth = false;
     let mut task: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -259,29 +259,75 @@ async fn main() -> Result<()> {
             "--max-turns" => {
                 max_turns = args.next().expect("--max-turns needs a value").parse()?;
             }
+            "--check-auth" => check_auth = true,
             other => task.push(other.to_string()),
         }
     }
-    let task = if task.is_empty() {
-        bail!("usage: axcoding-agent [--provider anthropic|openai] [--model NAME] [--max-turns N] TASK...")
+
+    if check_auth {
+        let (ok, msg) = axcoding::auth_status(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            std::env::var("OPENAI_API_KEY").ok().as_deref(),
+        );
+        println!("{msg}");
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // One task on argv, or interactive: one task per stdin line. The
+    // interactive mode is what a PTY host (termic) drives.
+    let mode = if task.is_empty() {
+        Mode::Interactive
     } else {
-        task.join(" ")
+        Mode::Run(task.join(" "))
     };
 
     match provider.as_str() {
         "anthropic" => {
             let client = <anthropic::Client as ProviderClient>::from_env()?;
-            let llm = RigLlm::new(client.completion_model(
+            let llm = Arc::new(RigLlm::new(client.completion_model(
                 model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
-            ));
-            run(llm, &task, max_turns).await
+            )));
+            dispatch(llm, mode, max_turns).await
         }
         "openai" => {
             let client = <openai::Client as ProviderClient>::from_env()?;
-            let llm = RigLlm::new(client
-                .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
-            run(llm, &task, max_turns).await
+            let llm = Arc::new(RigLlm::new(client
+                .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6))));
+            dispatch(llm, mode, max_turns).await
         }
         other => bail!("unknown provider {other:?} (anthropic | openai)"),
+    }
+}
+
+enum Mode {
+    Run(String),
+    Interactive,
+}
+
+async fn dispatch<L: Llm>(llm: Arc<L>, mode: Mode, max_turns: u32) -> Result<()> {
+    match mode {
+        Mode::Run(task) => run(llm, &task, max_turns).await,
+        Mode::Interactive => {
+            eprintln!("axcoding-agent: one task per line; Ctrl-D or --exit to quit.");
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => return Ok(()), // EOF
+                    Ok(_) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let task = line.trim();
+                if task.is_empty() {
+                    continue;
+                }
+                if task == "--exit" {
+                    return Ok(());
+                }
+                if let Err(e) = run(Arc::clone(&llm), task, max_turns).await {
+                    eprintln!("error: {e}");
+                }
+            }
+        }
     }
 }

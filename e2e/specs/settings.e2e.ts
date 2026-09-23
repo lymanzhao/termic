@@ -648,6 +648,43 @@ describe("settings rail", () => {
     await waitForText("Copy on select");
   });
 
+  // The registry and the icon table move together: a builtin whose id is
+  // missing from `CliIcon`'s switch renders the generic fallback glyph, which
+  // is exactly the "blank icon, visible immediately" failure
+  // docs/adding-an-agent.md §1c warns about. Sweep the agent card tabs in
+  // Settings and assert none of the CURRENT builtins drew the fallback;
+  // `data-icon-id` is the hook AgentsSection exposes for precisely this, and
+  // `data-cli-icon="fallback"` marks the generic glyph. The sweep is scoped
+  // to `builtin: true` rows from the store because an OLD profile can still
+  // carry rows for agents since dropped from `default_agents()` (gemini is
+  // the live example: its row survives in seeded profiles, its icon case
+  // does not, and that is a legacy artifact rather than a shipped-agent
+  // regression). axcoding is asserted by NAME on top: it is the built-in
+  // this repo itself ships, so "sweep found nothing" must never quietly
+  // mean "the strip did not render".
+  it("renders a brand icon for every builtin agent, never the fallback", async () => {
+    await browser.execute(() =>
+      window.__termic!.useApp.getState().openSettings("agents"),
+    );
+    await waitForText("Copy on select");
+
+    const { builtinIds, fallbacks } = await browser.execute(() => {
+      const agents = window.__termic!.useApp.getState().agents;
+      const builtinIds = agents
+        .filter((a: { builtin: boolean }) => a.builtin)
+        .map((a: { id: string }) => a.id);
+      const fallback = new Set(
+        [...document.querySelectorAll("span[data-icon-id]")]
+          .filter((s) => s.querySelector('svg[data-cli-icon="fallback"]'))
+          .map((s) => s.getAttribute("data-icon-id")),
+      );
+      return { builtinIds, fallbacks: builtinIds.filter((id: string) => fallback.has(id)) };
+    });
+    expect(builtinIds.length).toBeGreaterThan(0);
+    expect(builtinIds).toContain("axcoding");
+    expect(fallbacks).toEqual([]);
+  });
+
   // Appearance carries three sub-tabs. Terminal leads (the embedded terminal
   // is the product), which is why the live preview is click-armed: see the
   // pty case below.

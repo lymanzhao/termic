@@ -188,6 +188,20 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       name_args: ["--name", "{WORKSPACE_SLUG}"],
     },
   },
+  axcoding: {
+    // Must mirror the Rust default_agents() entry (agents.test.ts keeps the
+    // two in step): no approval mechanism, no session persistence in v0,
+    // env-var-only auth.
+    command: "axcoding-agent", args: [],
+    capabilities: {
+      yolo_args: [],
+      runtime_yolo_command: "",
+      resume_args: [],
+      session_id_args: [],
+      resume_id_args: [],
+      name_args: [],
+    },
+  },
   opencode: {
     command: "opencode", args: [],
     capabilities: {
@@ -472,6 +486,9 @@ export const BUILTIN_TITLE_SIGNALS: Record<string, Required<SignalPatterns>> = {
   opencode: { attention: [], busy: [], idle: [], pending: [] },
   pi: { attention: [], busy: [], idle: [], pending: [] },
   devin: { attention: [], busy: [], idle: [], pending: [] },
+  // axcoding never emits OSC 0 at all (by construction - the binary sets no
+  // titles and writes plain text), so there is nothing to capture.
+  axcoding: { attention: [], busy: [], idle: [], pending: [] },
 };
 
 /** How many rows up from the bottom of the viewport `pending` patterns are

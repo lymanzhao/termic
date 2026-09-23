@@ -57,7 +57,9 @@ impl Default for HarnessCfg {
         Self {
             max_turns: 24,
             repl: ReplCfg::default(),
-            data_dir: PathBuf::from(".rlm-data"),
+            // $HOME/.axcoding, shared across runs: the playbook is the
+            // self-improvement, so it must outlive any single task dir.
+            data_dir: crate::default_data_dir(),
             reflect: true,
         }
     }

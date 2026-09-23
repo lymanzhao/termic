@@ -43,6 +43,17 @@ target.
 | pi | none (`session_start` precedes the input box) | `before_agent_start`, `tool_call` | `ui_prompt_start` (an extension's own prompt; pi has no permission prompts) | `agent_settled` | none exists |
 | muse | none (`SessionStart` is lazy) | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `PermissionRequest` | `Stop` | none exists |
 
+axcoding is deliberately absent from this table, and the reasoning lives here
+because this is the only place anyone would find it (the same question was asked
+about muse once): axcoding is this repo's own binary (`axcoding/`), and it has no
+hook transport to install into. It reads no hooks or settings file of any shape,
+loads no plugin directory, and its only configuration surface is the process
+environment (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). Work state therefore comes
+from turn exit alone (`docs/agent-states.md`), the footer shows neither usage nor
+context (`SOURCES` in `lib/agentContext.ts` records the looking), and
+`schemas_for` in `agent_hooks.rs` intentionally has no row. If axcoding ever grows
+a config file, that is the trigger to revisit this paragraph and add a schema.
+
 Three install shapes are new with copilot, pi and muse (GH #277 follow-up):
 
 - **copilot** gets its NATIVE hook file, `~/.copilot/hooks/termic.json`

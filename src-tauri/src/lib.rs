@@ -19680,6 +19680,63 @@ fn default_agents() -> Vec<Agent> {
                     .into(),
             }),
         },
+        Agent {
+            // axcoding: this repo's own rig-core agent (sources in
+            // axcoding/ at the repo root; `cargo install --path axcoding`
+            // is what puts it on PATH). Measured BY CONSTRUCTION - we wrote
+            // the binary - so every claim below is a property of its source
+            // rather than of a help text:
+            //   - it never asks for permission because it has no approval
+            //     mechanism at all; yolo_args is EMPTY as an answer.
+            //   - v0 has no session persistence: no id flags of any shape,
+            //     so repo-root tasks start fresh ("Neither" in
+            //     docs/adding-an-agent.md §2). Revisit when sessions land.
+            //   - its only login is the environment: ANTHROPIC_API_KEY or
+            //     OPENAI_API_KEY, read at startup. Nothing on disk and no
+            //     keyring, which is why agent_dirs::login_store is None
+            //     WITH a reason - the measured "cannot hold a second
+            //     account", not an unmeasured blank.
+            //   - it writes plain text to stdout, sets no titles, and
+            //     emits no OSC, so there are no work-state signals to
+            //     capture and work_done rides on turn exit only.
+            id: "axcoding".into(),
+            display_name: "axcoding".into(),
+            command: "axcoding-agent".into(),
+            args: vec![],
+            icon_id: "axcoding".into(),
+            color: "#0d9488".into(),
+            builtin: true,
+            disabled: false,
+            capabilities: AgentCapabilities {
+                yolo_args: vec![],
+                runtime_yolo_command: String::new(),
+                runtime_default_command: String::new(),
+                resume_args: vec![],
+                session_id_args: vec![],
+                resume_id_args: vec![],
+                resume_picker_args: vec![],
+                name_args: vec![],
+                signals: AgentSignals::default(),
+                match_output: false,
+            },
+            env: std::collections::HashMap::new(),
+            docker_env: std::collections::HashMap::new(),
+            // The binary reads env keys and keeps its playbook in
+            // ~/.axcoding (agent_dirs::state_dirs); it needs no other
+            // host paths beyond the task's own worktree.
+            sandbox_allowed_paths: vec![],
+            // Empty like every other built-in: model-API hosts are the
+            // sandbox's runtime concern, not a per-agent list.
+            sandbox_allowed_hosts: vec![],
+            work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
+            extends: None,
+            kind: "agent".into(),
+            post_launch_capture: None,
+        },
     ]
 }
 
@@ -26150,6 +26207,31 @@ mod tests {
         // pi mints deterministically, so it must NOT use opencode's
         // post-exit capture path.
         assert!(pi.post_launch_capture.is_none());
+    }
+
+    // axcoding is this repo's own binary (axcoding/ at the repo root), so
+    // "measured" means by-construction: the empties below are properties of
+    // its source, and the test pins them so a reviewer does not "finish"
+    // them. It never prompts (no approval mechanism exists), so yolo_args is
+    // empty as an ANSWER; it has no session persistence in v0, so every
+    // resume list is empty and repo-root tasks start fresh; its login is
+    // env-var-only (ANTHROPIC_API_KEY / OPENAI_API_KEY), which is why
+    // agent_dirs gives it login_unsupported_reason rather than a store.
+    #[test]
+    fn axcoding_empties_are_answers_not_omissions() {
+        let agents = seeded_defaults().agents;
+        let ax = agents.iter().find(|a| a.id == "axcoding").expect("axcoding seeded");
+        assert!(ax.capabilities.yolo_args.is_empty());
+        assert!(ax.capabilities.resume_args.is_empty());
+        assert!(ax.capabilities.session_id_args.is_empty());
+        assert!(ax.capabilities.resume_id_args.is_empty());
+        assert!(ax.capabilities.resume_picker_args.is_empty());
+        assert!(ax.capabilities.name_args.is_empty());
+        assert!(ax.post_launch_capture.is_none());
+        // The one HOME path it owns is the playbook dir; auth itself is env.
+        assert!(ax.sandbox_allowed_paths.is_empty());
+        assert_eq!(ax.command, "axcoding-agent");
+        assert_eq!(ax.icon_id, "axcoding");
     }
 
     // Muse Code 1.0.2, measured against a live binary via its offline

@@ -1700,6 +1700,16 @@ pub fn render_filter_for(task: &Task, agent_override: Option<&str>) -> String {
             r"^.+\.sentry\.io$".into(),
             r"^.+\.openrouter\.ai$".into(),
         ]),
+        // axcoding (this repo's own rig-core agent). By construction it dials
+        // exactly two endpoints - the Anthropic Messages API and the OpenAI
+        // Responses API, whichever key the user has set - and nothing else:
+        // no telemetry, no update checks, and no auth flow (auth is an env
+        // var). A deny here means the code grew an endpoint; add it
+        // deliberately, like every other row above.
+        "axcoding" => hosts.extend([
+            r"^api\.anthropic\.com$".into(),
+            r"^api\.openai\.com$".into(),
+        ]),
         _ => { /* custom agents: user must list hosts explicitly */ }
     }
 

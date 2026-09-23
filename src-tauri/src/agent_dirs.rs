@@ -311,6 +311,15 @@ pub fn login_unsupported_reason(base_id: &str) -> Option<&'static str> {
             "Muse stores its credential in the OS keychain and termic has not confirmed that a \
              second set would get its own, so it does not offer one yet.",
         ),
+        // axcoding (this repo's own agent): auth is ANTHROPIC_API_KEY or
+        // OPENAI_API_KEY read from the environment at startup, so there is
+        // no on-disk login to isolate and no second account to offer. The
+        // probe (scripts/login-probe.mjs) checks this stays true.
+        "axcoding" => Some(
+            "axcoding authenticates with ANTHROPIC_API_KEY or OPENAI_API_KEY from the \
+             environment and keeps no login on disk, so there is nothing to isolate into a \
+             second store.",
+        ),
         _ => None,
     }
 }
@@ -493,6 +502,13 @@ pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
         // `.local/bin`), so unlike grok these are safe to mount over in
         // Docker — see assets/Dockerfile.default.
         "muse" => &[".config/muse", ".local/share/muse"],
+        // axcoding (this repo's own agent): the only HOME state is the
+        // playbook dir the RLM harness writes by default
+        // (`$HOME/.axcoding/playbook.json`, axcoding::default_data_dir).
+        // Auth is env-only, so this is state rather than login - but it is
+        // real WRITE state, which is exactly what a cage or a Docker mount
+        // must not silently deny.
+        "axcoding" => &[".axcoding"],
         // grok: binary, bundled skills, and config all live under `.grok`
         // with no clean relocation env. Listed here for Seatbelt (which
         // allows the real path regardless); `docker::agent_config` still

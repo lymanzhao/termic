@@ -15,6 +15,14 @@ no loop. Backends: `llm_fake::ScriptedLlm` (tests, zero network) and
 `llm_rig::RigLlm` (rig-core 0.42 provider plumbing, verified against the
 crate source, not docs).
 
+## Install (for use outside this repo, e.g. as a termic agent)
+
+```sh
+cargo install --path .   # puts axcoding-agent + axcoding-rlm on PATH
+```
+
+Auth is env-only: ANTHROPIC_API_KEY or OPENAI_API_KEY (`axcoding-agent --check-auth` reports it). axcoding-agent with no task argument runs interactive: one task per stdin line, Ctrl-D to quit - this is what a PTY host drives. The RLM playbook lives at ~/.axcoding/playbook.json across runs.
+
 ## Run
 
 ```sh
