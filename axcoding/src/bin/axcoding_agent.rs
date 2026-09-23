@@ -218,12 +218,15 @@ async fn run<L: Llm>(llm: Arc<L>, task: &str, max_turns: u32) -> Result<()> {
 
     for turn_no in 1..=max_turns {
         let turn = llm.complete(SYSTEM, &transcript, &specs).await?;
-        if !turn.text.trim().is_empty() {
-            eprintln!("──────── assistant (turn {turn_no}) ────────\n{}", turn.text);
-        }
         if turn.tool_calls.is_empty() {
+            // Final answer: stdout, once. The stderr event print below is
+            // for MID-loop narration only; printing both duplicated every
+            // last reply on screen.
             println!("{}", turn.text);
             return Ok(());
+        }
+        if !turn.text.trim().is_empty() {
+            eprintln!("──────── assistant (turn {turn_no}) ────────\n{}", turn.text);
         }
         transcript.push(ChatMessage::assistant_calls(turn.text, turn.tool_calls.clone()));
         for call in &turn.tool_calls {
