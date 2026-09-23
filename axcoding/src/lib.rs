@@ -11,6 +11,7 @@
 //! The `Llm` trait is the seam: real backends are thin adapters (rig),
 //! tests drive everything through `llm_fake::ScriptedLlm` with no network.
 
+pub mod auth;
 pub mod ctx;
 pub mod harness;
 pub mod llm_fake;
@@ -133,56 +134,14 @@ pub fn clip(s: &str, max_chars: usize) -> String {
     format!("{cut}…[+{} chars]", s.chars().count() - max_chars)
 }
 
-/// Where the playbook lives by default: `$HOME/.axcoding/`, shared across
-/// tasks and runs, so the self-improvement actually accumulates. `--data`
-/// overrides. Falls back to CWD when `$HOME` is unset (should not happen
-/// on macOS/Linux, but a hardcoded panic would be worse).
+/// Where the playbook lives by default: `$AXCODING_HOME` or `$HOME/.axcoding/`,
+/// shared across tasks and runs, so the self-improvement actually
+/// accumulates. Same relocation the auth file honors, which is what makes
+/// the dir a real login store. `--data` overrides. Falls back to CWD when
+/// `$HOME` is unset (should not happen on macOS/Linux, but a hardcoded
+/// panic would be worse).
 pub fn default_data_dir() -> std::path::PathBuf {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h).join(".axcoding"),
-        _ => std::path::PathBuf::from(".axcoding"),
-    }
+    let home = std::env::var("HOME").ok();
+    auth::axcoding_home(home.as_deref())
 }
 
-/// Pure so tests can run without touching process env.
-/// Returns (authenticated, one-line status).
-pub fn auth_status(anthropic: Option<&str>, openai: Option<&str>) -> (bool, String) {
-    match (anthropic.filter(|k| !k.trim().is_empty()), openai.filter(|k| !k.trim().is_empty())) {
-        (Some(_), Some(_)) => (true, "authenticated: ANTHROPIC_API_KEY + OPENAI_API_KEY".into()),
-        (Some(_), None) => (true, "authenticated: ANTHROPIC_API_KEY".into()),
-        (None, Some(_)) => (true, "authenticated: OPENAI_API_KEY".into()),
-        (None, None) => (
-            false,
-            "not authenticated: set ANTHROPIC_API_KEY or OPENAI_API_KEY".into(),
-        ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auth_status_reports_each_key_combination() {
-        let (ok, msg) = auth_status(Some("k"), Some("k"));
-        assert!(ok && msg.contains("ANTHROPIC") && msg.contains("OPENAI"));
-        let (ok, msg) = auth_status(Some("k"), None);
-        assert!(ok && msg.contains("ANTHROPIC"));
-        let (ok, msg) = auth_status(None, Some("k"));
-        assert!(ok && msg.contains("OPENAI"));
-        let (ok, msg) = auth_status(None, None);
-        assert!(!ok && msg.contains("not authenticated"));
-        // Blank keys count as absent.
-        let (ok, _) = auth_status(Some("  "), None);
-        assert!(!ok);
-    }
-
-    #[test]
-    fn default_data_dir_is_home_scoped() {
-        // Only meaningful when HOME is set, which is the normal case.
-        if std::env::var("HOME").map(|h| !h.is_empty()).unwrap_or(false) {
-            let d = default_data_dir();
-            assert!(d.ends_with(".axcoding"), "{d:?}");
-        }
-    }
-}

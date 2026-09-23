@@ -226,6 +226,19 @@ pub fn login_store(base_id: &str) -> Option<LoginStore> {
         // PATH, which is what lets two accounts be live at once.
         "claude" => Some(ConfigDir { env: "CLAUDE_CONFIG_DIR" }),
         "codex" => Some(ConfigDir { env: "CODEX_HOME" }),
+        // axcoding (this repo's own agent): auth resolves env vars first,
+        // then falls back to `$AXCODING_HOME/auth.json` (default
+        // `~/.axcoding/`, written by `axcoding-agent auth import` from the
+        // provider config switchers like cc-switch persist into Claude
+        // Code's settings.json). The binary honors AXCODING_HOME for BOTH
+        // the auth file and the playbook dir, so relocating the var
+        // relocates the whole login. Measured by construction - we wrote
+        // the resolver (axcoding/src/auth.rs) - and enforced going forward
+        // by the probe row in scripts/login-probe.mjs, which points the var
+        // at an empty dir and requires a signed-out answer. Unlike the
+        // keyring agents there is no second store hiding behind the dir:
+        // the credential is a plain file IN it.
+        "axcoding" => Some(ConfigDir { env: "AXCODING_HOME" }),
         // NOT SUPPORTED, and this is a correction rather than an omission.
         //
         // copilot keeps its credential in the OS keyring under a FIXED service
@@ -310,15 +323,6 @@ pub fn login_unsupported_reason(base_id: &str) -> Option<&'static str> {
         "muse" => Some(
             "Muse stores its credential in the OS keychain and termic has not confirmed that a \
              second set would get its own, so it does not offer one yet.",
-        ),
-        // axcoding (this repo's own agent): auth is ANTHROPIC_API_KEY or
-        // OPENAI_API_KEY read from the environment at startup, so there is
-        // no on-disk login to isolate and no second account to offer. The
-        // probe (scripts/login-probe.mjs) checks this stays true.
-        "axcoding" => Some(
-            "axcoding authenticates with ANTHROPIC_API_KEY or OPENAI_API_KEY from the \
-             environment and keeps no login on disk, so there is nothing to isolate into a \
-             second store.",
         ),
         _ => None,
     }

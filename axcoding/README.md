@@ -21,7 +21,7 @@ crate source, not docs).
 cargo install --path .   # puts axcoding-agent + axcoding-rlm on PATH
 ```
 
-Auth is env-only: ANTHROPIC_API_KEY or OPENAI_API_KEY (`axcoding-agent --check-auth` reports it). axcoding-agent with no task argument runs interactive: one task per stdin line, Ctrl-D to quit - this is what a PTY host drives. The RLM playbook lives at ~/.axcoding/playbook.json across runs.
+Auth resolves in order: env ANTHROPIC_API_KEY, env ANTHROPIC_AUTH_TOKEN (relay tokens, honored with ANTHROPIC_BASE_URL - what cc-switch writes), env OPENAI_API_KEY, then `~/.axcoding/auth.json` (`AXCODING_HOME` relocates it). `--check-auth` reports what resolved. `auth import` copies the provider config from ~/.claude/settings.json (where cc-switch persists it) into the auth file (0600); re-run with `--force` after switching providers. axcoding-agent with no task argument runs interactive: one task per stdin line, Ctrl-D to quit - this is what a PTY host drives. The RLM playbook lives at ~/.axcoding/playbook.json across runs.
 
 ## Run
 

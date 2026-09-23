@@ -13,13 +13,14 @@
 //! demo binary that can loop forever spends real money; pi itself has no
 //! such knob ("the loop just loops"). Pass a huge N to get pi semantics.
 
-use anyhow::{bail, Result};
-use rig_core::client::{CompletionClient, ProviderClient};
+use anyhow::{bail, Context as _, Result};
+use rig_core::client::CompletionClient;
 use rig_core::providers::{anthropic, openai};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+use axcoding::auth::Provider;
 use axcoding::llm_rig::RigLlm;
 use axcoding::{ChatMessage, Llm, ToolSpec};
 
@@ -250,6 +251,7 @@ async fn main() -> Result<()> {
     let mut model: Option<String> = None;
     let mut max_turns: u32 = 50;
     let mut check_auth = false;
+    let mut import_force = false;
     let mut task: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -260,17 +262,70 @@ async fn main() -> Result<()> {
                 max_turns = args.next().expect("--max-turns needs a value").parse()?;
             }
             "--check-auth" => check_auth = true,
+            "--force" => import_force = true,
             other => task.push(other.to_string()),
         }
     }
 
-    if check_auth {
-        let (ok, msg) = axcoding::auth_status(
-            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
-            std::env::var("OPENAI_API_KEY").ok().as_deref(),
+    // `auth import` copies the provider config from Claude Code's
+    // settings.json env block (where cc-switch and friends write) into
+    // the axcoding auth file.
+    if task.first().map(String::as_str) == Some("auth") {
+        if task.get(1).map(String::as_str) != Some("import") {
+            bail!("usage: axcoding-agent auth import [--force]");
+        }
+        let claude = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_default(),
+        )
+        .join(".claude/settings.json");
+        let settings = std::fs::read_to_string(&claude)
+            .with_context(|| format!("read {}", claude.display()))?;
+        let out = axcoding::auth::auth_file_path();
+        let s = axcoding::auth::import_from_claude_settings(&settings, &out, import_force)?;
+        println!("wrote {} (0600)", s.wrote.display());
+        println!(
+            "  auth_token: {}, api_key: {}",
+            s.auth_token, s.api_key
         );
-        println!("{msg}");
-        std::process::exit(if ok { 0 } else { 1 });
+        if let Some(u) = &s.base_url {
+            println!("  base_url:   {u}");
+        }
+        if let Some(m) = &s.model {
+            println!("  model:      {m}");
+        }
+        println!("note: a later provider switch in cc-switch does not update this copy; re-run with --force when you switch.");
+        return Ok(());
+    }
+
+    if check_auth {
+        return match axcoding::auth::resolve_from_process() {
+            Ok(a) => {
+                let kind = match a.kind {
+                    axcoding::auth::AuthKind::ApiKey => "api-key",
+                    axcoding::auth::AuthKind::AuthToken => "bearer",
+                };
+                print!(
+                    "authenticated: {} via {} ({kind})",
+                    match a.provider {
+                        axcoding::auth::Provider::Anthropic => "anthropic",
+                        axcoding::auth::Provider::OpenAi => "openai",
+                    },
+                    a.source,
+                );
+                if let Some(u) = &a.base_url {
+                    print!(" -> {u}");
+                }
+                if let Some(m) = &a.model {
+                    print!(" model={m}");
+                }
+                println!();
+                Ok(())
+            }
+            Err(e) => {
+                println!("{e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // One task on argv, or interactive: one task per stdin line. The
@@ -281,21 +336,54 @@ async fn main() -> Result<()> {
         Mode::Run(task.join(" "))
     };
 
+    // Auth is resolved once, up front, so a spawn with no credentials
+    // fails LOUDLY here instead of mid-conversation.
+    let auth = axcoding::auth::resolve_from_process().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // --model wins over the auth file's model, which wins over the default.
+    let model = model.or_else(|| auth.model.clone());
+    // --provider, when given, is a check on what was resolved, not a
+    // selector: the credential in play decides the provider.
     match provider.as_str() {
-        "anthropic" => {
-            let client = <anthropic::Client as ProviderClient>::from_env()?;
+        "anthropic" if auth.provider != Provider::Anthropic => bail!(
+            "--provider anthropic but the resolved credential is openai; \
+             unset the OpenAI credential or drop --provider"
+        ),
+        "openai" if auth.provider != Provider::OpenAi => bail!(
+            "--provider openai but the resolved credential is anthropic; \
+             unset the Anthropic credential or drop --provider"
+        ),
+        _ => {}
+    }
+
+    match auth.provider {
+        // One construction path for both credential kinds. Measured on the
+        // bigmodel relay (2026-09-23): it accepts the token via x-api-key
+        // AND via Authorization Bearer, so an ANTHROPIC_AUTH_TOKEN from a
+        // switcher rides the same builder as a plain API key. If a future
+        // relay rejects x-api-key, that is the moment to add a Bearer path
+        // (rig's BearerAuth cannot pass the anthropic builder's build(),
+        // which pins Key == AnthropicKey; it needs a custom http_client).
+        Provider::Anthropic => {
+            let mut b = anthropic::Client::builder().api_key(auth.key.clone());
+            if let Some(u) = &auth.base_url {
+                b = b.base_url(u.clone());
+            }
+            let client = b.build()?;
             let llm = Arc::new(RigLlm::new(client.completion_model(
                 model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
             )));
             dispatch(llm, mode, max_turns).await
         }
-        "openai" => {
-            let client = <openai::Client as ProviderClient>::from_env()?;
+        Provider::OpenAi => {
+            let mut b = openai::Client::builder().api_key(auth.key.clone());
+            if let Some(u) = &auth.base_url {
+                b = b.base_url(u.clone());
+            }
+            let client = b.build()?;
             let llm = Arc::new(RigLlm::new(client
                 .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6))));
             dispatch(llm, mode, max_turns).await
         }
-        other => bail!("unknown provider {other:?} (anthropic | openai)"),
     }
 }
 

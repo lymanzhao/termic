@@ -19691,11 +19691,13 @@ fn default_agents() -> Vec<Agent> {
             //   - v0 has no session persistence: no id flags of any shape,
             //     so repo-root tasks start fresh ("Neither" in
             //     docs/adding-an-agent.md §2). Revisit when sessions land.
-            //   - its only login is the environment: ANTHROPIC_API_KEY or
-            //     OPENAI_API_KEY, read at startup. Nothing on disk and no
-            //     keyring, which is why agent_dirs::login_store is None
-            //     WITH a reason - the measured "cannot hold a second
-            //     account", not an unmeasured blank.
+            //   - its login resolves env vars first, then falls back to
+            //     `$AXCODING_HOME/auth.json` (default `~/.axcoding/`,
+            //     written by `axcoding-agent auth import`, which reads the
+            //     provider config switchers like cc-switch persist into
+            //     Claude Code's settings.json). agent_dirs therefore holds
+            //     a real ConfigDir login store keyed on AXCODING_HOME, and
+            //     the account switcher works for it like claude's/codex's.
             //   - it writes plain text to stdout, sets no titles, and
             //     emits no OSC, so there are no work-state signals to
             //     capture and work_done rides on turn exit only.
@@ -26214,9 +26216,9 @@ mod tests {
     // its source, and the test pins them so a reviewer does not "finish"
     // them. It never prompts (no approval mechanism exists), so yolo_args is
     // empty as an ANSWER; it has no session persistence in v0, so every
-    // resume list is empty and repo-root tasks start fresh; its login is
-    // env-var-only (ANTHROPIC_API_KEY / OPENAI_API_KEY), which is why
-    // agent_dirs gives it login_unsupported_reason rather than a store.
+    // resume list is empty and repo-root tasks start fresh; its login
+    // resolves env vars first and falls back to $AXCODING_HOME/auth.json,
+    // which agent_dirs holds as a ConfigDir login store.
     #[test]
     fn axcoding_empties_are_answers_not_omissions() {
         let agents = seeded_defaults().agents;

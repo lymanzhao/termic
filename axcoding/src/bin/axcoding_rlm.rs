@@ -5,7 +5,7 @@
 //! in through the rig backend in `../llm_rig.rs` (`--provider`).
 
 use anyhow::{bail, Result};
-use rig_core::client::{CompletionClient, ProviderClient};
+use rig_core::client::CompletionClient;
 use rig_core::providers::{anthropic, openai};
 use axcoding::harness::{Harness, HarnessCfg};
 use axcoding::llm_fake::ScriptedLlm;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut mode = "fake".to_string();
-    let mut data_dir = PathBuf::from(".rlm-data");
+    let mut data_dir = axcoding::default_data_dir();
     let mut task =
         "Find the needle, say what surrounds it, and how deep into the hay it was.".to_string();
     let mut context_file: Option<String> = None;
@@ -48,18 +48,44 @@ async fn main() -> Result<()> {
 
     match mode.as_str() {
         "fake" => run_fake(&task, data_dir).await,
-        "anthropic" => {
-            let client = <anthropic::Client as ProviderClient>::from_env()?;
-            let llm = RigLlm::new(client.completion_model(
-                model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
-            ));
-            run_real(Arc::new(llm), &task, context_file, data_dir).await
-        }
-        "openai" => {
-            let client = <openai::Client as ProviderClient>::from_env()?;
-            let llm = RigLlm::new(client
-                .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
-            run_real(Arc::new(llm), &task, context_file, data_dir).await
+        "anthropic" | "openai" => {
+            // Same auth chain as axcoding-agent: env keys, switcher tokens
+            // (ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL), then auth.json.
+            let auth = axcoding::auth::resolve_from_process().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let want = if mode == "anthropic" {
+                axcoding::auth::Provider::Anthropic
+            } else {
+                axcoding::auth::Provider::OpenAi
+            };
+            if auth.provider != want {
+                bail!(
+                    "--provider {mode} but the resolved credential is {}; \
+                     unset the other credential or drop --provider",
+                    if auth.provider == axcoding::auth::Provider::Anthropic { "anthropic" } else { "openai" }
+                );
+            }
+            let model = model.or_else(|| auth.model.clone());
+            match auth.provider {
+                axcoding::auth::Provider::Anthropic => {
+                    let mut b = anthropic::Client::builder().api_key(auth.key.clone());
+                    if let Some(u) = &auth.base_url {
+                        b = b.base_url(u.clone());
+                    }
+                    let llm = RigLlm::new(b.build()?.completion_model(
+                        model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
+                    ));
+                    run_real(Arc::new(llm), &task, context_file, data_dir).await
+                }
+                axcoding::auth::Provider::OpenAi => {
+                    let mut b = openai::Client::builder().api_key(auth.key.clone());
+                    if let Some(u) = &auth.base_url {
+                        b = b.base_url(u.clone());
+                    }
+                    let llm = RigLlm::new(b.build()?
+                        .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
+                    run_real(Arc::new(llm), &task, context_file, data_dir).await
+                }
+            }
         }
         other => bail!("unknown provider {other:?} (anthropic | openai); --fake also exists"),
     }
