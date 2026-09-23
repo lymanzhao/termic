@@ -21,7 +21,9 @@ crate source, not docs).
 cargo install --path .   # puts axcoding-agent + axcoding-rlm on PATH
 ```
 
-Auth resolves in order: env ANTHROPIC_API_KEY, env ANTHROPIC_AUTH_TOKEN (relay tokens, honored with ANTHROPIC_BASE_URL - what cc-switch writes), env OPENAI_API_KEY, then `~/.axcoding/auth.json` (`AXCODING_HOME` relocates it). `--check-auth` reports what resolved. `auth import` copies the provider config from ~/.claude/settings.json (where cc-switch persists it) into the auth file (0600); re-run with `--force` after switching providers. axcoding-agent with no task argument runs interactive: one task per stdin line, Ctrl-D to quit - this is what a PTY host drives. The RLM playbook lives at ~/.axcoding/playbook.json across runs.
+Auth resolves in order: env ANTHROPIC_API_KEY, env ANTHROPIC_AUTH_TOKEN (relay tokens, honored with ANTHROPIC_BASE_URL - what cc-switch writes), then `~/.axcoding/auth.json` (`AXCODING_HOME` relocates it), then env OPENAI_API_KEY. Same-provider env beats the file (session override); the file beats OTHER providers' env noise (a stray launchd OPENAI key must not hijack an imported GLM config). `--check-auth` reports what resolved. `auth import` copies the provider config from ~/.claude/settings.json (where cc-switch persists it) into the auth file (0600); re-run with `--force` after switching providers.
+
+Interactive mode (no task argument) runs an inline TUI when stdin+stdout are a terminal: streaming output, one session across lines (follow-up questions share context), `/clear` resets the session, Ctrl-D exits, Ctrl-C cancels the in-flight task. Under a PTY host (termic) it just works; finished content flows into scrollback. Non-tty (pipes, scripts) or `--no-tui` / `AXCODING_NO_TUI=1` falls back to the plain one-task-per-line loop. `--max-turns` caps a task's model calls (default 50); `AXCODING_MAX_TOKENS` overrides the output budget (default 8192). The RLM playbook lives at ~/.axcoding/playbook.json across runs.
 
 ## Run
 
