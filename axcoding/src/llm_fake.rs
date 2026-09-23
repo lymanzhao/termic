@@ -105,6 +105,44 @@ impl Llm for ScriptedLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StreamEvent;
+
+    fn one_tool() -> [ToolSpec; 1] {
+        [ToolSpec { name: "eval", description: "t".into(), parameters: serde_json::json!({}) }]
+    }
+
+    #[tokio::test]
+    async fn stream_turn_synthesizes_events_from_complete() {
+        // The scripted backend takes the trait's DEFAULT stream_turn (it has
+        // no real deltas), which proves the default wrapper works for any
+        // backend that only implements complete().
+        let mut llm = ScriptedLlm::new();
+        llm.push_tool_turn(
+            "thinking",
+            vec![ScriptedLlm::tool("t1", "eval", r#"{"code":"1"}"#)],
+        );
+        use futures::StreamExt;
+        let mut s = llm
+            .stream_turn("sys", &[ChatMessage::user("hi")], &one_tool())
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = s.next().await {
+            events.push(ev.unwrap());
+        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::Text(t) if t == "thinking"));
+        assert!(matches!(&events[1], StreamEvent::ToolCall(c) if c.name == "eval"));
+    }
+
+    #[tokio::test]
+    async fn stream_turn_omits_empty_text_event() {
+        let mut llm = ScriptedLlm::new();
+        llm.push_text("");
+        use futures::StreamExt;
+        let mut s = llm.stream_turn("sys", &[], &one_tool()).await.unwrap();
+        assert!(s.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn pops_turns_in_order_then_defaults() {

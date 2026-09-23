@@ -8,8 +8,9 @@
 use anyhow::{anyhow, Result};
 use rig_core::completion::{CompletionModel, CompletionResponse, ToolDefinition};
 use rig_core::message::{AssistantContent, Message};
+use rig_core::streaming::StreamedAssistantContent;
 
-use crate::{ChatMessage, Llm, LlmTurn, Role, ToolSpec};
+use crate::{ChatMessage, EventStream, Llm, LlmTurn, Role, StreamEvent, ToolSpec};
 
 /// Output budget sent with every request. The Anthropic endpoint REQUIRES
 /// max_tokens, and rig only defaults it for model names it recognizes
@@ -128,6 +129,60 @@ where
         }
         Ok(LlmTurn { text, tool_calls })
     }
+
+    /// Real deltas. Same builder, `.stream()` instead of `.completion()`;
+    /// text arrives as append-deltas, tool calls as ONE assembled event
+    /// each (the incremental ToolCallDelta fragments are rig bookkeeping
+    /// and are dropped here). Driven by a spawned task feeding a
+    /// futures-channel, so the caller just awaits events.
+    async fn stream_turn(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<EventStream> {
+        let (first, rest) = messages.split_first().ok_or_else(|| anyhow!("no messages"))?;
+        let mut builder = self
+            .model
+            .completion_request(to_rig(first))
+            .preamble(system.to_string())
+            .max_tokens(max_tokens_from_env());
+        if !rest.is_empty() {
+            builder = builder.messages(rest.iter().map(to_rig));
+        }
+        if !tools.is_empty() {
+            builder = builder.tools(tools.iter().map(to_tool_def).collect());
+        }
+        let resp = self
+            .model
+            .stream(builder.build())
+            .await
+            .map_err(|e| anyhow!("stream failed: {e}"))?;
+
+        let (mut tx, rx) = futures::channel::mpsc::channel::<anyhow::Result<StreamEvent>>(16);
+        tokio::spawn(async move {
+            let mut resp = resp;
+            use futures::{SinkExt, StreamExt};
+            while let Some(item) = resp.next().await {
+                let event = match item {
+                    Ok(StreamedAssistantContent::Text(t)) => Ok(StreamEvent::Text(t.text)),
+                    Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                        Ok(StreamEvent::ToolCall(crate::ToolCall {
+                            id: tool_call.id.as_str().to_string(),
+                            name: tool_call.function.name.clone(),
+                            args_json: tool_call.function.arguments.to_string(),
+                        }))
+                    }
+                    Ok(_) => continue,
+                    Err(e) => Err(anyhow!("stream error: {e}")),
+                };
+                if tx.send(event).await.is_err() {
+                    return; // receiver went away: caller cancelled the turn
+                }
+            }
+        });
+        Ok(Box::pin(rx))
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +250,52 @@ mod tests {
             },
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    use crate::ChatMessage;
+    use futures::StreamExt;
+    use rig_core::client::CompletionClient;
+    use rig_core::providers::anthropic;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "network: run with -- --ignored; uses the real relay"]
+    async fn bigmodel_stream_smoke() {
+        let auth = crate::auth::resolve_from_process().expect("auth");
+        let mut b = anthropic::Client::builder().api_key(auth.key.clone());
+        if let Some(u) = &auth.base_url {
+            b = b.base_url(u.clone());
+        }
+        let model_name = auth.model.clone().unwrap_or_else(|| "glm-5.3-flash".into());
+        let client = b.build().expect("client");
+        let llm = RigLlm::new(client.completion_model(&model_name));
+        let started = std::time::Instant::now();
+        let mut s = llm
+            .stream_turn(
+                "answer in one short word",
+                &[ChatMessage::user("只回答一个词：你好")],
+                &[],
+            )
+            .await
+            .expect("stream_turn");
+        let mut first_at = None;
+        let mut text = String::new();
+        while let Some(ev) = s.next().await {
+            match ev.expect("event") {
+                StreamEvent::Text(d) => {
+                    if first_at.is_none() {
+                        first_at = Some(started.elapsed());
+                        eprintln!("first delta at {first_at:?}");
+                    }
+                    text.push_str(&d);
+                }
+                StreamEvent::ToolCall(c) => eprintln!("tool call: {}", c.name),
+            }
+        }
+        eprintln!("total {:?}, text: {text:?}", started.elapsed());
+        assert!(!text.is_empty());
     }
 }

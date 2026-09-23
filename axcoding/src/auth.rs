@@ -106,6 +106,13 @@ fn non_empty(s: Option<String>) -> Option<String> {
 /// Walk the chain. `file` is the auth.json TEXT, already read by the
 /// caller (the bin reads the real path; tests pass explicit strings), so
 /// `None` cleanly means "no file" and tests never touch the filesystem.
+///
+/// Precedence, and WHY: same-provider env vars beat the file (a session
+/// can override the imported config), but the file beats OTHER providers'
+/// env vars. The latter matters on machines where tools `launchctl setenv`
+/// leftover keys into every GUI-spawned process: an env OPENAI_API_KEY
+/// must not hijack a run whose credentials were deliberately imported for
+/// the Anthropic dialect.
 pub fn resolve(env: &EnvSnapshot, file: Option<&str>) -> Result<AuthConfig, String> {
     if let Some(k) = non_empty(env.anthropic_api_key.clone()) {
         return Ok(AuthConfig {
@@ -125,16 +132,6 @@ pub fn resolve(env: &EnvSnapshot, file: Option<&str>) -> Result<AuthConfig, Stri
             base_url: non_empty(env.anthropic_base_url.clone()),
             model: None,
             source: "ANTHROPIC_AUTH_TOKEN",
-        });
-    }
-    if let Some(k) = non_empty(env.openai_api_key.clone()) {
-        return Ok(AuthConfig {
-            provider: Provider::OpenAi,
-            kind: AuthKind::ApiKey,
-            key: k,
-            base_url: None,
-            model: None,
-            source: "OPENAI_API_KEY",
         });
     }
 
@@ -175,9 +172,20 @@ pub fn resolve(env: &EnvSnapshot, file: Option<&str>) -> Result<AuthConfig, Stri
         ));
     }
 
+    if let Some(k) = non_empty(env.openai_api_key.clone()) {
+        return Ok(AuthConfig {
+            provider: Provider::OpenAi,
+            kind: AuthKind::ApiKey,
+            key: k,
+            base_url: None,
+            model: None,
+            source: "OPENAI_API_KEY",
+        });
+    }
+
     Err(format!(
         "not authenticated. Looked in: ANTHROPIC_API_KEY (unset), \
-         ANTHROPIC_AUTH_TOKEN (unset), OPENAI_API_KEY (unset), {} (missing). \
+         ANTHROPIC_AUTH_TOKEN (unset), {} (missing), OPENAI_API_KEY (unset). \
          Run `axcoding-agent auth import` to copy the provider config from \
          Claude Code's settings.json (where cc-switch and similar tools write), \
          or set one of those variables.",
@@ -325,8 +333,15 @@ mod tests {
         assert_eq!(r.source, "auth file");
         assert_eq!(r.model.as_deref(), Some("glm-x"));
 
-        // OPENAI env beats the file too (env is more specific to the session).
+        // The imported file must beat OTHER providers' env noise: a stray
+        // OPENAI_API_KEY in launchd (setenv) must not hijack an
+        // anthropic-dialect run. This exact case hung a real run.
         let r = resolve(&env(None, None, None, Some("ok")), Some(file)).unwrap();
+        assert_eq!(r.provider, Provider::Anthropic);
+        assert_eq!(r.source, "auth file");
+
+        // Without a file, env OPENAI still works as the fallback.
+        let r = resolve(&env(None, None, None, Some("ok")), None).unwrap();
         assert_eq!(r.provider, Provider::OpenAi);
     }
 

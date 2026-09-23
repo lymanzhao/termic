@@ -18,6 +18,9 @@ pub mod llm_fake;
 pub mod llm_rig;
 pub mod playbook;
 pub mod repl;
+pub mod session;
+pub mod tools;
+pub mod tui;
 
 use std::future::Future;
 
@@ -114,6 +117,22 @@ pub struct LlmTurn {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// One event out of a streaming turn. `Text` is a DELTA (append it);
+/// `ToolCall` is a complete, assembled call (deltas of partial JSON are
+/// swallowed by the backend and never surface here). End of stream = the
+/// stream yields None; after that the turn is fully accounted for.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Text(String),
+    ToolCall(ToolCall),
+}
+
+/// Boxed stream of stream events; boxed so the trait stays simple (one
+/// allocation per turn is nothing next to a model round-trip).
+pub type EventStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>,
+>;
+
 /// The only thing a backend must do: one completion, no loop.
 /// The loop lives in `harness` (and in `bin/axcoding_agent.rs`) so it stays visible.
 pub trait Llm: Send + Sync + 'static {
@@ -123,6 +142,30 @@ pub trait Llm: Send + Sync + 'static {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> impl Future<Output = anyhow::Result<LlmTurn>> + Send;
+
+    /// Streaming variant. The default wraps `complete()` and re-emits its
+    /// result as synthetic events, so a backend only overrides this when it
+    /// has REAL deltas to give (rig does; the scripted test backend does not
+    /// and stays zero-code).
+    fn stream_turn(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = anyhow::Result<EventStream>> + Send {
+        let fut = self.complete(system, messages, tools);
+        async move {
+            let turn = fut.await?;
+            let mut events: Vec<anyhow::Result<StreamEvent>> = Vec::new();
+            if !turn.text.is_empty() {
+                events.push(Ok(StreamEvent::Text(turn.text.clone())));
+            }
+            for call in &turn.tool_calls {
+                events.push(Ok(StreamEvent::ToolCall(call.clone())));
+            }
+            Ok(Box::pin(futures::stream::iter(events)) as EventStream)
+        }
+    }
 }
 
 /// Truncate for display without splitting a char.
