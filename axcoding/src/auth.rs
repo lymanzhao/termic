@@ -191,6 +191,18 @@ pub fn resolve_from_process() -> Result<AuthConfig, String> {
     resolve(&EnvSnapshot::from_process(), raw.as_deref())
 }
 
+/// `ANTHROPIC_MODEL` (and friends) carry Claude Code context aliases as a
+/// bracket suffix - `glm-5.3-flash[1M]` - which the raw Messages API does
+/// not accept as a model code ([1211] model-not-found on bigmodel). Strip
+/// it for the wire; users who want the suffix semantics are using Claude
+/// Code, not this binary.
+pub fn strip_model_alias(model: &str) -> String {
+    match model.find('[') {
+        Some(at) if model.ends_with(']') && at > 0 => model[..at].to_string(),
+        _ => model.to_string(),
+    }
+}
+
 /// What `auth import` found and wrote. Field names only, never values.
 #[derive(Debug)]
 pub struct ImportSummary {
@@ -237,7 +249,8 @@ pub fn import_from_claude_settings(
         api_key,
         base_url: str_field("ANTHROPIC_BASE_URL"),
         model: str_field("ANTHROPIC_MODEL")
-            .or_else(|| str_field("ANTHROPIC_DEFAULT_SONNET_MODEL")),
+            .or_else(|| str_field("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+            .map(|m| strip_model_alias(&m)),
     };
     let summary = ImportSummary {
         wrote: out.clone(),
@@ -355,7 +368,8 @@ mod tests {
         assert!(s.auth_token);
         assert!(!s.api_key);
         assert_eq!(s.base_url.as_deref(), Some("https://relay.example/api/anthropic"));
-        assert_eq!(s.model.as_deref(), Some("glm-x[1M]"));
+        // The [1M] context alias is Claude Code's, not a model code.
+        assert_eq!(s.model.as_deref(), Some("glm-x"));
         // The file must actually hold it, and be 0600.
         let written = std::fs::read_to_string(&s.wrote).unwrap();
         assert!(written.contains("tok-abc"));
@@ -377,5 +391,15 @@ mod tests {
         assert!(import_from_claude_settings(r#"{"env":{}}"#, &out, true).is_err());
         assert!(import_from_claude_settings("not json", &out, true).is_err());
         std::fs::remove_file(&out).ok();
+    }
+
+    #[test]
+    fn model_alias_suffix_is_stripped_for_the_wire() {
+        assert_eq!(strip_model_alias("glm-5.3-flash[1M]"), "glm-5.3-flash");
+        assert_eq!(strip_model_alias("glm-5.3"), "glm-5.3");
+        // Not a suffix-shaped string: keep verbatim.
+        assert_eq!(strip_model_alias("claude-sonnet-4-6"), "claude-sonnet-4-6");
+        assert_eq!(strip_model_alias("[1M]"), "[1M]");
+        assert_eq!(strip_model_alias("weird[unclosed"), "weird[unclosed");
     }
 }

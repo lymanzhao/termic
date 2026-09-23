@@ -11,6 +11,23 @@ use rig_core::message::{AssistantContent, Message};
 
 use crate::{ChatMessage, Llm, LlmTurn, Role, ToolSpec};
 
+/// Output budget sent with every request. The Anthropic endpoint REQUIRES
+/// max_tokens, and rig only defaults it for model names it recognizes
+/// (claude-*) - a relay model like `glm-5.3-flash[1M]` from the auth file
+/// would hard-error without this. Override at runtime with
+/// AXCODING_MAX_TOKENS.
+pub const DEFAULT_MAX_TOKENS: u64 = 8192;
+
+fn parse_max_tokens(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&t| t > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+fn max_tokens_from_env() -> u64 {
+    parse_max_tokens(std::env::var("AXCODING_MAX_TOKENS").ok().as_deref())
+}
+
 /// Wraps any provider model into our `Llm` trait.
 pub struct RigLlm<M: CompletionModel> {
     model: M,
@@ -82,7 +99,8 @@ where
         let mut builder = self
             .model
             .completion_request(to_rig(first))
-            .preamble(system.to_string());
+            .preamble(system.to_string())
+            .max_tokens(max_tokens_from_env());
         if !rest.is_empty() {
             builder = builder.messages(rest.iter().map(to_rig));
         }
@@ -116,6 +134,15 @@ where
 mod tests {
     use super::*;
     use rig_core::message::{ToolResult, UserContent};
+
+    #[test]
+    fn max_tokens_parsing_rejects_junk_and_zero() {
+        assert_eq!(parse_max_tokens(None), DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens(Some(" 4096 ")), 4096);
+        assert_eq!(parse_max_tokens(Some("abc")), DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens(Some("0")), DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens(Some("-5")), DEFAULT_MAX_TOKENS);
+    }
 
     #[test]
     fn user_maps_to_user_text() {
