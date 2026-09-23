@@ -187,25 +187,13 @@ fn char_to_byte(s: &str, char_index: usize) -> usize {
     s.char_indices().nth(char_index).map(|(b, _)| b).unwrap_or(s.len())
 }
 
-/// Cell width for the chars agent output actually contains (CJK and
-/// fullwidth forms are 2; everything else 1). Deliberately local instead
-/// of a unicode-width direct dep — if this ever misses a glyph the cost is
-/// a one-cell cursor misalignment, not a crash.
+/// Cell width, delegated to unicode-width — the SAME crate ratatui lays
+/// out with. A hand-rolled table here disagreed with ratatui on ambiguous
+/// and combining chars, and every disagreement showed up on screen as
+/// drifting gaps around CJK text. Combining marks are zero-width.
 pub fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    if (0x1100..=0x115F).contains(&cp)
-        || ((0x2E80..=0xA4CF).contains(&cp) && cp != 0x303F)
-        || (0xAC00..=0xD7A3).contains(&cp)
-        || (0xF900..=0xFAFF).contains(&cp)
-        || (0xFE30..=0xFE6F).contains(&cp)
-        || (0xFF00..=0xFF60).contains(&cp)
-        || (0xFFE0..=0xFFE6).contains(&cp)
-        || (0x20000..=0x3FFFD).contains(&cp)
-    {
-        2
-    } else {
-        1
-    }
+    use unicode_width::UnicodeWidthChar;
+    c.width().unwrap_or(0)
 }
 
 /// Wrap text into rows of at most `cols` CELLS, breaking at char bounds
@@ -311,9 +299,14 @@ impl Tui {
             let area = frame.area();
             let width = area.width as usize;
             let status = if self.busy {
-                format!("{} working…  Ctrl-C cancels this task", SPINNER[self.spinner])
+                // ASCII separators: East Asian Ambiguous punctuation (…, ·)
+                // is the one class where a terminal may render wide while
+                // unicode-width says narrow, and the status row lives
+                // closest to the cursor. The reply text keeps whatever the
+                // model emits.
+                format!("{} working... Ctrl-C cancels this task", SPINNER[self.spinner])
             } else {
-                "type a task · /clear resets the session · Ctrl-D exits".to_string()
+                "type a task | /clear resets the session | Ctrl-D exits".to_string()
             };
             let live_tail: String = {
                 let chars: Vec<char> = self.live.chars().collect();
@@ -334,7 +327,10 @@ impl Tui {
                     format!("…{}", chars[start..].iter().collect::<String>())
                 }
             };
-            let prompt = "❯ ";
+            let prompt = "> ";
+            // Prompt width in CELLS (byte .len() put the cursor two cells
+            // past the prompt and floated it wide over CJK input).
+            let prompt_cells: usize = prompt.chars().map(char_width).sum();
             let input = format!("{prompt}{}", self.editor.text());
             let [live_a, status_a, input_a] = ratatui::layout::Layout::vertical([
                 ratatui::layout::Constraint::Length(1),
@@ -349,7 +345,7 @@ impl Tui {
                 status_a,
             );
             frame.render_widget(ratatui::text::Line::from(input), input_a);
-            let x = (input_a.x as usize + prompt.len() + self.editor.cursor_cells())
+            let x = (input_a.x as usize + prompt_cells + self.editor.cursor_cells())
                 .min(width.saturating_sub(1));
             frame.set_cursor_position((x as u16, input_a.y));
         });
@@ -429,6 +425,17 @@ mod tests {
         e.key(KeyCode::Char('X'), false);
         assert_eq!(e.text(), "你好worXl");
         assert_eq!(e.cursor_cells(), 2 + 2 + 3 + 1);
+    }
+
+    #[test]
+    fn combining_marks_are_zero_width() {
+        // e + combining acute: one cell, and insertion lands on a boundary.
+        let mut e = LineEditor::new();
+        type_str(&mut e, "e\u{301}x");
+        assert_eq!(e.cursor_cells(), 2); // e(1) + mark(0) + x(1)
+        e.key(KeyCode::Left, false);
+        e.key(KeyCode::Char('Z'), false);
+        assert_eq!(e.text(), "e\u{301}Zx");
     }
 
     #[test]
