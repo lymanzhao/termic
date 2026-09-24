@@ -27,9 +27,11 @@ Interactive mode (no task argument) runs an inline TUI when stdin+stdout are a t
 
 `axcoding-rlm` (no flags) also runs one task per stdin line - each line is a
 full RLM run (map/slice/sub-call/submit + reflection), playbook shared across
-runs. `--context-file big.txt` gives it the long context that makes RLM
-meaningful; both binaries appear as task CLIs in termic (axcoding,
-axcoding-rlm).
+runs. The context defaults to the CURRENT DIRECTORY, walked automatically
+(skips .git/node_modules/target and binary extensions; 200k per-file,
+2M total char caps) - in a termic task that is the worktree, which is the
+point. `--context-file big.txt` overrides. Both binaries appear as task CLIs
+in termic (axcoding, axcoding-rlm).
 
 ## Run
 

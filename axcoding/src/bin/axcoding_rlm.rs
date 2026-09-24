@@ -10,7 +10,7 @@
 //! auth.json); the playbook lives at `~/.axcoding/playbook.json` across
 //! runs, which is the self-improvement.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use rig_core::client::CompletionClient;
 use rig_core::providers::{anthropic, openai};
 use axcoding::harness::{Harness, HarnessCfg};
@@ -114,8 +114,33 @@ async fn dispatch<L: axcoding::Llm>(
     context_file: Option<String>,
     data_dir: PathBuf,
 ) -> Result<()> {
+    // The context, resolved ONCE for the session: an explicit file, or -
+    // by default, and this is the termic case - the task's own directory
+    // (cwd), which for a worktree task is exactly the long context the
+    // RLM was built to work over.
+    let context = match &context_file {
+        Some(p) => {
+            let c = std::fs::read_to_string(p)
+                .with_context(|| format!("read context file {p}"))?;
+            eprintln!("context: {} chars from {}", c.chars().count(), p);
+            c
+        }
+        None => {
+            let (c, s) = axcoding::ctxbuild::build_from_dir(
+                std::path::Path::new("."),
+                200_000,
+                2_000_000,
+            );
+            eprintln!(
+                "context: {} files, {} chars from cwd (skipped: {} oversize, {} binary)",
+                s.files, s.chars, s.skipped_oversize, s.skipped_binary
+            );
+            c
+        }
+    };
+
     match task {
-        Some(t) => run_real(llm, &t, context_file, data_dir).await,
+        Some(t) => run_real(llm, &t, &context, data_dir).await,
         None => {
             // One RLM run per stdin line — the PTY-host interaction model.
             eprintln!("axcoding-rlm: one task per line; Ctrl-D or --exit to quit.");
@@ -134,7 +159,9 @@ async fn dispatch<L: axcoding::Llm>(
                 if task == "--exit" {
                     return Ok(());
                 }
-                if let Err(e) = run_real(Arc::clone(&llm), task, context_file.clone(), data_dir.clone()).await {
+                if let Err(e) =
+                    run_real(Arc::clone(&llm), task, &context, data_dir.clone()).await
+                {
                     eprintln!("error: {e}");
                 }
             }
@@ -142,22 +169,15 @@ async fn dispatch<L: axcoding::Llm>(
     }
 }
 
-/// One real run: task + (big) context file -> harness -> trace.
+/// One real run: task + context -> harness -> trace.
 async fn run_real<L: axcoding::Llm>(
     llm: Arc<L>,
     task: &str,
-    context_file: Option<String>,
+    context: &str,
     data_dir: PathBuf,
 ) -> Result<()> {
-    let context = match &context_file {
-        Some(p) => std::fs::read_to_string(p)?,
-        None => String::new(),
-    };
-    if context.is_empty() {
-        eprintln!("warn: empty context; pass --context-file for a real RLM run");
-    }
     let harness = Harness::new(llm, HarnessCfg { data_dir, ..HarnessCfg::default() });
-    let trace = harness.run(task, &context).await?;
+    let trace = harness.run(task, context).await?;
     println!("answer:     {:?}", trace.answer);
     println!("turns:      {}", trace.turns);
     println!("evals:      {}", trace.usage.evals);

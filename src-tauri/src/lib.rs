@@ -19747,9 +19747,10 @@ fn default_agents() -> Vec<Agent> {
             // ($AXCODING_HOME, ~/.axcoding) - so the login store, state
             // dirs and probe rows mirror it exactly. Differences worth
             // knowing: one task per line of stdin (same PTY interaction
-            // model, no TUI - output is the run trace), and the RLM runs
-            // are only as good as their context; pass --context-file via
-            // the agent's args in Settings for real long-context work.
+            // model, no TUI - output is the run trace), and the context
+            // defaults to the task's own directory walked automatically
+            // (caps inside ctxbuild); --context-file overrides it via
+            // the agent's args in Settings.
             id: "axcoding-rlm".into(),
             display_name: "axcoding-rlm".into(),
             command: "axcoding-rlm".into(),
