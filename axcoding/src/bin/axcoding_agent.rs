@@ -141,7 +141,7 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
                     None => return Ok(()),
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {
-                    tui.tick_spinner();
+                    tui.tick();
                 }
             }
         };
@@ -157,19 +157,16 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
         tui.set_busy(true);
         let mark = transcript.len();
         let outcome = {
-            // The sink borrows `tui` for exactly this block; `transcript`
-            // is handed to the drive future. Both borrows end before the
-            // post-processing below.
-            let mut sink = |ev: UiEvent| match ev {
-                UiEvent::StreamDelta(d) => tui.push_live(&d),
-                UiEvent::AssistantText { .. } => {}
-                UiEvent::ToolStart { name, args_summary } => {
-                    tui.commit(&format!("· tool {name} {args_summary}"));
-                }
-                UiEvent::ToolEnd { output } => {
-                    tui.commit(&format!("  → {output}"));
-                }
-                UiEvent::FinalAnswer(text) => tui.commit(&text),
+            // The sink forwards into a channel so nothing here borrows
+            // `tui` while the drive future is alive: the select below
+            // needs `tui` free for its tick arm. Events are applied on
+            // the same tick that repaints, which also BATCHES streaming
+            // deltas into one draw — painting per-delta positioned every
+            // wide char with its own cursor move, and terminals render
+            // that as separate glyph runs: visibly wider CJK spacing.
+            let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+            let mut sink = |ev: UiEvent| {
+                let _ = ui_tx.send(ev);
             };
             let drive = drive_turn(
                 &llm,
@@ -181,9 +178,35 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
                 &mut sink,
             );
             tokio::pin!(drive);
-            loop {
+            let apply = |tui: &mut Tui, ev: UiEvent| match ev {
+                UiEvent::StreamDelta(d) => tui.push_live(&d),
+                UiEvent::AssistantText { .. } => {}
+                UiEvent::ToolStart { name, args_summary } => {
+                    tui.commit(&format!("· tool {name} {args_summary}"));
+                }
+                UiEvent::ToolEnd { output } => {
+                    tui.commit(&format!("  → {output}"));
+                }
+                UiEvent::FinalAnswer(text) => tui.commit(&text),
+            };
+            let outcome = loop {
                 tokio::select! {
-                    r = &mut drive => break Some(r),
+                    r = &mut drive => {
+                        // Drain whatever the finished task still queued so
+                        // the final answer paints before the status flips.
+                        while let Ok(ev) = ui_rx.try_recv() {
+                            apply(&mut tui, ev);
+                        }
+                        break Some(r);
+                    }
+                    ev = ui_rx.recv() => match ev {
+                        Some(ev) => apply(&mut tui, ev),
+                        None => {}
+                    },
+                    // The tick repaints batched deltas.
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        tui.tick();
+                    }
                     ev = ev_rx.recv() => {
                         // Only Ctrl-C acts while busy; everything else
                         // (typed-ahead or stray mouse input) is dropped.
@@ -197,7 +220,8 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
                         }
                     }
                 }
-            }
+            };
+            outcome
         };
         tui.set_busy(false);
         match outcome {

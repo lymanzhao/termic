@@ -239,6 +239,13 @@ pub struct Tui {
     /// Text of the current streaming turn, not yet committed to scrollback.
     live: String,
     busy: bool,
+    /// Set when content changed but was not painted yet. Streaming deltas
+    /// arrive one or two chars at a time; painting EACH of them makes
+    /// ratatui position every wide char with its own cursor move, which
+    /// terminals render as separate glyph runs — visibly wider CJK
+    /// spacing. Deltas only mark dirty; the caller's timer repaints, so
+    /// consecutive chars land in ONE draw as one contiguous run.
+    dirty: bool,
 }
 
 impl Tui {
@@ -255,6 +262,7 @@ impl Tui {
             spinner: 0,
             live: String::new(),
             busy: false,
+            dirty: false,
         })
     }
 
@@ -267,15 +275,22 @@ impl Tui {
         self.draw();
     }
 
-    /// Append a streaming delta to the live tail and repaint.
+    /// Append a streaming delta to the live tail. Does NOT paint: see the
+    /// `dirty` doc. The caller repaints on its timer.
     pub fn push_live(&mut self, delta: &str) {
         self.live.push_str(delta);
-        self.tick_spinner();
+        self.dirty = true;
     }
 
-    pub fn tick_spinner(&mut self) {
-        self.spinner = (self.spinner + 1) % SPINNER.len();
-        self.draw();
+    /// Timer tick: advance the spinner while busy, repaint only when
+    /// something actually changed.
+    pub fn tick(&mut self) {
+        if self.busy {
+            self.spinner = (self.spinner + 1) % SPINNER.len();
+            self.draw();
+        } else if self.dirty {
+            self.draw();
+        }
     }
 
     /// Move finished text into real scrollback, above the live region.
@@ -289,6 +304,12 @@ impl Tui {
                     buf.set_string(0, i as u16, row, Style::default());
                 }
             });
+            // insert_before scrolls the screen; ratatui's diff still
+            // compares against the pre-scroll buffer, so the next draw
+            // would skip cells that physically moved — measured as
+            // letters missing from the status row. Reset the baseline:
+            // the following draw repaints the whole viewport.
+            let _ = self.terminal.clear();
         }
         self.live.clear();
         self.draw();
@@ -349,6 +370,7 @@ impl Tui {
                 .min(width.saturating_sub(1));
             frame.set_cursor_position((x as u16, input_a.y));
         });
+        self.dirty = false;
     }
 
     /// Blocking read for the event thread. Recurses past non-key/mouse
