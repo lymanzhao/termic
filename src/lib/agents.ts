@@ -202,6 +202,19 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       name_args: [],
     },
   },
+  "axcoding-rlm": {
+    // Same crate, same auth file, same playbook dir; the harness CLI runs
+    // one RLM task per stdin line.
+    command: "axcoding-rlm", args: [],
+    capabilities: {
+      yolo_args: [],
+      runtime_yolo_command: "",
+      resume_args: [],
+      session_id_args: [],
+      resume_id_args: [],
+      name_args: [],
+    },
+  },
   opencode: {
     command: "opencode", args: [],
     capabilities: {
@@ -489,6 +502,7 @@ export const BUILTIN_TITLE_SIGNALS: Record<string, Required<SignalPatterns>> = {
   // axcoding never emits OSC 0 at all (by construction - the binary sets no
   // titles and writes plain text), so there is nothing to capture.
   axcoding: { attention: [], busy: [], idle: [], pending: [] },
+  "axcoding-rlm": { attention: [], busy: [], idle: [], pending: [] },
 };
 
 /** How many rows up from the bottom of the viewport `pending` patterns are

@@ -1,8 +1,14 @@
 //! `axcoding-rlm` — the Self-Improving RLM harness CLI.
 //!
-//! `--fake` runs the whole loop against a scripted backend (no network):
-//! find the needle, sub-call a slice, submit, reflect. Real providers wire
-//! in through the rig backend in `../llm_rig.rs` (`--provider`).
+//! Task sources, in order of explicitness:
+//! - `--task TEXT`  one run, then exit
+//! - stdin          one run PER LINE (what a PTY host like termic drives);
+//!                  EOF or `--exit` quits
+//! - `--fake`       the scripted demo (no network), ignoring the above
+//!
+//! Auth is the same chain as axcoding-agent (env keys → switcher tokens →
+//! auth.json); the playbook lives at `~/.axcoding/playbook.json` across
+//! runs, which is the self-improvement.
 
 use anyhow::{bail, Result};
 use rig_core::client::CompletionClient;
@@ -15,23 +21,23 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut mode = "fake".to_string();
+    let mut fake = false;
+    let mut provider_check: Option<String> = None;
     let mut data_dir = axcoding::default_data_dir();
-    let mut task =
-        "Find the needle, say what surrounds it, and how deep into the hay it was.".to_string();
+    let mut task: Option<String> = None;
     let mut context_file: Option<String> = None;
     let mut model: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--fake" => mode = "fake".to_string(),
-            "--provider" => mode = args.next().unwrap_or_else(|| "anthropic".to_string()),
+            "--fake" => fake = true,
+            "--provider" => provider_check = Some(args.next().expect("--provider needs a value")),
             "--model" => model = Some(args.next().expect("--model needs a value")),
             "--data" => {
                 data_dir = PathBuf::from(args.next().expect("--data needs a value"));
             }
             "--task" => {
-                task = args.next().expect("--task needs a value");
+                task = Some(args.next().expect("--task needs a value"));
             }
             "--context-file" => {
                 context_file = Some(args.next().expect("--context-file needs a value"));
@@ -39,60 +45,104 @@ async fn main() -> Result<()> {
             other => {
                 eprintln!("unknown flag {other}");
                 bail!(
-                    "usage: axcoding-rlm [--fake|--provider anthropic|openai] [--model NAME] \
+                    "usage: axcoding-rlm [--fake] [--provider anthropic|openai] [--model NAME] \
                      [--data DIR] [--task TEXT] [--context-file PATH]"
                 );
             }
         }
     }
 
-    match mode.as_str() {
-        "fake" => run_fake(&task, data_dir).await,
-        "anthropic" | "openai" => {
-            // Same auth chain as axcoding-agent: env keys, switcher tokens
-            // (ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL), then auth.json.
-            let auth = axcoding::auth::resolve_from_process().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let want = if mode == "anthropic" {
-                axcoding::auth::Provider::Anthropic
-            } else {
-                axcoding::auth::Provider::OpenAi
-            };
-            if auth.provider != want {
-                bail!(
-                    "--provider {mode} but the resolved credential is {}; \
-                     unset the other credential or drop --provider",
-                    if auth.provider == axcoding::auth::Provider::Anthropic { "anthropic" } else { "openai" }
-                );
-            }
-            let model = model.or_else(|| auth.model.clone());
-            match auth.provider {
-                axcoding::auth::Provider::Anthropic => {
-                    let mut b = anthropic::Client::builder().api_key(auth.key.clone());
-                    if let Some(u) = &auth.base_url {
-                        b = b.base_url(u.clone());
-                    }
-                    let llm = RigLlm::new(b.build()?.completion_model(
-                        model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
-                    ));
-                    run_real(Arc::new(llm), &task, context_file, data_dir).await
+    if fake {
+        return run_fake(
+            &task.unwrap_or_else(|| {
+                "Find the needle, say what surrounds it, and how deep into the hay it was."
+                    .to_string()
+            }),
+            data_dir,
+        )
+        .await;
+    }
+
+    let auth = axcoding::auth::resolve_from_process().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(want_name) = &provider_check {
+        let want = match want_name.as_str() {
+            "anthropic" => axcoding::auth::Provider::Anthropic,
+            "openai" => axcoding::auth::Provider::OpenAi,
+            other => bail!("unknown provider {other:?} (anthropic | openai)"),
+        };
+        if auth.provider != want {
+            bail!(
+                "--provider {want_name} but the resolved credential is {}; \
+                 unset the other credential or drop --provider",
+                if auth.provider == axcoding::auth::Provider::Anthropic {
+                    "anthropic"
+                } else {
+                    "openai"
                 }
-                axcoding::auth::Provider::OpenAi => {
-                    let mut b = openai::Client::builder().api_key(auth.key.clone());
-                    if let Some(u) = &auth.base_url {
-                        b = b.base_url(u.clone());
-                    }
-                    let llm = RigLlm::new(b.build()?
-                        .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
-                    run_real(Arc::new(llm), &task, context_file, data_dir).await
+            );
+        }
+    }
+    // --model wins over the auth file's model, which wins over the default.
+    let model = model.or_else(|| auth.model.clone());
+
+    match auth.provider {
+        axcoding::auth::Provider::Anthropic => {
+            let mut b = anthropic::Client::builder().api_key(auth.key.clone());
+            if let Some(u) = &auth.base_url {
+                b = b.base_url(u.clone());
+            }
+            let llm = RigLlm::new(b.build()?.completion_model(
+                model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
+            ));
+            dispatch(Arc::new(llm), task, context_file, data_dir).await
+        }
+        axcoding::auth::Provider::OpenAi => {
+            let mut b = openai::Client::builder().api_key(auth.key.clone());
+            if let Some(u) = &auth.base_url {
+                b = b.base_url(u.clone());
+            }
+            let llm = RigLlm::new(b.build()?
+                .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
+            dispatch(Arc::new(llm), task, context_file, data_dir).await
+        }
+    }
+}
+
+async fn dispatch<L: axcoding::Llm>(
+    llm: Arc<L>,
+    task: Option<String>,
+    context_file: Option<String>,
+    data_dir: PathBuf,
+) -> Result<()> {
+    match task {
+        Some(t) => run_real(llm, &t, context_file, data_dir).await,
+        None => {
+            // One RLM run per stdin line — the PTY-host interaction model.
+            eprintln!("axcoding-rlm: one task per line; Ctrl-D or --exit to quit.");
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => return Ok(()), // EOF
+                    Ok(_) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let task = line.trim();
+                if task.is_empty() {
+                    continue;
+                }
+                if task == "--exit" {
+                    return Ok(());
+                }
+                if let Err(e) = run_real(Arc::clone(&llm), task, context_file.clone(), data_dir.clone()).await {
+                    eprintln!("error: {e}");
                 }
             }
         }
-        other => bail!("unknown provider {other:?} (anthropic | openai); --fake also exists"),
     }
 }
 
 /// One real run: task + (big) context file -> harness -> trace.
-/// Playbook lives in `data_dir`, so running twice shows the improvement.
 async fn run_real<L: axcoding::Llm>(
     llm: Arc<L>,
     task: &str,
@@ -113,10 +163,7 @@ async fn run_real<L: axcoding::Llm>(
     println!("evals:      {}", trace.usage.evals);
     println!("sub_calls:  {}", trace.usage.sub_calls);
     println!("ctx chars:  {}", trace.ctx_chars);
-    println!(
-        "touched:    {} chars",
-        trace.usage.chars_touched
-    );
+    println!("touched:    {} chars", trace.usage.chars_touched);
     println!(
         "notes:      {}",
         if trace.notes.is_empty() { "(none)".to_string() } else { axcoding::clip(&trace.notes, 500) }

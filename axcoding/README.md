@@ -1,7 +1,7 @@
 # axcoding
 
-Two research prototypes in one crate. Not product code; lives in
-`scratchpad/` on purpose.
+Two research prototypes in one crate, developed in this repo and shipped
+as termic task CLIs.
 
 1. **`axcoding-agent`** — a minimal coding agent on rig-core, built with pi's
    (Mario Zechner, earendil-works) philosophy.
@@ -25,18 +25,24 @@ Auth resolves in order: env ANTHROPIC_API_KEY, env ANTHROPIC_AUTH_TOKEN (relay t
 
 Interactive mode (no task argument) runs an inline TUI when stdin+stdout are a terminal: streaming output, one session across lines (follow-up questions share context), `/clear` resets the session, Ctrl-D exits, Ctrl-C cancels the in-flight task. Under a PTY host (termic) it just works; finished content flows into scrollback. Non-tty (pipes, scripts) or `--no-tui` / `AXCODING_NO_TUI=1` falls back to the plain one-task-per-line loop. `--max-turns` caps a task's model calls (default 50); `AXCODING_MAX_TOKENS` overrides the output budget (default 8192). The RLM playbook lives at ~/.axcoding/playbook.json across runs.
 
+`axcoding-rlm` (no flags) also runs one task per stdin line - each line is a
+full RLM run (map/slice/sub-call/submit + reflection), playbook shared across
+runs. `--context-file big.txt` gives it the long context that makes RLM
+meaningful; both binaries appear as task CLIs in termic (axcoding,
+axcoding-rlm).
+
 ## Run
 
 ```sh
-cargo test                                   # 26 tests, no network
+cargo test                                   # 46 tests, no network
 cargo run --bin axcoding-rlm -- --fake                # full loop against a scripted model
 cargo run --bin axcoding-rlm -- --provider anthropic --context-file big.txt --task "..." --data .axcoding-data
 cargo run --bin axcoding-agent -- --provider anthropic "list the rust files here and count their lines"
 ```
 
-Real runs need `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` with
-`--provider openai`). Run `rlm --provider ...` twice against the same
-`--data` dir to see the playbook survive and shape the second run.
+Real runs resolve auth through the chain above (the auth file works
+after `auth import`). Run `axcoding-rlm --task "..."` twice against the
+same `--data` dir to see the playbook survive and shape the second run.
 
 ## What axcoding-agent shows (pi's ideas, concretely)
 

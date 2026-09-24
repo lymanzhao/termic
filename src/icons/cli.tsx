@@ -163,6 +163,7 @@ export function CliIcon({ cli, className }: { cli: string; className?: string })
     case "opencode": return <OpencodeIcon className={className} />;
     case "pi":       return <PiIcon className={className} />;
     case "axcoding": return <AxcodingIcon className={className} />;
+    case "axcoding-rlm": return <AxcodingIcon className={className} />;
     case "muse":     return <MuseIcon className={className} />;
     case "devin":    return <DevinIcon className={className} />;
     case "copilot": return <CopilotIcon className={className} />;
@@ -192,6 +193,7 @@ export const CLI_BRAND_COLOR: Record<string, string> = {
   opencode: "text-[var(--color-cli-opencode)]",
   pi:       "text-[var(--color-cli-pi)]",
   axcoding: "text-[var(--color-cli-axcoding)]",
+  "axcoding-rlm": "text-[var(--color-cli-axcoding)]",
   muse:     "text-[var(--color-cli-muse)]",
   devin:    "text-[var(--color-cli-devin)]",
 };
@@ -217,6 +219,7 @@ export const CLI_LABEL: Record<string, string> = {
   opencode: "opencode",
   pi:       "pi",
   axcoding: "axcoding",
+  "axcoding-rlm": "axcoding-rlm",
   muse:     "Muse Code",
   devin:    "Devin",
 };

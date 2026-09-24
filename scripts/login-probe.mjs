@@ -56,6 +56,9 @@ const AGENTS = [
   // pointing a variable it deliberately IGNORES, so if a future version
   // grows a config-dir login this row fails here first.
   { id: "axcoding", env: "AXCODING_HOME",     probe: ["--check-auth"], signedOut: /not authenticated/i },
+  // The harness CLI shares the whole auth surface - probe it too, so a
+  // config-dir login growing into ONE of the two binaries is caught.
+  { id: "axcoding-rlm", env: "AXCODING_HOME", probe: ["--check-auth"], signedOut: /not authenticated/i },
   // Same reason as copilot, plus a caveat this probe cannot see: muse reports
   // itself signed out when its metadata INDEX moves, while the credential may
   // still sit in one shared keychain item. Left here as a note rather than a

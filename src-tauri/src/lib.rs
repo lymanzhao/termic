@@ -19739,6 +19739,50 @@ fn default_agents() -> Vec<Agent> {
             kind: "agent".into(),
             post_launch_capture: None,
         },
+        Agent {
+            // axcoding-rlm: the RLM harness half of the axcoding crate, as
+            // its own task CLI. Shares EVERYTHING session-related with the
+            // axcoding entry above by construction - the same auth chain
+            // and auth file (axcoding/src/auth.rs), the same playbook dir
+            // ($AXCODING_HOME, ~/.axcoding) - so the login store, state
+            // dirs and probe rows mirror it exactly. Differences worth
+            // knowing: one task per line of stdin (same PTY interaction
+            // model, no TUI - output is the run trace), and the RLM runs
+            // are only as good as their context; pass --context-file via
+            // the agent's args in Settings for real long-context work.
+            id: "axcoding-rlm".into(),
+            display_name: "axcoding-rlm".into(),
+            command: "axcoding-rlm".into(),
+            args: vec![],
+            icon_id: "axcoding-rlm".into(),
+            color: "#0d9488".into(),
+            builtin: true,
+            disabled: false,
+            capabilities: AgentCapabilities {
+                yolo_args: vec![],
+                runtime_yolo_command: String::new(),
+                runtime_default_command: String::new(),
+                resume_args: vec![],
+                session_id_args: vec![],
+                resume_id_args: vec![],
+                resume_picker_args: vec![],
+                name_args: vec![],
+                signals: AgentSignals::default(),
+                match_output: false,
+            },
+            env: std::collections::HashMap::new(),
+            docker_env: std::collections::HashMap::new(),
+            sandbox_allowed_paths: vec![],
+            sandbox_allowed_hosts: vec![],
+            work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
+            extends: None,
+            kind: "agent".into(),
+            post_launch_capture: None,
+        },
     ]
 }
 
@@ -26234,6 +26278,16 @@ mod tests {
         assert!(ax.sandbox_allowed_paths.is_empty());
         assert_eq!(ax.command, "axcoding-agent");
         assert_eq!(ax.icon_id, "axcoding");
+
+        // The harness CLI is the same registration story with a different
+        // binary: one RLM run per stdin line, same empties, same store.
+        let rl = agents.iter().find(|a| a.id == "axcoding-rlm").expect("axcoding-rlm seeded");
+        assert!(rl.capabilities.yolo_args.is_empty());
+        assert!(rl.capabilities.resume_args.is_empty());
+        assert!(rl.capabilities.session_id_args.is_empty());
+        assert!(rl.capabilities.name_args.is_empty());
+        assert_eq!(rl.command, "axcoding-rlm");
+        assert_eq!(rl.icon_id, "axcoding-rlm");
     }
 
     // Muse Code 1.0.2, measured against a live binary via its offline

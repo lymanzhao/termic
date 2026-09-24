@@ -27,8 +27,9 @@ macOS sandbox cage. It spawns the **real** `claude`, `codex`, `agy` (Antigravity
 `copilot` and `grok` binaries (not the vendor SDKs), so inference rides on the Pro / Max plan you
 already pay for. Spin up four agents on the same branch, broadcast one prompt to
 all of them, watch a reliable work-done indicator tell you the moment each finishes.
-It also ships `axcoding`, this repo's own rig-based agent and RLM harness
-(see [axcoding/](axcoding/); `cargo install --path axcoding` to put it on PATH).
+It also ships this repo's own rig-based agent and RLM harness as two task CLIs,
+`axcoding` (coding agent) and `axcoding-rlm` (self-improving RLM harness)
+(see [axcoding/](axcoding/); `cargo install --path axcoding` to put them on PATH).
 
 ---
 
