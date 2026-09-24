@@ -12,6 +12,10 @@ use crate::{ChatMessage, Llm, StreamEvent, ToolSpec};
 /// throughout — events cross into renderers that may outlive the borrow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEvent {
+    /// The submitted task, emitted FIRST so front-ends can echo it above
+    /// the reply (the TUI input line clears on submit — without this the
+    /// question would never appear in scrollback).
+    UserTask(String),
     /// Streaming text delta for the current assistant turn.
     StreamDelta(String),
     /// Mid-loop narration: this turn produced text AND tool calls.
@@ -39,6 +43,7 @@ where
     S: FnMut(UiEvent),
 {
     transcript.push(ChatMessage::user(task));
+    sink(UiEvent::UserTask(task.to_string()));
     let mut turns = 0u32;
     loop {
         turns += 1;
@@ -152,6 +157,8 @@ mod tests {
         .await
         .unwrap();
         assert!(events.contains(&UiEvent::StreamDelta("hi ".into())));
+        // The question is echoed first, above everything else.
+        assert_eq!(events[0], UiEvent::UserTask("t".into()));
         assert!(events.iter().any(
             |e| matches!(e, UiEvent::ToolStart { name, .. } if name == "bash")
         ));

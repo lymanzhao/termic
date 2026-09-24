@@ -45,6 +45,8 @@ enum Mode {
 
 fn plain_sink(ev: UiEvent) {
     match ev {
+        // The tty already echoed the typed line; pipes stay clean.
+        UiEvent::UserTask(_) => {}
         UiEvent::StreamDelta(_) => {}
         UiEvent::AssistantText { turn, text } => {
             eprintln!("──────── assistant (turn {turn}) ────────\n{text}");
@@ -179,6 +181,8 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
             );
             tokio::pin!(drive);
             let apply = |tui: &mut Tui, ev: UiEvent| match ev {
+                // Echo the question into scrollback, above the reply.
+                UiEvent::UserTask(task) => tui.commit(&format!("> {task}")),
                 UiEvent::StreamDelta(d) => tui.push_live(&d),
                 UiEvent::AssistantText { .. } => {}
                 UiEvent::ToolStart { name, args_summary } => {
