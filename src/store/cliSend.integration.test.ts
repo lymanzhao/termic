@@ -94,6 +94,38 @@ describe("send --tab: explicit target (GH #138 part 2)", () => {
     expect(deliverMessage).not.toHaveBeenCalled();
   });
 
+  // An agent whose own loop stopped with subagents / shells still running
+  // (delegated, or partially done) takes the prompt now instead of queueing it
+  // until every one of them has finished.
+  it("delivers to an agent stalled on delegated work instead of queueing", async () => {
+    seed([
+      term(),
+      term({
+        id: "t-second", cli: "codex", is_default: false, ptyId: "pty-2",
+        workState: "working", delegatedIdle: true,
+      }),
+    ]);
+    const r = await send({ tabId: "t-second" });
+    expect(r.mode).toBe("delivered");
+    expect(deliverMessage).toHaveBeenCalledWith("pty-2", "run tests");
+  });
+
+  it("still queues on a delegated agent that has gone back to work", async () => {
+    // delegatedWork alone stays on the tab while the model works again; only
+    // the idle mark says the loop has stopped.
+    seed([
+      term(),
+      term({
+        id: "t-second", cli: "codex", is_default: false, ptyId: "pty-2",
+        workState: "working", delegatedIdle: false,
+        delegatedWork: { label: "subagent", count: 1, ids: ["a"] },
+      }),
+    ]);
+    const r = await send({ tabId: "t-second" });
+    expect(r.mode).toBe("queued");
+    expect(deliverMessage).not.toHaveBeenCalled();
+  });
+
   it("refuses a vanished tab id with the unknown_tab sentinel", async () => {
     // The server resolved from its cache; the tab closed meanwhile. The
     // store is ground truth and the error must be the coded sentinel so

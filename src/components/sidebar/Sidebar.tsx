@@ -25,7 +25,7 @@ import { useIsArchiving } from "@/store/archivingTasks";
 import { cn } from "@/lib/utils";
 import { formatTerminalTitle } from "@/lib/terminalTitle";
 import { requestCloseTab } from "@/lib/closeTab";
-import { taskRename, taskReorder, projectRename, openPath, projectReorder, taskSetYolo, projectRemove, projectUpdate, projectSetGroup, procmonOpenWindow, ptyKill } from "@/lib/ipc";
+import { taskRename, taskReorder, taskGroupJoin, taskGroupLeave, taskGroupNew, projectRename, openPath, projectReorder, taskSetYolo, projectRemove, projectUpdate, projectSetGroup, procmonOpenWindow, ptyKill } from "@/lib/ipc";
 import { copyToClipboard } from "@/lib/clipboard";
 import { copyAgentBriefing } from "@/lib/agentBriefing";
 import { groupOf, projectSections } from "@/lib/projectGroups";
@@ -34,7 +34,7 @@ import { withCreateLock } from "@/lib/createLock";
 import { confirmAndArchive } from "@/lib/archiveTask";
 import { startSpotlight, stopSpotlight } from "@/lib/spotlight";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
-import type { Tab, Task, TerminalTab } from "@/lib/types";
+import type { Tab, Task, TaskGroup, TerminalTab } from "@/lib/types";
 import { agentDisplayName } from "@/lib/agents";
 import { effectiveSandboxMode, isSandboxEnforced, isTaskCaged } from "@/lib/types";
 import { SandboxIcon, sandboxModeText, DockerSandboxIcon } from "@/components/SandboxIcon";
@@ -45,6 +45,10 @@ import { accentCss } from "@/lib/accents";
 import { TaskWorkBadge } from "@/components/TaskWorkBadge";
 import { TaskPrBadge } from "@/components/TaskPrBadge";
 import { GroupActionsMenuItems } from "./GroupActionsMenuItems";
+import { ProjectFilterBar, ProjectFilterToggle } from "./ProjectTaskFilter";
+import { filterTasks, isFilterActive, taskHasNotification } from "@/lib/taskFilter";
+import { TaskGroupBlock } from "./TaskGroupBlock";
+import { flattenSegments, groupColorCss as taskGroupColorCss, groupLabel, layoutTaskList, liveGroups, nextGroupColor } from "@/lib/taskGroups";
 import { taskNeedsAttention, taskWorkDone, taskWorking, taskDelegated } from "@/lib/taskWorkState";
 import { delegatedTitle } from "@/lib/delegatedWork";
 
@@ -122,6 +126,10 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   const setView = useApp(s => s.setView);
   const currentView = useApp(s => s.view.page);
   const tabs = useApp(s => s.tabs);
+  const agents = useApp(s => s.agents);
+  const taskFilters = useUI(s => s.taskFilters);
+  const setTaskFilterText = useUI(s => s.setTaskFilterText);
+  const toggleTaskFilterBell = useUI(s => s.toggleTaskFilterBell);
   const mountedTasks = useApp(s => s.mountedTasks);
   const loadAll = useApp(s => s.loadAll);
   const openNewProject = useUI(s => s.openNewProject);
@@ -130,6 +138,8 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   const setProjectCollapsed = useApp(s => s.setProjectCollapsed);
   const collapsedGroups = useApp(s => s.collapsedGroups);
   const setGroupCollapsed = useApp(s => s.setGroupCollapsed);
+  const collapsedTaskGroups = useApp(s => s.collapsedTaskGroups);
+  const setTaskGroupCollapsed = useApp(s => s.setTaskGroupCollapsed);
   const groupColors = useApp(s => s.groupColors);
   const setGroupColor = useApp(s => s.setGroupColor);
   const setAllTasksCollapsed = useApp(s => s.setAllTasksCollapsed);
@@ -233,6 +243,9 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   // visually "hovered" (bg + Cog visible) while the menu is open;
   // otherwise the menu trigger looks like it un-selected its parent.
   const [menuOpenProjectId, setMenuOpenProjectId] = useState<string | null>(null);
+  // Projects whose filter bar the user opened (GH #324), valued by a counter
+  // that bumps on every open so the bar's input re-takes focus.
+  const [filterInputs, setFilterInputs] = useState<Record<string, number>>({});
   // Inline name-prompt state for repo-root task creation. When the
   // user picks an agent from the project's `+` menu, we stash the choice
   // here and render a focused input row under the project — Enter creates
@@ -309,8 +322,22 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   const [dragTaskId, setDragTaskId] = useState<string | null>(null);
   const [dragTaskTy, setDragTaskTy] = useState(0);
   const taskDragArmed = useRef<
-    { id: string; projectId: string; x: number; y: number; started: boolean; grabOffsetY: number; appliedTy: number; pointerY: number } | null
+    { id: string; projectId: string; x: number; y: number; started: boolean; grabOffsetY: number; appliedTy: number; pointerY: number; origGroupId: string | null } | null
   >(null);
+  // Task GROUP the dragged row is over (src/lib/taskGroups.ts). `undefined`
+  // until the drag has hit-tested once, so a drag that never moved keeps its
+  // own group; `null` = outside every group block. The row wears this group
+  // while dragging, so the block grows and shrinks under it before the drop
+  // commits a join or a leave. Mirrored in a ref for endTaskDrag, which runs
+  // from a document listener holding a stale closure.
+  const [dragTaskGroup, setDragTaskGroupState] = useState<TaskGroup | null | undefined>(undefined);
+  const dragTaskGroupRef = useRef<TaskGroup | null | undefined>(undefined);
+  const setDragTaskGroup = (g: TaskGroup | null | undefined) => {
+    dragTaskGroupRef.current = g;
+    setDragTaskGroupState(g);
+  };
+  const groupFor = (t: Task): TaskGroup | null =>
+    t.id === dragTaskId && dragTaskGroup !== undefined ? dragTaskGroup : t.group ?? null;
   const taskDragListenersRef = useRef<{ move: (e: PointerEvent) => void; up: (e: PointerEvent) => void } | null>(null);
   // A completed drop still fires a click on the row (pointerup lands on the
   // same element), which would activate the task the user only meant to
@@ -338,9 +365,11 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
     }
     const armed = taskDragArmed.current;
     const wasStarted = armed?.started ?? false;
+    const target = dragTaskGroupRef.current;
     taskDragArmed.current = null;
     setDragTaskId(null);
     setDragTaskTy(0);
+    setDragTaskGroup(undefined);
     if (commit && wasStarted && armed) {
       taskClickSuppressed.current = true;
       // Clear on the next tick whether or not the click lands: `click` fires
@@ -352,10 +381,34 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
       // Only this project's visible rows: task_reorder numbers exactly the
       // ids it is handed, so passing the whole task list would stamp an
       // order on every other project too.
-      const finalIds = useApp.getState().tasks
-        .filter(t => t.project_id === armed.projectId && !t.archived)
-        .map(t => t.id);
-      taskReorder(finalIds).catch(() => { void useApp.getState().loadAll(); });
+      //
+      // A changed task group is applied to the store FIRST, in the same
+      // update the drag state clears in, so the row stays where it was
+      // dropped instead of snapping back to its old group for the frames
+      // until the IPC round-trip lands. The ids are then taken in DISPLAY
+      // order (groups gathered into blocks), so what is stored is what the
+      // user saw.
+      const joining = target !== undefined && (target?.id ?? null) !== armed.origGroupId;
+      let all = useApp.getState().tasks;
+      if (joining) {
+        all = all.map(t => (t.id === armed.id ? { ...t, group: target ?? undefined } : t));
+        useApp.setState({ tasks: all });
+      }
+      const projectRows = all.filter(t => t.project_id === armed.projectId && !t.archived);
+      const finalIds = flattenSegments(layoutTaskList(projectRows)).map(t => t.id);
+      const reorder = taskReorder(finalIds);
+      if (joining) {
+        // Join through a LIVE member, not the group id: that is the lead's
+        // task id, and the lead may be archived or gone entirely.
+        const via = target && all.find(t => t.group?.id === target.id && t.id !== armed.id && !t.archived)?.id;
+        // Dropped into a collapsed group: open it, or the task you just
+        // placed disappears from view the moment you let go.
+        if (target) useApp.getState().setTaskGroupCollapsed(target.id, false);
+        const write = via ? taskGroupJoin(armed.id, via) : taskGroupLeave(armed.id);
+        void Promise.allSettled([reorder, write]).then(() => useApp.getState().loadAll());
+      } else {
+        reorder.catch(() => { void useApp.getState().loadAll(); });
+      }
     }
   };
 
@@ -403,8 +456,144 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
     }
     const next = [...rest];
     next.splice(insertAt, 0, all.find(t => t.id === dragId)!);
+    hitTestTaskGroup(e.clientY, armed.projectId, dragId);
     if (next.every((t, i) => t.id === all[i].id)) return; // no visible change
     useApp.setState({ tasks: next });
+  };
+
+  // Which of this project's drawn group blocks the cursor is inside, the
+  // header included. Stable at the edges without hysteresis: inside a block
+  // the row becomes a member, which keeps the block under the cursor; past
+  // its edge the row leaves, which shrinks the block further away.
+  const hitTestTaskGroup = (clientY: number, projectId: string, dragId: string) => {
+    let hit: string | null = null;
+    for (const el of Array.from(dragRoot().querySelectorAll<HTMLElement>("[data-task-group-id]"))) {
+      if (el.dataset.taskGroupProjectId !== projectId) continue;
+      const r = el.getBoundingClientRect();
+      if (clientY >= r.top && clientY <= r.bottom) { hit = el.dataset.taskGroupId!; break; }
+    }
+    if (hit === (dragTaskGroupRef.current === undefined ? undefined : dragTaskGroupRef.current?.id ?? null)) return;
+    // The lead's copy is the canonical one (layoutTaskList's rule); any
+    // other member's is identical unless a write is mid-flight.
+    const all = useApp.getState().tasks;
+    const g = hit === null
+      ? null
+      : (all.find(t => t.id === hit && t.group?.id === hit) ?? all.find(t => t.id !== dragId && t.group?.id === hit))?.group ?? null;
+    setDragTaskGroup(g);
+  };
+
+  // ── Task GROUP block drag-to-reorder ──────────────────────────────────
+  // The task-level twin of the project folder drag below: grab a group's
+  // caption and the whole block moves through its project's rows as one
+  // contiguous run. Top-level boundaries only (loose rows and OTHER blocks),
+  // since a block never nests; like a task, it never leaves its project.
+  const [dragBlockId, setDragBlockId] = useState<string | null>(null);
+  const [dragBlockTy, setDragBlockTy] = useState(0);
+  const blockDragArmed = useRef<
+    { groupId: string; projectId: string; x: number; y: number; started: boolean; grabOffsetY: number; appliedTy: number; pointerY: number } | null
+  >(null);
+  const blockDragListenersRef = useRef<{ move: (e: PointerEvent) => void; up: (e: PointerEvent) => void } | null>(null);
+  const blockClickSuppressed = useRef(false);
+  const blockSel = (a: { groupId: string; projectId: string }) =>
+    `[data-task-group-id="${CSS.escape(a.groupId)}"][data-task-group-project-id="${CSS.escape(a.projectId)}"]`;
+
+  const computeBlockTy = (clientY: number): number => {
+    const armed = blockDragArmed.current;
+    const el = armed && dragRoot().querySelector<HTMLElement>(blockSel(armed));
+    if (!armed || !el) return 0;
+    const layoutTop = el.getBoundingClientRect().top - armed.appliedTy;
+    const ty = (clientY - armed.grabOffsetY) - layoutTop;
+    armed.appliedTy = ty;
+    return ty;
+  };
+
+  const endBlockDrag = (commit: boolean) => {
+    const ls = blockDragListenersRef.current;
+    if (ls) {
+      document.removeEventListener("pointermove", ls.move);
+      document.removeEventListener("pointerup", ls.up);
+      document.removeEventListener("pointercancel", ls.up);
+      blockDragListenersRef.current = null;
+    }
+    const armed = blockDragArmed.current;
+    blockDragArmed.current = null;
+    setDragBlockId(null);
+    setDragBlockTy(0);
+    if (commit && armed?.started) {
+      // The drop's trailing click lands on the caption, which toggles now:
+      // swallow it, and clear on the next tick for the drops whose click
+      // never arrives (same pattern as the task row drag).
+      blockClickSuppressed.current = true;
+      setTimeout(() => { blockClickSuppressed.current = false; }, 0);
+      // Display order, as the task drop does: what is stored is what was seen.
+      const projectRows = useApp.getState().tasks.filter(t => t.project_id === armed.projectId && !t.archived);
+      taskReorder(flattenSegments(layoutTaskList(projectRows)).map(t => t.id))
+        .catch(() => { void useApp.getState().loadAll(); });
+    }
+  };
+
+  const onBlockDragPointerMove = (e: PointerEvent) => {
+    const armed = blockDragArmed.current;
+    if (!armed) return;
+    if (!armed.started) {
+      const dx = e.clientX - armed.x;
+      const dy = e.clientY - armed.y;
+      if (dx * dx + dy * dy < 16) return;
+      armed.started = true;
+      setDragBlockId(armed.groupId);
+    }
+    armed.pointerY = e.clientY;
+    setDragBlockTy(computeBlockTy(e.clientY));
+    const { groupId, projectId } = armed;
+    const all = useApp.getState().tasks;
+    const inBlock = (t: Task) => t.project_id === projectId && !t.archived && t.group?.id === groupId;
+    const members = all.filter(inBlock);
+    if (members.length === 0) return;
+    const rest = all.filter(t => !inBlock(t));
+    // Loose rows and other blocks of THIS project, in document order; the
+    // first midpoint below the cursor is the slot.
+    const boundaries = Array.from(
+      dragRoot().querySelectorAll<HTMLElement>("[data-sidebar-task-id], [data-task-group-id]"),
+    ).filter(el => el.dataset.taskGroupId !== undefined
+      ? el.dataset.taskGroupProjectId === projectId && el.dataset.taskGroupId !== groupId
+      : el.dataset.sidebarTaskProjectId === projectId && !el.closest("[data-task-group-id]"));
+    let beforeId: string | null = null;
+    for (const el of boundaries) {
+      const r = el.getBoundingClientRect();
+      if (e.clientY < (r.top + r.bottom) / 2) {
+        beforeId = el.dataset.taskGroupId !== undefined
+          ? rest.find(t => t.project_id === projectId && !t.archived && t.group?.id === el.dataset.taskGroupId)?.id ?? null
+          : el.dataset.sidebarTaskId!;
+        break;
+      }
+    }
+    let insertAt = beforeId ? rest.findIndex(t => t.id === beforeId) : -1;
+    if (insertAt === -1) {
+      // Past the last slot: just after this project's last visible row.
+      let last = -1;
+      rest.forEach((t, i) => { if (t.project_id === projectId && !t.archived) last = i; });
+      insertAt = last + 1;
+    }
+    const next = [...rest.slice(0, insertAt), ...members, ...rest.slice(insertAt)];
+    if (next.every((t, i) => t === all[i])) return;
+    useApp.setState({ tasks: next });
+  };
+
+  const onBlockDragPointerDown = (e: React.PointerEvent, groupId: string, projectId: string) => {
+    if (compact || e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('button, input, a, [data-no-drag], [role="menu"], [role="dialog"]')) return;
+    const el = e.currentTarget.closest<HTMLElement>("[data-task-group-id]");
+    blockDragArmed.current = {
+      groupId, projectId, x: e.clientX, y: e.clientY, started: false,
+      grabOffsetY: e.clientY - (el ?? (e.currentTarget as HTMLElement)).getBoundingClientRect().top,
+      appliedTy: 0, pointerY: e.clientY,
+    };
+    const onUp = () => endBlockDrag(true);
+    blockDragListenersRef.current = { move: onBlockDragPointerMove, up: onUp };
+    document.addEventListener("pointermove", onBlockDragPointerMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
   };
 
   const onTaskDragPointerDown = (e: React.PointerEvent, w: Task) => {
@@ -418,7 +607,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
     taskDragArmed.current = {
       id: w.id, projectId: w.project_id, x: e.clientX, y: e.clientY, started: false,
       grabOffsetY: e.clientY - (e.currentTarget as HTMLElement).getBoundingClientRect().top,
-      appliedTy: 0, pointerY: e.clientY,
+      appliedTy: 0, pointerY: e.clientY, origGroupId: w.group?.id ?? null,
     };
     const onUp = () => endTaskDrag(true);
     taskDragListenersRef.current = { move: onTaskDragPointerMove, up: onUp };
@@ -775,6 +964,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
     if (dragArmed.current?.started) setDragTy(computeProjectTy(dragArmed.current.pointerY));
     if (groupDragArmed.current?.started) setDragGroupTy(computeGroupTy(groupDragArmed.current.pointerY));
     if (taskDragArmed.current?.started) setDragTaskTy(computeTaskTy(taskDragArmed.current.pointerY));
+    if (blockDragArmed.current?.started) setDragBlockTy(computeBlockTy(blockDragArmed.current.pointerY));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projects, tasks]);
 
@@ -1027,6 +1217,27 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
             // expanded row). User overrides stick: explicit true / false
             // wins; undefined falls back to emptiness-based default.
             const explicit = collapsedProjects[p.id];
+            // Task filter (GH #324). Turning one on expands the project once
+            // (ProjectFilterBar's onActivate): results behind a chevron read
+            // as "nothing matched". Once, not for as long as it is on, or the
+            // chevron would stop working while a filter is up.
+            const filter = taskFilters[p.id];
+            const filterOn = !compact && isFilterActive(filter);
+            const visibleTasks = filterOn ? filterTasks(taskList, filter, tabs, agents, activeTask) : taskList;
+            // "No matching tasks" only when the filter left the list EMPTY. The
+            // active task is kept on screen even when it does not match, and a
+            // hint saying nothing matched under a visible row contradicts it.
+            const noMatches = filterOn && taskList.length > 0 && visibleTasks.length === 0;
+            const notifCount = compact ? 0 : taskList.filter(w => taskHasNotification(tabs[w.id])).length;
+            // An active filter keeps its bar on screen on its own; otherwise
+            // the bar is open only while the user put it there.
+            const filterBarOpen = !compact && (filterOn || filterInputs[p.id] !== undefined);
+            const closeFilterBar = () => setFilterInputs(prev => {
+              if (prev[p.id] === undefined) return prev;
+              const next = { ...prev };
+              delete next[p.id];
+              return next;
+            });
             // Render-only fold while THIS project is being dragged: the
             // translateY rides on the header alone, so expanded task rows
             // would sit frozen in place while their header floats away.
@@ -1187,14 +1398,29 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                             so the row stays clean; New-task stays
                             visible because it's the headline action. */}
                         <div className="flex items-center gap-0.5">
+                          {/* Filter controls (GH #324), left of the cog. An
+                              active filter pins the whole bar so the user
+                              can see why rows are missing. */}
+                          <ProjectFilterToggle
+                            projectId={p.id}
+                            active={filterOn}
+                            revealed={menuOpenProjectId === p.id || filterBarOpen}
+                            // Open (or re-focus) the bar; an open bar with
+                            // nothing filtering closes instead.
+                            onToggle={() => {
+                              if (filterBarOpen && !filterOn) closeFilterBar();
+                              else setFilterInputs(prev => ({ ...prev, [p.id]: (prev[p.id] ?? 0) + 1 }));
+                            }}
+                          />
                           <Tip content={t("projectSettingsTip")}>
                             <button
                               className={cn(
                                 "rounded p-1 text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-3)] hover:text-[var(--color-fg)] transition-opacity",
                                 // Stay visible while the `+` dropdown is
                                 // open (otherwise the gear vanishes the
-                                // moment the user opens the menu).
-                                menuOpenProjectId === p.id
+                                // moment the user opens the menu), and
+                                // while the filter bar is open.
+                                menuOpenProjectId === p.id || filterBarOpen
                                   ? "opacity-100"
                                   : "opacity-0 group-hover:opacity-100",
                               )}
@@ -1385,6 +1611,18 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                   </ContextMenuItem>
                 </ContextMenuContent>
                 </ContextMenuRoot>
+                {/* The filter bar's own line (GH #324), under the header and
+                    above the rows it filters. Shown collapsed or not: the
+                    first filter to go on expands the project. */}
+                {filterBarOpen && (
+                  <ProjectFilterBar
+                    projectId={p.id}
+                    notifCount={notifCount}
+                    focusKey={filterInputs[p.id] ?? 0}
+                    onClose={closeFilterBar}
+                    onActivate={() => { if (collapsed) setProjectCollapsed(p.id, false); }}
+                  />
+                )}
 
                 {/* Empty expanded project — single placeholder CTA that
                     opens the SAME dropdown as the row's `+` icon (one
@@ -1438,17 +1676,82 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                     dragged still reads oldest-first, and new tasks append at
                     the bottom), and a live drag splices the same array — an
                     extra sort here would fight the drag. */}
-                {!collapsed && taskList.map(w => (
-                  <TaskRowSlot
-                    key={w.id}
-                    w={w}
-                    compact={compact}
-                    dragging={dragTaskId === w.id}
-                    dragTy={dragTaskTy}
-                    onDragPointerDown={onTaskDragPointerDown}
-                    clickSuppressed={taskClickSuppressed}
-                  />
-                ))}
+                {!collapsed && layoutTaskList(visibleTasks, groupFor).map(seg => {
+                  const row = (w: Task) => (
+                    <TaskRowSlot
+                      key={w.id}
+                      w={w}
+                      compact={compact}
+                      dragging={dragTaskId === w.id}
+                      dragTy={dragTaskTy}
+                      onDragPointerDown={onTaskDragPointerDown}
+                      clickSuppressed={taskClickSuppressed}
+                    />
+                  );
+                  // Task groups (src/lib/taskGroups.ts): a drawn group is one
+                  // contiguous block at its first member's position.
+                  if (seg.kind === "task") return row(seg.task);
+                  // Collapse is ignored on the icon rail, which has no caption
+                  // to expand it from. A collapsed group still shows the row
+                  // of the task you are on, whatever route got you there.
+                  // A filter shows its matches even inside a collapsed group:
+                  // otherwise searching for a task that sits in one would
+                  // leave the match hidden behind the caption. (The layout
+                  // already runs over the FILTERED rows, so a group with no
+                  // matches is not drawn at all.)
+                  //
+                  // Two facts, kept apart: `groupCollapsed` is the STORED state,
+                  // which the chevron always shows and toggles; `rowsHidden` is
+                  // whether this render hides members. Folding the filter into
+                  // the first made the chevron point "expanded" while filtering,
+                  // so a click collapsed the group invisibly and it snapped shut
+                  // the moment the filter cleared, looking like lost tasks.
+                  const groupCollapsed = !compact && !!collapsedTaskGroups[seg.group.id];
+                  const rowsHidden = groupCollapsed && !filterOn;
+                  // (And the row being dragged: it must not vanish from under
+                  // the cursor while it hovers a collapsed group.)
+                  const shown = rowsHidden
+                    ? seg.tasks.filter(t => t.id === activeTask || t.id === dragTaskId)
+                    : seg.tasks;
+                  return (
+                    <TaskGroupBlock
+                      key={`group:${seg.group.id}`}
+                      group={seg.group}
+                      projectId={p.id}
+                      label={groupLabel(seg.group, tasks)}
+                      compact={compact}
+                      count={seg.tasks.length}
+                      memberIds={seg.tasks.map(t => t.id)}
+                      collapsed={groupCollapsed}
+                      summarized={rowsHidden}
+                      onToggleCollapsed={() => {
+                        if (blockClickSuppressed.current) { blockClickSuppressed.current = false; return; }
+                        setTaskGroupCollapsed(seg.group.id, !useApp.getState().collapsedTaskGroups[seg.group.id]);
+                      }}
+                      dragging={dragBlockId === seg.group.id && blockDragArmed.current?.projectId === p.id}
+                      dragTy={dragBlockTy}
+                      onDragPointerDown={onBlockDragPointerDown}
+                    >
+                      {shown.map(row)}
+                    </TaskGroupBlock>
+                  );
+                })}
+                {!collapsed && noMatches && (
+                  <div
+                    data-testid={`project-filter-empty-${p.id}`}
+                    className="ml-3 mr-1 mb-px flex h-[var(--task-row-h)] items-center justify-center gap-1.5 px-2 text-[13px] text-[var(--color-fg-faint)]"
+                  >
+                    <span className="truncate">No matching tasks</span>
+                    <button
+                      className="shrink-0 rounded px-1 text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+                      onClick={() => {
+                        setTaskFilterText(p.id, "");
+                        if (filter?.bell) toggleTaskFilterBell(p.id);
+                        closeFilterBar();
+                      }}
+                    >Clear filter</button>
+                  </div>
+                )}
                 {/* Tasks mid-creation (GH #242) — a real Task doesn't exist
                     yet, so these come from pendingTaskList, not taskList.
                     Rendered after the real rows, compact mode excluded (same
@@ -2646,6 +2949,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                   if (!!w.yolo && !isSandboxEnforced(wMode)) {
                     return (
                       <Zap
+                        data-testid="task-yolo-badge"
                         className={cn(
                           "absolute h-3.5 w-3.5 text-[var(--color-err)] transition-opacity group-hover/wsrow:opacity-0",
                           isLaunched ? "opacity-100" : "opacity-40",
@@ -2853,6 +3157,84 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                 <Waypoints className="h-4 w-4" />
                 <span>{t("copyBriefing")}</span>
               </DropdownItem>
+              {/* Move to group: the project row's menu, for tasks. The group
+                  list is READ while the menu is open rather than subscribed:
+                  a subscription here would re-render every row on every task
+                  change, for a menu nobody has open. */}
+              {menuOpen && (() => {
+                const all = useApp.getState().tasks;
+                const groups = liveGroups(all.filter(t => t.project_id === w.project_id));
+                const run = (p: Promise<void>) => { void p.finally(() => loadAll()); };
+                return (
+                  <DropdownSub>
+                    <DropdownSubTrigger className="justify-between" data-testid={`task-move-to-group-${w.id}`}>
+                      <span className="flex items-center gap-2">
+                        <Folder className="h-4 w-4" />
+                        <span>Move to group</span>
+                      </span>
+                      <ChevronRight className="h-3.5 w-3.5 text-[var(--color-fg-faint)]" />
+                    </DropdownSubTrigger>
+                    <DropdownSubContent className="max-h-80 overflow-y-auto">
+                      {groups.map(g => {
+                        // Join through a live member, not the group id: that is
+                        // the lead's task id, and the lead may be archived.
+                        const via = all.find(t => !t.archived && t.id !== w.id && t.group?.id === g.id)?.id;
+                        const current = w.group?.id === g.id;
+                        return (
+                          <DropdownItem
+                            key={g.id}
+                            className="items-center [&>svg]:mt-0"
+                            data-testid={`task-move-to-group-${w.id}-${g.id}`}
+                            onSelect={() => {
+                              if (current || !via) return;
+                              // Open it so the moved task stays in view.
+                              useApp.getState().setTaskGroupCollapsed(g.id, false);
+                              run(taskGroupJoin(w.id, via));
+                            }}
+                          >
+                            {current
+                              ? <Check className="h-3.5 w-3.5 text-[var(--color-accent)]" />
+                              : <span className="block h-2.5 w-2.5 shrink-0 rounded-full mx-0.5" style={{ backgroundColor: taskGroupColorCss(g) }} />}
+                            <span className="truncate">{groupLabel(g, all)}</span>
+                          </DropdownItem>
+                        );
+                      })}
+                      {groups.length > 0 && <DropdownSeparator />}
+                      <DropdownItem
+                        className="items-center [&>svg]:mt-0"
+                        data-testid={`task-new-group-${w.id}`}
+                        onSelect={() => {
+                          void taskGroupNew(w.id, nextGroupColor(all))
+                            .then(() => loadAll())
+                            .then(() => {
+                              // Offer the real name straight away, like a new
+                              // project folder. The id is read back because a
+                              // task already leading a group gets a fresh one.
+                              // The draft starts as the label the group shows:
+                              // the task's name either way (followed or stored).
+                              const gid = useApp.getState().tasks.find(t => t.id === w.id)?.group?.id;
+                              if (gid && !compact) useUI.setState({ groupRenaming: { groupId: gid, value: w.name } });
+                            })
+                            .catch(() => loadAll());
+                        }}
+                      >
+                        <FolderPlus className="h-4 w-4" />
+                        <span>New group</span>
+                      </DropdownItem>
+                      {w.group && (
+                        <DropdownItem
+                          className="items-center [&>svg]:mt-0"
+                          data-testid={`task-leave-group-${w.id}`}
+                          onSelect={() => run(taskGroupLeave(w.id))}
+                        >
+                          <FolderMinus className="h-4 w-4" />
+                          <span>Remove from group</span>
+                        </DropdownItem>
+                      )}
+                    </DropdownSubContent>
+                  </DropdownSub>
+                );
+              })()}
               {/* Duplicate: only for worktree tasks (the repo-root
                   entry IS the project's checkout, can't be branched
                   off cleanly). Pre-fills the New worktree dialog with

@@ -91,6 +91,17 @@ export function computeTabState(t: TerminalTab, agents: AppState["agents"]): Tab
 
 type AppState = ReturnType<typeof useApp.getState>;
 
+/** One state for a task's terminal tabs: working wins, then a tab blocked
+ *  on the user (attention), then a finished turn (done), else idle. Shared
+ *  with the sidebar's notification filter (lib/taskFilter.ts) so the
+ *  per-project bell count always adds up to the tray's numeral. */
+export function aggregateTabsState(term: TerminalTab[]): "working" | "waiting" | "done" | "idle" {
+  if (term.some(t => t.workState === "working")) return "working";
+  if (term.some(t => t.unread?.reason === "attention")) return "waiting";
+  if (term.some(t => t.workState === "done")) return "done";
+  return "idle";
+}
+
 /** Aggregate one state per LIVE task, matching the sidebar's own signal
  *  (lib/waitingAgents.ts): working wins, then a tab blocked on the user
  *  (attention), then a finished turn (done), else idle. A task with no
@@ -120,10 +131,7 @@ export function computeAgentStates(s: AppState = useApp.getState()): Record<stri
       };
       continue;
     }
-    let state = "idle";
-    if (term.some(t => t.workState === "working")) state = "working";
-    else if (term.some(t => t.unread?.reason === "attention")) state = "waiting";
-    else if (term.some(t => t.workState === "done")) state = "done";
+    const state = aggregateTabsState(term);
     const queued = term.reduce((n, t) => n + (t.queue?.length ?? 0), 0);
     const capable = term.some(t => workDoneCapable(t.cli, s.agents));
     const tab_states = term.filter(t => !t.paneId).map(t => computeTabState(t, s.agents));

@@ -8,7 +8,7 @@
 // quick-create note, and the task the quick path actually creates all come
 // through here.
 
-import type { Project, SandboxSelection } from "@/lib/types";
+import { isTaskCaged, selectionToFields, type Project, type SandboxSelection } from "@/lib/types";
 
 /** The project's default engine in the picker's own vocabulary. */
 export function projectSandboxDefault(p: Project | null | undefined): SandboxSelection {
@@ -18,6 +18,29 @@ export function projectSandboxDefault(p: Project | null | undefined): SandboxSel
   // "on", which has always meant Enforce.
   return (p.default_sandbox_mode as SandboxSelection | undefined)
     ?? (p.default_sandbox ? "enforce" : "off");
+}
+
+/** Whether a new task of this project starts with YOLO on, before anyone
+ *  ticks or unticks it: the project's own answer, else the app-wide one
+ *  (Settings → Sandbox). `null` and `undefined` both mean "this project has
+ *  no opinion", so `??` is right here. `false` is a real answer: a project
+ *  that keeps asking on a machine that is otherwise YOLO by default. */
+export function projectYoloDefault(p: Project | null | undefined, appDefault: boolean): boolean {
+  return p?.default_yolo ?? appDefault;
+}
+
+/** The `yolo` a create should SEND for a ticked-or-not YOLO choice. Off
+ *  whenever the flag is moot or meaningless:
+ *  - the task is caged (Enforcing, Enforcing (FS), Docker): spawn turns YOLO
+ *    on anyway (`isTaskCaged`), and a stored `true` would light the red ⚡
+ *    the moment someone switched the sandbox off later;
+ *  - the task's default tab is not an agent (a shell, a custom command, a
+ *    terminal entry), which never receives `yolo_args`.
+ *  Monitoring is NOT a cage, so YOLO there is the real, red, thing. */
+export function yoloForCreate(checked: boolean, selection: SandboxSelection, isAgent: boolean): boolean {
+  if (!checked || !isAgent) return false;
+  const { mode, docker } = selectionToFields(selection);
+  return !isTaskCaged({ sandbox_mode: mode, docker_sandbox_enabled: docker });
 }
 
 /** Union two lists preserving order, first occurrence wins. The same merge

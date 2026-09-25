@@ -21,6 +21,29 @@ const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: "ignore" });
 const shOut = (cmd, cwd) =>
   execSync(cmd, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString();
 
+/** Delete every branch but `main` in `repo`, batched (a thousand `git`
+ *  spawns would add seconds to every run). `branch -D` removes what it can
+ *  and refuses, without stopping, a branch checked out in a worktree. */
+function deleteBranchesExceptMain(repo) {
+  let names = [];
+  try {
+    names = shOut("git for-each-ref '--format=%(refname:short)' refs/heads", repo)
+      .split("\n").map(s => s.trim()).filter(b => b && b !== "main");
+  } catch {
+    return;
+  }
+  for (let i = 0; i < names.length; i += 200) {
+    const batch = names.slice(i, i + 200).map(b => JSON.stringify(b)).join(" ");
+    try { sh(`git branch -D ${batch}`, repo); } catch { /* checked-out ones stay */ }
+  }
+}
+
+function pruneBranches(fixture, originGit) {
+  deleteBranchesExceptMain(fixture);
+  if (existsSync(originGit)) deleteBranchesExceptMain(originGit);
+  try { sh("git fetch -q --prune origin", fixture); } catch { /* no origin yet */ }
+}
+
 /**
  * @param {object} [o]
  * @param {string} [o.dataDir]  TERMIC_DATA_DIR (profile) to write.
@@ -152,6 +175,17 @@ export function seed(o = {}) {
   } catch {
     /* ignore */
   }
+  // 2b. Branches every earlier run left behind. Archiving a worktree task
+  // keeps its branch (by design, the branch may be pushed), so each local
+  // `make e2e` adds a few dozen and nothing ever removes them. They are not
+  // harmless: the New Task "check out an existing branch" picker lists at
+  // most BRANCH_CHOICES_MAX (100), and past ~1000 leftovers the branch that
+  // spec pushes for itself was cut from the list. CI never sees this (fresh
+  // checkout per run); a developer's machine does. Everything but `main` goes,
+  // in the fixture and in its bare origin, then the remote-tracking refs
+  // follow. `branch -D` skips (and reports) any branch a worktree has checked
+  // out, so `sbcheck` and a live worktree survive; the errors are ignored.
+  pruneBranches(fixture, originGit);
   let worktrees = "";
   try {
     worktrees = shOut("git worktree list", fixture);
@@ -197,6 +231,14 @@ export function seed(o = {}) {
   // somebody deleted the file by hand.
   rmSync(path.join(dataDir, "profiles.json"), { force: true });
   rmSync(path.join(dataDir, "profiles"), { recursive: true, force: true });
+  // The e2e build's saved window frames (lib.rs window_state_filename). They
+  // live in the bundle's Application Support folder, not the data dir, and a
+  // frame one run left behind (a tiny profile window, a main window on a
+  // monitor since unplugged) resizes every later run. Every run starts from
+  // the app's default size instead.
+  if (process.platform === "darwin") {
+    rmSync(path.join(os.homedir(), "Library", "Application Support", "com.simion.termic", ".window-state-e2e.json"), { force: true });
+  }
   // Every worktree under `tasksPath` belongs to a previous run: task records
   // are recreated by the specs themselves, so anything still on disk here is
   // debris from a run that was interrupted before its `after` hook. Drop it,

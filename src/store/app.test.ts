@@ -455,6 +455,48 @@ describe("closeTab", () => {
 // ── openPreviewTab ────────────────────────────────────────────────────
 
 describe("openPreviewTab", () => {
+  // `permanent` is the terminal's cmd+click open: the user asked for THAT
+  // file, so it must not land in (or evict) the recyclable preview slot.
+  it("permanent: opens a regular tab and leaves the preview slot alone", () => {
+    const taskId = "ws1";
+    const previewTab: Tab = { id: "prev-1", type: "edit", title: "old.ts", path: "/x/old.ts", preview: true } as any;
+    useApp.setState({ tabs: { [taskId]: [previewTab] }, activeTab: { [taskId]: "prev-1" } });
+
+    useApp.getState().openPreviewTab(taskId, { type: "edit", path: "/x/new.ts", title: "new.ts", permanent: true });
+
+    const tabs = useApp.getState().tabs[taskId];
+    expect(tabs).toHaveLength(2);
+    expect(tabs.find(t => t.id === "prev-1")).toMatchObject({ path: "/x/old.ts", preview: true });
+    const opened = tabs.find(t => (t as any).path === "/x/new.ts")!;
+    expect(opened.preview).toBe(false);
+    expect(useApp.getState().activeTab[taskId]).toBe(opened.id);
+    // And the NEXT ordinary open recycles the old preview, not the pinned tab.
+    useApp.getState().openPreviewTab(taskId, { type: "edit", path: "/x/third.ts", title: "third.ts" });
+    expect(useApp.getState().tabs[taskId].find(t => t.id === opened.id)).toMatchObject({ path: "/x/new.ts", preview: false });
+  });
+
+  it("permanent: pins the file in place when it is already the preview", () => {
+    const taskId = "ws1";
+    const previewTab: Tab = { id: "prev-1", type: "edit", title: "foo.ts", path: "/x/foo.ts", preview: true } as any;
+    useApp.setState({ tabs: { [taskId]: [previewTab] }, activeTab: { [taskId]: "prev-1" } });
+
+    useApp.getState().openPreviewTab(taskId, { type: "edit", path: "/x/foo.ts", title: "foo.ts", permanent: true, revealAt: { line: 3 } });
+
+    const tabs = useApp.getState().tabs[taskId];
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0]).toMatchObject({ id: "prev-1", preview: false, revealAt: { line: 3 } });
+  });
+
+  it("without permanent, behaviour is unchanged: the preview slot is recycled", () => {
+    const taskId = "ws1";
+    const previewTab: Tab = { id: "prev-1", type: "edit", title: "old.ts", path: "/x/old.ts", preview: true } as any;
+    useApp.setState({ tabs: { [taskId]: [previewTab] }, activeTab: { [taskId]: "prev-1" } });
+    useApp.getState().openPreviewTab(taskId, { type: "edit", path: "/x/new.ts", title: "new.ts" });
+    const tabs = useApp.getState().tabs[taskId];
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0]).toMatchObject({ id: "prev-1", path: "/x/new.ts", preview: true });
+  });
+
   it("creates a new preview tab when none exists", () => {
     const taskId = "ws1";
     useApp.setState({ tabs: { [taskId]: [] } });
@@ -1610,5 +1652,40 @@ describe("previewPlace", () => {
     useApp.getState().setActiveTask("A");
     unsub();
     expect(real).toBeGreaterThan(1);
+  });
+});
+
+
+// ── task group collapse ───────────────────────────────────────────────
+
+describe("task group collapse", () => {
+  const G = { id: "lead" };
+  const tasks = [
+    { id: "lead", project_id: "p1", name: "lead", archived: false, group: G },
+    { id: "w1", project_id: "p1", name: "w1", archived: false, group: G },
+    { id: "loose", project_id: "p1", name: "loose", archived: false },
+    { id: "o1", project_id: "p1", name: "o1", archived: false, group: { id: "other" } },
+  ] as never;
+
+  it("navigating to a task opens the group it sits in, and only that one", () => {
+    useApp.setState({ tasks, activeTaskId: null, collapsedTaskGroups: { lead: true, other: true } });
+    useApp.getState().setActiveTask("w1");
+    expect(useApp.getState().collapsedTaskGroups).toEqual({ lead: false, other: true });
+  });
+
+  it("leaves the map alone for a task in no group", () => {
+    const before = { lead: true };
+    useApp.setState({ tasks, activeTaskId: null, collapsedTaskGroups: before });
+    useApp.getState().setActiveTask("loose");
+    expect(useApp.getState().collapsedTaskGroups).toBe(before);
+  });
+
+  it("an unchanged collapse write does not touch the store", () => {
+    useApp.setState({ collapsedTaskGroups: { lead: true } });
+    const before = useApp.getState();
+    useApp.getState().setTaskGroupCollapsed("lead", true);
+    expect(useApp.getState()).toBe(before);
+    useApp.getState().setTaskGroupCollapsed("lead", false);
+    expect(useApp.getState().collapsedTaskGroups.lead).toBe(false);
   });
 });

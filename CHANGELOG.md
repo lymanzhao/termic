@@ -4,6 +4,63 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.8.1] - 2026-09-24
+
+Tasks your agents start now group together in the sidebar.
+
+### Features
+- **Task groups.** When an agent starts tasks of its own, from the `termic`
+  CLI or over MCP, they appear under its task as one coloured group, named
+  after it. A worker that starts tasks in turn adds them to the same group.
+  Click a group to collapse it: the caption keeps its task count and one of
+  each mark its tasks carry, so a finished agent and one that needs you both
+  stay visible. Rename or recolour a group from its menu, drag tasks in and
+  out, drag the whole group, or start one by hand with Move to group > New
+  group. Opening a task in a collapsed group expands it.
+- **Agents can name their group.** `termic group --name "Auth refactor"`
+  (or the MCP `task_group` tool) names and colours the group an agent's
+  tasks form, so the sidebar says what the batch of work is.
+- **The MCP server matches the CLI.** Every `termic` option is now a tool
+  argument too (sandbox, YOLO, model, agent arguments, adopting a worktree,
+  resuming a session, prompt-library prompts), and scratchpads are
+  available over MCP. A client set up by Termic tells the server which task
+  it runs in, so an agent's own task is the default, as on the CLI. Re-run
+  the MCP setup in Settings to pick this up.
+- **Agents know they are inside Termic.** The CLI's help and the MCP
+  server now open by telling an agent it runs in a Termic task and what it
+  can do from there, messages between agents are signed with the sender's
+  agent, task name and id, and results come back as a report rather than a
+  file by default.
+- **Filter a project's tasks** by text or by notifications. Thanks to
+  [@GabrielDumbrava](https://github.com/GabrielDumbrava).
+  ([#324](https://github.com/simion/termic/issues/324))
+- **Check out an existing branch into a new worktree task**, including one
+  that only exists on the remote. Thanks to
+  [@nvkvin](https://github.com/nvkvin).
+- **Start new tasks in YOLO by default**, for this machine or per project.
+  Thanks to [@nvkvin](https://github.com/nvkvin).
+- **A scratchpad an agent writes while you are elsewhere is marked** with a
+  ring on its tab until you look at it.
+
+### Improvements
+- Cmd+clicking a file path in a terminal opens it in a regular tab, not the
+  preview tab the next file you open replaces.
+- A PR your agent opens from its own terminal now shows in the sidebar as
+  soon as you open the task, rather than only after opening its Git tab.
+- A `.termic.yaml` Termic writes starts with a comment explaining what it is.
+
+### Bug fixes
+- With a second profile's window open, a task created from the CLI or MCP
+  could be reported as failed although it was created, and every other CLI
+  or MCP command ran in both windows.
+- When resuming a main-checkout task fell back to the session picker, one
+  Enter could pick a sibling task's conversation and swap the two tasks'
+  sessions. ([#311](https://github.com/simion/termic/issues/311))
+- A report from another agent (`termic send`, MCP `task_send`) waited in
+  the receiving agent's queue while that agent was only waiting on
+  subagents or shells it had started, so an orchestrator did not hear from
+  its workers until all of its work was done. It is now delivered at once.
+
 ## [1.7.0] - 2026-09-22
 
 Agents now report the work they hand off, and every status mark says what it means.

@@ -663,6 +663,18 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
                 </span>
               )}
             </span>
+          ) : tab.type === "scratch" && tab.unseen ? (
+            // Written by an agent since you last looked. A pad is dirty for
+            // its whole life, so the grey dot says nothing; this ring (the
+            // partial-done shape, in the done colour) replaces it until the
+            // tab is shown.
+            <span
+              data-testid="pad-unseen"
+              title="Updated since you last looked"
+              aria-label="Updated since you last looked"
+              className="absolute block h-2 w-2 rounded-full border-[1.5px] transition-opacity group-hover:opacity-0"
+              style={{ borderColor: "var(--color-info)" }}
+            />
           ) : tab.dirty && (
             <span
               aria-hidden

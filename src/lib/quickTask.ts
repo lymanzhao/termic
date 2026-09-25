@@ -8,8 +8,9 @@
 // last choice.
 
 import { taskCreate, taskOpenRepo, taskImportWorktree, settingsLoad } from "@/lib/ipc";
-import { projectSandboxDefault, mergeLists } from "@/lib/projectSandboxDefault";
+import { projectSandboxDefault, projectYoloDefault, yoloForCreate, mergeLists } from "@/lib/projectSandboxDefault";
 import { selectionToFields } from "@/lib/types";
+import { isTerminalCli } from "@/lib/agents";
 import { useApp } from "@/store/app";
 import { launchSetupTab } from "@/lib/runTabs";
 import { withCreateLock } from "@/lib/createLock";
@@ -106,6 +107,28 @@ async function quickSandboxArgs(projectId: string) {
   };
 }
 
+/** The `yolo` a quick create should send for `projectId`: the project's
+ *  default, else the app-wide one, through the same `yoloForCreate` gate the
+ *  New Task dialog uses (nothing for a caged task or a non-agent).
+ *
+ *  Quick create has no form to show a checkbox in, so the default is applied
+ *  the way `quickSandboxArgs` applies the project's cage, and the red ⚡ on
+ *  the new row is where it shows. Leaving it out would make the + menu the
+ *  one human create path that ignores the setting, which is the per-task
+ *  toggling the default exists to remove. */
+async function quickYolo(projectId: string, cli: string): Promise<boolean | undefined> {
+  // Dynamic, like autoStart.ts's: prefs.ts touches the DOM at import time,
+  // and this module is imported by node-environment unit tests.
+  const { usePrefs } = await import("@/store/prefs");
+  const project = useApp.getState().projects.find(p => p.id === projectId);
+  const on = yoloForCreate(
+    projectYoloDefault(project, usePrefs.getState().defaultYolo),
+    projectSandboxDefault(project),
+    !isTerminalCli(cli),
+  );
+  return on || undefined;
+}
+
 /** Map a sandbox mode string ("off" | "monitor" | "enforce" |
  *  "enforce-fs") onto task-create pins. Anything else (absent flag,
  *  unknown string) returns undefined: leave the pins unset so Rust
@@ -165,9 +188,13 @@ export async function createQuickTask(opts: {
     // changing that contract for anyone else. A project defaulting to "off"
     // still sends nothing, so the uncaged path is untouched.
     task = await withCreateLock(async () =>
-      taskOpenRepo(projectId, cli, trimmedName, await quickSandboxArgs(projectId), command),
+      taskOpenRepo(
+        projectId, cli, trimmedName, await quickSandboxArgs(projectId), command,
+        undefined, undefined, undefined, await quickYolo(projectId, cli),
+      ),
     );
   } else {
+    const yolo = await quickYolo(projectId, cli);
     task = await withCreateLock(() =>
       taskCreate({
         id: opts.id ?? crypto.randomUUID(),
@@ -180,6 +207,7 @@ export async function createQuickTask(opts: {
         // defaults (quick create doesn't expose the sandbox panel — that's
         // what "Advanced…" is for).
         custom_command: cli === "custom" ? (command ?? null) : undefined,
+        yolo,
       }),
     );
   }
@@ -197,9 +225,15 @@ export async function createQuickTask(opts: {
  *  them (branch name / dir basename, and the project's default CLI). No setup
  *  script: the worktree already exists and is presumed set up. */
 export async function importQuickWorktree(projectId: string, path: string): Promise<Task> {
+  // Rust derives the CLI as the project's default, so that is the agent the
+  // YOLO default is judged against.
+  const project = useApp.getState().projects.find(p => p.id === projectId);
+  const yolo = await quickYolo(projectId, project?.default_cli ?? "shell");
   // Import runs git worktree list/prune and the port math; serialize it
   // with every other create (createLock.ts).
-  const task = await withCreateLock(() => taskImportWorktree(projectId, path));
+  const task = await withCreateLock(() => taskImportWorktree(
+    projectId, path, undefined, undefined, undefined, undefined, undefined, yolo,
+  ));
   await useApp.getState().loadAll();
   useApp.getState().setActiveTask(task.id);
   return task;

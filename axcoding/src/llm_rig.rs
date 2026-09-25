@@ -1,7 +1,7 @@
 //! rig-core adapter: the only module that speaks rig's message dialect.
 //!
 //! We use rig for provider plumbing only (HTTP, auth, request/response
-//! serialization). The agent loops live in `harness` and `bin/axcoding_agent.rs`,
+//! serialization). The agent loop lives in `bin/axcoding_agent.rs`,
 //! explicit and inspectable, pi-style. API shapes below were verified
 //! against rig-core 0.42.0 source, not docs.
 

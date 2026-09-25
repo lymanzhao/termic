@@ -3,6 +3,7 @@
 
 import { create } from "zustand";
 import type { Prompt } from "@/store/prompts";
+import type { TaskFilter } from "@/lib/taskFilter";
 
 export interface ConfirmCheckbox {
   label: string;
@@ -222,6 +223,10 @@ interface UIState {
    *  is responsible for expanding the row's project first (a collapsed
    *  project doesn't render the row, so the signal would be missed). */
   renameRequest: { taskId: string; nonce: number } | null;
+  /** The task group whose caption is being renamed, and the draft. Held
+   *  here rather than in TaskGroupBlock because Move to group > New group
+   *  starts it from a task's menu, before the block it targets has mounted. */
+  groupRenaming: { groupId: string; value: string } | null;
   /** ⇧⌘F find-in-files dialog — task id, null = closed. */
   findInFilesTaskId: string | null;
   /** Global "blocking work in flight" message. Shows a centered loader over
@@ -261,6 +266,11 @@ interface UIState {
    *  checks the set on exit instead of showing the "Restart agent"
    *  overlay). Cleared per-(task,tab) when the respawn fires. */
   pendingPtyRestarts: Set<string>;
+  /** Sidebar task filter per project id (GH #324). Absent = unfiltered.
+   *  Not persisted: a restart starts with every task visible. */
+  taskFilters: Record<string, TaskFilter>;
+  setTaskFilterText: (projectId: string, text: string) => void;
+  toggleTaskFilterBell: (projectId: string) => void;
   /** Transient bottom-right toasts. Auto-dismiss handled in <Toaster/>. */
   toasts: Toast[];
   /** Bumped to force the "All files" tree to re-read from disk — e.g. after
@@ -408,6 +418,25 @@ export interface Toast {
   sticky?: boolean;
 }
 
+/** Apply `patch` to one project's filter, dropping the entry once both parts
+ *  are empty so "absent" stays the only unfiltered shape. Returns the same
+ *  map (a no-op set) when nothing changed. */
+function patchTaskFilter(
+  filters: Record<string, TaskFilter>, projectId: string, patch: Partial<TaskFilter>,
+): { taskFilters: Record<string, TaskFilter> } {
+  const prev = filters[projectId];
+  const next: TaskFilter = { text: prev?.text ?? "", bell: prev?.bell ?? false, ...patch };
+  if (prev && prev.text === next.text && prev.bell === next.bell) return { taskFilters: filters };
+  const out = { ...filters };
+  if (next.text === "" && !next.bell) {
+    if (!prev) return { taskFilters: filters };
+    delete out[projectId];
+  } else {
+    out[projectId] = next;
+  }
+  return { taskFilters: out };
+}
+
 /** Keys withdrawn while their confirm was still inside askConfirm's macrotask
  *  deferral. Consumed by that deferred open, so entries never accumulate. */
 const withdrawnConfirms = new Set<string>();
@@ -459,6 +488,7 @@ export const useUI = create<UIState>(set => ({
   syntaxPaletteFor: null,
   promptFire: null,
   renameRequest: null,
+  groupRenaming: null,
   busyMessage: null,
   fileTreeNonce: 0,
   confirm: null,
@@ -467,6 +497,10 @@ export const useUI = create<UIState>(set => ({
   scratchSave: null,
   dockerRebuildPrompt: null,
   pendingPtyRestarts: new Set<string>(),
+  taskFilters: {},
+  setTaskFilterText: (projectId, text) => set(s => patchTaskFilter(s.taskFilters, projectId, { text })),
+  toggleTaskFilterBell: (projectId) => set(s =>
+    patchTaskFilter(s.taskFilters, projectId, { bell: !s.taskFilters[projectId]?.bell })),
   toasts: [],
 
   openNewProject:    () => set({ newProjectOpen: true }),

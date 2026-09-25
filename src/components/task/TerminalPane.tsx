@@ -35,7 +35,7 @@ import { loadTerminalRenderer, awaitTerminalFonts } from "@/lib/terminalRenderer
 import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
-import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, HOOK_OSC_SESSION_PREFIX, HOOK_OSC_WORKING_BODY, HOOK_OSC_DONE_BODY, HOOK_OSC_DELEGATED_PREFIX, hookOscSessionId } from "@/lib/agentHooks";
+import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, HOOK_OSC_SESSION_PREFIX, HOOK_OSC_WORKING_BODY, HOOK_OSC_DONE_BODY, HOOK_OSC_DELEGATED_PREFIX, hookOscSessionId, sessionHolder } from "@/lib/agentHooks";
 import { parseDelegatedBody, delegatedVerdict, isAgentOwned, delegatedChipText, DELEGATED_DETACHED_GRACE_MS, type DelegatedWork } from "@/lib/delegatedWork";
 import { lastAgentLine } from "@/lib/resumeTail";
 import { parseUsageBody } from "@/lib/agentUsage";
@@ -225,9 +225,12 @@ export function TerminalPane({ task, tab, active }: Props) {
   const [pathMenu, setPathMenu] = useState<
     { x: number; y: number; candidates: string[]; line?: number; col?: number; external?: ExternalTarget } | null
   >(null);
+  // Cmd+click on a path is a deliberate "open THIS file": it opens as a
+  // permanent tab, never the preview slot the next click would recycle.
   const openPathFile = useCallback((path: string, line?: number, col?: number) => {
     useApp.getState().openPreviewTab(task.id, {
       type: "edit",
+      permanent: true,
       path,
       title: path.split("/").pop() || path,
       revealAt: line ? { line, col } : undefined,
@@ -1026,6 +1029,7 @@ const captureArmedRef = useRef(false);
       if (readable) {
         useApp.getState().openPreviewTab(task.id, {
           type: "external",
+          permanent: true,
           path: abs,
           title: abs.split("/").pop() || abs,
           revealAt: target.line ? { line: target.line, col: target.col } : undefined,
@@ -1435,7 +1439,7 @@ const captureArmedRef = useRef(false);
     {
       const held = (useApp.getState().tabs[task.id]
         ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.delegatedWork;
-      if (held) patchTab(task.id, tab.id, { delegatedWork: null, delegatedSince: 0 });
+      if (held) patchTab(task.id, tab.id, { delegatedWork: null, delegatedSince: 0, delegatedIdle: false });
     }
     native133LoggedRef.current = false;
     agentReadyPatchedRef.current = false;
@@ -1476,6 +1480,14 @@ const captureArmedRef = useRef(false);
     const goWorking = (reason: string) => {
       if (!workDoneEnabled) return;
       cancelSettle(reason);
+      // Any sign of work means the agent is no longer stalled waiting on its
+      // delegated work, so another agent's message queues again. Guarded:
+      // this runs on every working heartbeat (bear trap 8).
+      {
+        const live = useApp.getState().tabs[task.id]
+          ?.find(t => t.id === tab.id) as TerminalTab | undefined;
+        if (live?.delegatedIdle) patchTab(task.id, tab.id, { delegatedIdle: false });
+      }
       // The agent is working again well after we called this turn done, so the
       // done was premature (a stage boundary read as the end). Hand the turn's
       // done token back — otherwise the completion that actually ends the turn
@@ -2021,6 +2033,25 @@ const captureArmedRef = useRef(false);
         // undone by the next Enter, back to a session nothing was said in.
         pendingSessionUuidRef.current = null;
         sessionReportedRef.current = true;
+        // Another tab's conversation, picked in a shared cwd's picker: keep
+        // this tab's pointer where it was rather than swap the two tasks (see
+        // sessionHolder). Checked only when the id is new to this tab, so the
+        // lookup stays off the steady-state path.
+        const holder = live?.sessionId !== reported
+          ? sessionHolder(reported, { taskId: task.id, tabId: tab.id },
+              useApp.getState().tasks, useApp.getState().tabs)
+          : null;
+        if (holder) {
+          logWorkState("session-foreign",
+            `cli=${tab.cli} task=${JSON.stringify(task.name)} id=${reported}`
+            + ` holder=${JSON.stringify(holder.taskName)}`);
+          useUI.getState().pushToast(
+            `That ${agentDisplayName(tab.cli)} conversation belongs to "${holder.taskName}", so Termic did not save it to this tab.`
+            + ` Two tabs on one conversation lock each other out: continue it in "${holder.taskName}", or /resume another one here.`,
+            "info",
+          );
+          return false;
+        }
         if (live?.sessionId !== reported) {
           logWorkState("session-reported",
             `cli=${tab.cli} task=${JSON.stringify(task.name)} id=${reported}`);
@@ -2188,6 +2219,7 @@ const captureArmedRef = useRef(false);
           delegatedSince: Date.now(),
         });
         goWorking(`delegated ${work.label} (partial)`);
+        markDelegatedIdle("partial");
         return;
       }
       if (verdict === "carried") {
@@ -2225,6 +2257,18 @@ const captureArmedRef = useRef(false);
       // record WHEN so the detached-work grace has something to measure from.
       patchTab(task.id, tab.id, { delegatedWork: work, delegatedSince: Date.now() });
       goWorking(`delegated ${work.label}`);
+      markDelegatedIdle("delegated");
+    };
+    // The done hook just fired with work outstanding, so the agent's own
+    // loop has stopped: another agent's message (`termic send`, MCP
+    // task_send) can go in now instead of queueing behind every subagent /
+    // shell it started (cliRpc's busy test reads this). The user's own
+    // message queue is deliberately NOT affected: it still waits for the
+    // turn to end. Marked AFTER goWorking, which clears the mark; the next
+    // working signal clears it again.
+    const markDelegatedIdle = (why: string) => {
+      patchTab(task.id, tab.id, { delegatedIdle: true });
+      logWorkState("delegated-idle", `cli=${tab.cli} ${why}: agent messages deliver now`);
     };
     hookDelegatedRef.current = hookDelegated;
     term.parser.registerOscHandler(133, (data) => {
@@ -2874,7 +2918,13 @@ const captureArmedRef = useRef(false);
             setGen(g => g + 1);
             return;
           }
-          if (fastExit && lastSpawnWasResumeRef.current) {
+          // A CLEAN exit is never a failed resume. Every refusal measured exits
+          // non-zero (claude's "No conversation found" and "running in another
+          // terminal", codex's "active writer": all 1), while quitting a tab
+          // with Ctrl+C right after a relaunch exits 0. Reading that as "the id
+          // is dead" cleared a good id and opened the picker, and in a main
+          // checkout the picker's top row is a sibling task's conversation.
+          if (fastExit && lastSpawnWasResumeRef.current && code !== 0) {
             // Rapid exit during a resume attempt = the stored session
             // doesn't resolve anymore (id-CLI: log rotated / deleted;
             // legacy: "no conversation to continue"). Drop the bad

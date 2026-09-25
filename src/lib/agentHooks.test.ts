@@ -12,6 +12,7 @@ import {
   HOOK_OSC_DONE_BODY,
   HOOK_OSC_SESSION_PREFIX,
   HOOK_OSC_DELEGATED_PREFIX,
+  sessionHolder,
 } from "@/lib/agentHooks";
 import { notificationWantsAttention, BUILTIN_NOTIFY_IGNORE } from "@/lib/agents";
 
@@ -142,5 +143,46 @@ describe("an agent's own end-of-turn notification is not a request", () => {
     expect(notificationWantsAttention("muse", "Muse needs your approval to run a command", [])).toBe(true);
     // A permission request from grok still is one.
     expect(notificationWantsAttention("grok", "Grok needs your permission to run bash", [])).toBe(true);
+  });
+});
+
+// A reported session id another tab already holds is not this tab's to keep.
+// Main-checkout tasks share a cwd, so claude's picker lists the siblings'
+// conversations, newest first; storing the pick swapped two tasks.
+describe("sessionHolder", () => {
+  const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const self = { taskId: "t-b", tabId: "tab-b" };
+  const term = (id: string, sessionId?: string) =>
+    ({ id, type: "terminal", cli: "claude", title: "", sessionId }) as any;
+  const task = (id: string, name: string, extra: any = {}) =>
+    ({ id, name, archived: false, persisted_tabs: [], ...extra });
+
+  it("names the task whose live tab holds the id", () => {
+    const tasks = [task("t-a", "alpha"), task("t-b", "bravo")];
+    const tabs = { "t-a": [term("tab-a", A)], "t-b": [term("tab-b", B)] };
+    expect(sessionHolder(A, self, tasks, tabs)).toEqual({ taskId: "t-a", taskName: "alpha", tabId: "tab-a" });
+  });
+
+  it("finds a holder that was never opened this run, through its persisted tabs", () => {
+    const tasks = [task("t-a", "alpha", { persisted_tabs: [{ id: "tab-a", session_id: A }] }), task("t-b", "bravo")];
+    expect(sessionHolder(A, self, tasks, {})?.taskName).toBe("alpha");
+  });
+
+  it("a second tab in the SAME task is a holder too", () => {
+    const tasks = [task("t-b", "bravo")];
+    const tabs = { "t-b": [term("tab-b"), term("tab-b2", A)] };
+    expect(sessionHolder(A, self, tasks, tabs)?.tabId).toBe("tab-b2");
+  });
+
+  it("the reporting tab's own id, an unheld id, and an archived holder are all free", () => {
+    const tasks = [
+      task("t-b", "bravo", { persisted_tabs: [{ id: "tab-b", session_id: B }] }),
+      task("t-old", "old", { archived: true, persisted_tabs: [{ id: "tab-o", session_id: A }] }),
+    ];
+    const tabs = { "t-b": [term("tab-b", B)] };
+    expect(sessionHolder(B, self, tasks, tabs)).toBe(null);
+    expect(sessionHolder("cccccccc-cccc-4ccc-8ccc-cccccccccccc", self, tasks, tabs)).toBe(null);
+    expect(sessionHolder(A, self, tasks, tabs)).toBe(null);
   });
 });

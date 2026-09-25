@@ -29,6 +29,8 @@ export function SandboxSection() {
   const setGlobalDefaultSandboxKind = usePrefs(s => s.setGlobalDefaultSandboxKind);
   const sandboxBypassPermissions = usePrefs(s => s.sandboxBypassPermissions);
   const setSandboxBypassPermissions = usePrefs(s => s.setSandboxBypassPermissions);
+  const defaultYolo = usePrefs(s => s.defaultYolo);
+  const setDefaultYolo = usePrefs(s => s.setDefaultYolo);
 
   // Same two gates the picker needs everywhere else it appears: Seatbelt
   // is macOS-only, Docker needs the global switch on AND an image built.
@@ -97,6 +99,28 @@ export function SandboxSection() {
             </div>
           )}
         </div>
+      </Block>
+
+      {/* YOLO default for NEW tasks, for a machine that is itself the
+          sandbox. It only seeds Task.yolo: the New Task dialog shows it as a
+          ticked checkbox before Create, the Race dialog and the sidebar
+          quick-create apply it, and the red ⚡ marks the task afterwards.
+          The CLI and MCP still need an explicit --yolo, so an agent asking
+          to create a task cannot inherit it. Existing tasks keep their own
+          flag. */}
+      <Block id="default-yolo">
+        <Toggle
+          label="Start new tasks in YOLO"
+          hint={<>
+            For a machine that is already the sandbox, like a dedicated Mac mini or a VM. New tasks start with
+            the agent's own permission prompts skipped, and for codex and muse that also turns off their
+            built-in sandbox. The New task dialog shows it before you create, and a project can override it
+            (Settings → Repositories). Agents creating tasks through the CLI still need{" "}
+            <code className="font-mono">--yolo</code>.
+          </>}
+          value={defaultYolo}
+          onChange={setDefaultYolo}
+        />
       </Block>
 
       {/* Bypass-permissions default for sandboxed agents. When on, a

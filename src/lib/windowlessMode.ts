@@ -19,6 +19,7 @@
 // windowless transitions count.
 
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { useUI } from "@/store/ui";
 import { useApp } from "@/store/app";
@@ -41,7 +42,10 @@ export async function initWindowlessMode(): Promise<void> {
   // three outcomes (menu bar / quit / dismiss-cancels-the-close). Reset on
   // every request so a tick left over from a superseded prompt cannot ride
   // into a decision the user thinks is fresh.
-  await listen("termic://close-requested", () => {
+  // Scoped to THIS window: Rust `emit_to`s the window whose close button was
+  // clicked, and a global `listen` (target Any) would open the prompt in
+  // every profile's window at once (see cliRpc.ts initCliRpc).
+  await getCurrentWebviewWindow().listen("termic://close-requested", () => {
     // ACK FIRST. Rust falls back to going windowless if no ack arrives, which
     // is what stops a missing listener from turning the red button into a
     // silent no-op. Acking before showing the prompt means a dismissal is

@@ -19,6 +19,10 @@
 //   2. Background. `initPrStatusPoller` (App start) runs one global slow
 //      tick over every task with a PR identity persisted on its record,
 //      whether or not it has been visited this session. See its doc below.
+//   3. Focus. Activating a task, or refocusing the window with one in
+//      front, runs an unforced refresh for it (at most one per task per
+//      30s), which is what DISCOVERS a PR the agent opened itself. See
+//      `initPrRefreshOnFocus` below.
 //
 // Layer 2 exists because layer 1 is bound to a component that is usually
 // unmounted (issue #281): `PrCard` lives inside `GitPanel`, which renders
@@ -271,14 +275,70 @@ async function statusPass() {
   }
 }
 
+// ─────────────────────── refresh on focus ───────────────────────
+//
+// The gap the two layers above leave: DISCOVERING a PR. The background tick
+// only polls tasks that already carry a PR identity, and the foreground one
+// only runs while the Git tab is on screen, so a PR the agent opened from
+// its own terminal (`gh pr create`) stayed invisible in the sidebar until
+// someone opened that task's Git tab. Focusing the task is the natural
+// moment to look: the same unforced refresh the agent spawn uses, so the
+// store's 30s floor still caps it at one `gh`/`glab` per task per 30s
+// however often you switch. Once a lookup finds the PR, `refresh` records
+// the identity and the background tick keeps it fresh from then on.
+
+/** Would a PR lookup mean anything for this task? The background poller's
+ *  own exclusions: a main checkout has no branch of its own, and a plain
+ *  folder has no forge. */
+export function prFocusEligible(taskId: string | null): taskId is string {
+  if (!taskId) return false;
+  const app = useApp.getState();
+  const t = app.tasks.find(w => w.id === taskId);
+  if (!t || t.archived || t.is_main_checkout) return false;
+  return !app.projects.find(p => p.id === t.project_id)?.non_git;
+}
+
+function refreshFocused() {
+  const id = useApp.getState().activeTaskId;
+  if (prFocusEligible(id)) void usePr.getState().refresh(id);
+}
+
+let focusUnsubs: (() => void)[] | null = null;
+
+/** Refresh the active task's PR when it becomes active, and when the window
+ *  comes back into focus with it in front. Idempotent; started with the
+ *  poller. Store subscriptions rather than a component effect: a poll bound
+ *  to a mounted component is exactly the #281 trap described above. */
+export function initPrRefreshOnFocus() {
+  if (focusUnsubs) return;
+  focusUnsubs = [
+    useApp.subscribe((s, prev) => {
+      if (s.activeTaskId !== prev.activeTaskId) refreshFocused();
+    }),
+    useUI.subscribe((s, prev) => {
+      if (s.windowFocused && !prev.windowFocused) refreshFocused();
+    }),
+  ];
+}
+
+/** Test seam: undo initPrRefreshOnFocus. */
+export function stopPrRefreshOnFocus() {
+  focusUnsubs?.forEach(u => u());
+  focusUnsubs = null;
+}
+
 /** Start the global PR status poller. Idempotent; called from App once
  *  `loadAll` has resolved, because a pass before the tasks are in the
  *  store has nothing to poll and the badge would stay grey until the
- *  first tick. Runs a pass immediately, then every STATUS_TICK_MS. */
+ *  first tick. Runs a pass immediately, then every STATUS_TICK_MS. Also
+ *  starts the refresh-on-focus trigger (see above), and looks at the task
+ *  already in front, which no focus change will announce. */
 export function initPrStatusPoller() {
   if (statusTimer !== null) return;
   statusTimer = window.setInterval(() => { void statusPass(); }, STATUS_TICK_MS);
   void statusPass();
+  initPrRefreshOnFocus();
+  refreshFocused();
 }
 
 /** Test seam: run one background pass immediately. */

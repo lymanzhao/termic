@@ -212,6 +212,116 @@ describe("editor open", () => {
   });
 });
 
+// Cmd+click on a file path in a terminal is a deliberate "open THIS file", so
+// it opens a PERMANENT tab: it neither lands in nor evicts the preview slot
+// (the italic, recyclable tab every other single-click open uses). Driven
+// through the real capture-phase opener: a shell prints the path at the top
+// left of a cleared screen and the spec cmd+clicks that cell. Asserted on the
+// italic title the user actually sees, not only on the store flag.
+describe("terminal cmd+click opens a permanent tab", () => {
+  let taskId!: string;
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  const tabFor = (p: string) =>
+    browser.execute(
+      (id, path) => (window.__termic!.useApp.getState().tabs[id] ?? [])
+        .find((t: any) => t.type === "edit" && t.path === path) ?? null,
+      taskId, p,
+    ) as Promise<any>;
+  /** The tab title's font-style, as rendered: "italic" = preview. */
+  const titleStyle = (tabId: string) =>
+    browser.execute((id) => {
+      const el = document.querySelector(`[data-tab-id="${id}"] .truncate`) as HTMLElement | null;
+      return el ? getComputedStyle(el).fontStyle : null;
+    }, tabId);
+  /** Cmd+click the top-left cell of the task's visible terminal screen. */
+  const cmdClickTopLeft = () =>
+    browser.execute((id) => {
+      const screen = [...document.querySelectorAll<HTMLElement>(`[data-task-id="${id}"] .xterm-screen`)]
+        .find(el => el.getBoundingClientRect().width > 0);
+      if (!screen) return false;
+      const r = screen.getBoundingClientRect();
+      const at = { bubbles: true, cancelable: true, button: 0, metaKey: true, clientX: r.left + 3, clientY: r.top + 3 };
+      screen.dispatchEvent(new MouseEvent("mousedown", at));
+      screen.dispatchEvent(new MouseEvent("mouseup", at));
+      screen.dispatchEvent(new MouseEvent("click", at));
+      return true;
+    }, taskId);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("e2e-term-cmdclick", true, "shell");
+    await browser.waitUntil(
+      () => browser.execute((id) => !!(window.__termic!.useApp.getState().tabs[id] ?? []).find((t: any) => t.type === "terminal")?.ptyId, taskId),
+      { timeout: 20_000, timeoutMsg: "the shell never got a PTY" },
+    );
+    // `clear` homes the cursor, so the path prints at row 0, col 0.
+    await browser.execute(async (id) => {
+      const t = window.__termic!;
+      const pty = (t.useApp.getState().tabs[id] ?? []).find((x: any) => x.type === "terminal").ptyId;
+      const bytes = [...new TextEncoder().encode("clear; printf 'README.md\\n'\r")];
+      await t.ipc.ptyWrite(pty, bytes);
+    }, taskId);
+  });
+
+  it("opens a regular tab and leaves the preview slot's file alone", async () => {
+    // Something already occupies the preview slot.
+    await browser.execute((id) => window.__termic!.useApp.getState().openPreviewTab(id, {
+      type: "edit", path: "e2e-preview-occupant.txt", title: "e2e-preview-occupant.txt",
+    }), taskId);
+    // Back to the terminal, then cmd+click the printed path. Retried until the
+    // tab appears: the shell prints asynchronously, and a click on a blank
+    // cell is a no-op, so repeating it is safe.
+    await browser.waitUntil(async () => {
+      await browser.execute((id) => {
+        const s = window.__termic!.useApp.getState();
+        const term = (s.tabs[id] ?? []).find((t: any) => t.type === "terminal");
+        s.setActiveTabId(id, term.id);
+      }, taskId);
+      await cmdClickTopLeft();
+      return !!(await tabFor("README.md"));
+    }, { timeout: 15_000, interval: 500, timeoutMsg: "cmd+click on the printed path never opened it" });
+
+    const readme = await tabFor("README.md");
+    expect(readme.preview).toBe(false);
+    await browser.waitUntil(async () => (await titleStyle(readme.id)) !== null, { timeout: 5_000 });
+    expect(await titleStyle(readme.id)).toBe("normal");
+    // The preview slot kept its file: nothing was evicted.
+    const occupant = await tabFor("e2e-preview-occupant.txt");
+    expect(occupant?.preview).toBe(true);
+    expect(await titleStyle(occupant.id)).toBe("italic");
+    await snap("terminal-cmdclick-permanent.png");
+  });
+
+  it("pins the file in place when it is the one already in the preview slot", async () => {
+    // Close README, then make it the preview occupant.
+    await browser.execute((id, tid) => window.__termic!.useApp.getState().closeTab(id, tid), taskId, (await tabFor("README.md")).id);
+    await browser.execute((id) => window.__termic!.useApp.getState().openPreviewTab(id, {
+      type: "edit", path: "README.md", title: "README.md",
+    }), taskId);
+    const before = await tabFor("README.md");
+    expect(before.preview).toBe(true);
+
+    await browser.waitUntil(async () => {
+      await browser.execute((id) => {
+        const s = window.__termic!.useApp.getState();
+        s.setActiveTabId(id, (s.tabs[id] ?? []).find((t: any) => t.type === "terminal").id);
+      }, taskId);
+      await cmdClickTopLeft();
+      return (await tabFor("README.md"))?.preview === false;
+    }, { timeout: 15_000, interval: 500, timeoutMsg: "cmd+click never pinned the previewed file" });
+    // The SAME tab, pinned: no second README tab.
+    expect((await tabFor("README.md")).id).toBe(before.id);
+    const count = await browser.execute((id) => (window.__termic!.useApp.getState().tabs[id] ?? [])
+      .filter((t: any) => t.type === "edit" && t.path === "README.md").length, taskId);
+    expect(count).toBe(1);
+    expect(await titleStyle(before.id)).toBe("normal");
+  });
+});
+
 // P0: editing a file and saving it. Guards the CodeMirror edit -> dirty dot ->
 // Cmd+S -> taskFileWrite path (termic never auto-saves). Restores README on
 // teardown so the fixture repo stays clean for the git specs.

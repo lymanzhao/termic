@@ -119,6 +119,18 @@ and the landings in between show as state 4. A shell nobody ever collects
 `DELEGATED_DETACHED_GRACE_MS`, five minutes; agent-owned work has no clock on
 it at all, because it is measured to come back on its own.
 
+### Agent messages while delegated
+
+In the delegated and partially-done states the agent's own loop has
+stopped (its `Stop` hook reported the held work), so `delegatedIdle` is
+set on the tab, and another agent's message (`termic send`, MCP
+`task_send`) is typed at once instead of queueing until every subagent is
+back. That is the report-back path: a worker finishing is exactly what an
+orchestrator in this state is waiting to hear. Any working signal clears
+the mark (a subagent's report making the agent resume, for one), so a
+message never lands mid-generation. The USER's message queue ignores the
+mark and still waits for the turn to end.
+
 ## What each surface draws
 
 Priority, high to low, and it is the same chain everywhere:

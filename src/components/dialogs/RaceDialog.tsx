@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/Button";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { visibleCliIds } from "@/lib/agents";
 import { startRace, suggestRaceName, type Racer } from "@/lib/agentRace";
+import { projectYoloDefault } from "@/lib/projectSandboxDefault";
 import { cn, slugify } from "@/lib/utils";
 import { Flag, Loader2, Minus, Plus } from "lucide-react";
 
@@ -53,13 +54,13 @@ export function RaceDialog() {
     if (!open) return;
     setCounts({}); setPrompt(""); setName(""); setNameEdited(false);
     setBranchMid(""); setBranchEdited(false);
-    // Sandbox seeds from what a plain New Task in this project would get
-    // (project default, then the global default); YOLO always starts off.
+    // Sandbox and YOLO both seed from what a plain New Task in this project
+    // would get (project default, then the global default).
     const p = useApp.getState().projects.find(p => p.id === projectId);
     setSandbox(p?.default_sandbox_mode
       ? isSandboxEnforced(p.default_sandbox_mode)
       : (!!p?.default_sandbox || usePrefs.getState().globalDefaultSandboxKind !== "off"));
-    setYolo(false);
+    setYolo(projectYoloDefault(p, usePrefs.getState().defaultYolo));
     setErr(null); setBusy(false); setProgress(null);
   }, [projectId, open]);
 
@@ -231,6 +232,7 @@ export function RaceDialog() {
           {t("race.sandboxLabel")}
         </label>
         <label
+          data-testid="race-yolo"
           title={sandbox
             ? t("race.yoloTitleSandboxed")
             : t("race.yoloTitleBare")}

@@ -13,6 +13,8 @@
 // boundary; `agentHooks.test.ts` and the Rust
 // `the_script_gates_on_both_env_vars_and_always_exits_zero` are the two halves.
 
+import type { Tab, Task, TerminalTab } from "@/lib/types";
+
 /** OSC 777's `notify` title field. Identifies the sender, not the message. */
 export const HOOK_OSC_TITLE = "termic";
 
@@ -99,6 +101,36 @@ export function hookOscSessionId(body: string): string | null {
   const uuid = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
   const slug = /^[0-9a-zA-Z][0-9a-zA-Z_-]{0,127}$/;
   return uuid.test(id) || slug.test(id) ? id : null;
+}
+
+/** The OTHER tab that already holds session `id`, or null.
+ *
+ *  A reported id is not always this tab's to keep. Every task in a main
+ *  checkout shares one cwd, so claude's picker (the #311 fallback, or a
+ *  `/resume` typed by hand) lists the siblings' conversations too, newest
+ *  first, and one reflexive Enter takes whichever sibling was used last.
+ *  Stored, that swaps the two tasks: the sibling's next resume is refused as
+ *  "running in another terminal", which is a fast exit, which clears ITS id
+ *  and opens ITS picker, whose top row is now this tab's old conversation.
+ *
+ *  Checks the live tabs AND the durable `persisted_tabs`, because a task that
+ *  was never opened this run has no live tabs but still owns its sessions.
+ *  Archived tasks own nothing. */
+export function sessionHolder(
+  id: string,
+  self: { taskId: string; tabId: string },
+  tasks: readonly Pick<Task, "id" | "name" | "archived" | "persisted_tabs">[],
+  tabs: Readonly<Record<string, readonly Tab[] | undefined>>,
+): { taskId: string; taskName: string; tabId: string } | null {
+  for (const task of tasks) {
+    if (task.archived) continue;
+    const live = (tabs[task.id] ?? []).find(t =>
+      t.id !== self.tabId && t.type === "terminal" && (t as TerminalTab).sessionId === id);
+    const held = live?.id ?? (task.persisted_tabs ?? []).find(p =>
+      p.id !== self.tabId && p.session_id === id)?.id;
+    if (held) return { taskId: task.id, taskName: task.name, tabId: held };
+  }
+  return null;
 }
 
 /** The OSC payload without its introducer or terminator: what you would put

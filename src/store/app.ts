@@ -158,6 +158,11 @@ export interface AppState {
    *  name like collapsedGroups. Persisted to localStorage; pruned and
    *  rename-migrated alongside the collapse map. */
   groupColors: Record<string, string>;
+  /** Per TASK GROUP collapse state (src/lib/taskGroups.ts), keyed by group
+   *  id. true = members hidden behind the caption, which then shows their
+   *  marks instead. localStorage like the project folders' map, pruned in
+   *  `loadAll` when a group is gone. */
+  collapsedTaskGroups: Record<string, boolean>;
   /** Task ids most recently activated, newest first, capped at
    *  RECENT_TASKS_CAP. Drives the dashboard's "Recent" row, which is the
    *  only way back into a task from the home screen without hunting the
@@ -249,6 +254,7 @@ export interface AppState {
   setTaskCollapsed: (taskId: string,      collapsed: boolean) => void;
   /** Set a project-group's collapse state (keyed by group name). */
   setGroupCollapsed: (group: string, collapsed: boolean) => void;
+  setTaskGroupCollapsed: (groupId: string, collapsed: boolean) => void;
   /** Assign a palette color to a group folder (null clears back to the
    *  default). Keys are palette names ("red"…); the sidebar maps them to
    *  --color-palette-* tokens and ignores unknown keys. */
@@ -371,7 +377,13 @@ export interface AppState {
   /** Show a place WITHOUT treating it as a visit — see the implementation. */
   previewPlace: (taskId: string, tabId: string) => void;
   persistTab: (taskId: string, tabId: string) => void;
-  openPreviewTab: (taskId: string, data: { type: "edit" | "diff" | "dir" | "external"; path: string; title: string; scope?: DiffTab["scope"]; revealAt?: { line: number; col?: number }; revealHeading?: string }) => void;
+  /** Open a file in the tab strip. By default it lands in the PREVIEW slot
+   *  (italic, recycled by the next preview open). `permanent` opens it as a
+   *  regular tab instead: an already-open preview of the same file is pinned
+   *  in place, the preview slot is never recycled, and a new tab is created
+   *  non-preview. For deliberate opens (cmd+click in a terminal, the file
+   *  finder), where the user asked for THAT file and expects it to stay. */
+  openPreviewTab: (taskId: string, data: { type: "edit" | "diff" | "dir" | "external"; path: string; title: string; scope?: DiffTab["scope"]; revealAt?: { line: number; col?: number }; revealHeading?: string; permanent?: boolean }) => void;
   /** Clear an edit tab's `revealAt` after EditorPane has consumed it,
    *  so a re-render doesn't re-jump the cursor. */
   consumeReveal: (taskId: string, tabId: string) => void;
@@ -454,6 +466,7 @@ const LS_RFH     = "rightFooterHeight";
 const LS_COLLAPSED_PROJ = scoped("collapsedProjects"); // Record<projId, true>
 const LS_COLLAPSED_TASK   = scoped("collapsedTasks"); // Record<taskId, bool>
 const LS_COLLAPSED_GRP  = scoped("collapsedGroups"); // Record<groupName, bool>
+const LS_COLLAPSED_TASK_GRP = scoped("collapsedTaskGroups"); // Record<taskGroupId, bool>
 const LS_GROUP_COLORS   = scoped("groupColors"); // Record<groupName, paletteKey>
 const LS_RECENT_TASKS   = scoped("recentTasks"); // string[] of task ids, newest first
 /** How many tasks the dashboard's Recent row remembers. A way back into what
@@ -463,6 +476,7 @@ export const RECENT_TASKS_CAP = 8;
 const initialCollapsed   = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_PROJ) || "{}"); } catch { return {}; } })();
 const initialCollapsedTask = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_TASK)   || "{}"); } catch { return {}; } })();
 const initialCollapsedGrp = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_GRP) || "{}"); } catch { return {}; } })();
+const initialCollapsedTaskGrp = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_TASK_GRP) || "{}"); } catch { return {}; } })();
 const initialGroupColors = (() => { try { return JSON.parse(localStorage.getItem(LS_GROUP_COLORS) || "{}"); } catch { return {}; } })();
 // Array, not a record: an unparseable or hand-edited value must not become a
 // non-array that every consumer then has to defend against.
@@ -702,6 +716,7 @@ export const useApp = create<AppState>((set, get) => ({
   collapsedProjects:   initialCollapsed   as Record<string, boolean>,
   collapsedTasks: initialCollapsedTask as Record<string, boolean>,
   collapsedGroups: initialCollapsedGrp as Record<string, boolean>,
+  collapsedTaskGroups: initialCollapsedTaskGrp as Record<string, boolean>,
   groupColors: initialGroupColors as Record<string, string>,
   recentTasks: initialRecentTasks,
   agents: [],
@@ -755,7 +770,17 @@ export const useApp = create<AppState>((set, get) => ({
       recentTasks = recentTasks.filter(id => openTaskIds.has(id));
       try { localStorage.setItem(LS_RECENT_TASKS, JSON.stringify(recentTasks)); } catch {}
     }
-    set({ projects, tasks, collapsedGroups, groupColors, recentTasks, agents: (settings.agents as import("@/lib/types").Agent[]) ?? [], previewBrowser: settings.preview_browser ?? "" });
+    // Task groups likewise: a group whose last live member left takes its
+    // collapse entry with it.
+    const liveTaskGroups = new Set(tasks.filter(t => !t.archived && t.group).map(t => t.group!.id));
+    let collapsedTaskGroups = get().collapsedTaskGroups;
+    if (Object.keys(collapsedTaskGroups).some(k => !liveTaskGroups.has(k))) {
+      collapsedTaskGroups = Object.fromEntries(
+        Object.entries(collapsedTaskGroups).filter(([k]) => liveTaskGroups.has(k)),
+      );
+      try { localStorage.setItem(LS_COLLAPSED_TASK_GRP, JSON.stringify(collapsedTaskGroups)); } catch {}
+    }
+    set({ projects, tasks, collapsedGroups, collapsedTaskGroups, groupColors, recentTasks, agents: (settings.agents as import("@/lib/types").Agent[]) ?? [], previewBrowser: settings.preview_browser ?? "" });
     // Same housekeeping for Agent Race cohorts: once every task in a race is
     // archived or deleted, drop the race so the board and its localStorage
     // don't accumulate dead entries.
@@ -939,12 +964,24 @@ export const useApp = create<AppState>((set, get) => ({
       nextRecent = [id, ...nextRecent.filter(x => x !== id)].slice(0, RECENT_TASKS_CAP);
       try { localStorage.setItem(LS_RECENT_TASKS, JSON.stringify(nextRecent)); } catch {}
     }
+    // And its TASK group: navigating to a task, by any route that activates
+    // it (click, ⌘1..9, the next-waiting jump, a notification), opens the
+    // group it sits in. Routes that only preview a place (previewPlace) are
+    // covered at render time instead: a collapsed group always shows the
+    // active task's row.
+    let nextCollapsedTaskGroups = get().collapsedTaskGroups;
+    const gid = id ? get().tasks.find(w => w.id === id)?.group?.id : undefined;
+    if (gid && nextCollapsedTaskGroups[gid]) {
+      nextCollapsedTaskGroups = { ...nextCollapsedTaskGroups, [gid]: false };
+      try { localStorage.setItem(LS_COLLAPSED_TASK_GRP, JSON.stringify(nextCollapsedTaskGroups)); } catch {}
+    }
     set({
       activeTaskId: id,
       view: { page: id ? "dashboard" : get().view.page },
       mountedTasks: nextMounted,
       collapsedProjects: nextCollapsed,
       collapsedGroups: nextCollapsedGroups,
+      collapsedTaskGroups: nextCollapsedTaskGroups,
       recentTasks: nextRecent,
     });
     if (id) {
@@ -1164,6 +1201,12 @@ export const useApp = create<AppState>((set, get) => ({
     const next = { ...s.collapsedTasks, [taskId]: collapsed };
     try { localStorage.setItem(LS_COLLAPSED_TASK, JSON.stringify(next)); } catch {}
     return { collapsedTasks: next };
+  }),
+  setTaskGroupCollapsed: (groupId, collapsed) => set(s => {
+    if (!!s.collapsedTaskGroups[groupId] === collapsed) return s; // bear trap 8
+    const next = { ...s.collapsedTaskGroups, [groupId]: collapsed };
+    try { localStorage.setItem(LS_COLLAPSED_TASK_GRP, JSON.stringify(next)); } catch {}
+    return { collapsedTaskGroups: next };
   }),
   setGroupCollapsed: (group, collapsed) => set(s => {
     const next = { ...s.collapsedGroups, [group]: collapsed };
@@ -2314,6 +2357,8 @@ export const useApp = create<AppState>((set, get) => ({
       // `Partial<typeof t>` over the union widens `type` back to the union
       // (TS distributes the spread, not the narrowing), so cast the result
       // rather than the patch.
+      // A pad's own "changed since you looked" mark clears the same way.
+      if (t.type === "scratch" && t.unseen) return { ...t, unread: null, unseen: false } as Tab;
       if (t.unread) return { ...t, unread: null } as Tab;
       return t;
     });
@@ -2547,8 +2592,11 @@ export const useApp = create<AppState>((set, get) => ({
       if (data.type === "diff" && !data.scope?.startsWith("commit:")) {
         patch.reloadNonce = ((existing as { reloadNonce?: number }).reloadNonce ?? 0) + 1;
       }
-      if (Object.keys(patch).length === 0) return list; // nothing new — leave any pending reveal alone
-      return list.map(t => t.id === existing.id ? { ...t, ...patch } as Tab : t);
+      // A permanent open of a file that is sitting in the preview slot pins
+      // it where it is, rather than opening a second tab for the same file.
+      const pin = data.permanent && existing.preview ? { preview: false } : {};
+      if (Object.keys(patch).length === 0 && !("preview" in pin)) return list; // nothing new — leave any pending reveal alone
+      return list.map(t => t.id === existing.id ? { ...t, ...patch, ...pin } as Tab : t);
     };
     const tree = s.splitTree[taskId];
     const activePaneIdVal = s.activePaneId[taskId];
@@ -2572,8 +2620,9 @@ export const useApp = create<AppState>((set, get) => ({
         return { tabs: { ...s.tabs, [taskId]: next }, splitTree: { ...s.splitTree, [taskId]: newTree } };
       }
 
-      // Replace existing preview tab in this pane?
-      const previewTab = paneTabs.find(t => t.preview);
+      // Replace existing preview tab in this pane? Never for a permanent
+      // open: that would evict whatever the preview was showing.
+      const previewTab = data.permanent ? undefined : paneTabs.find(t => t.preview);
       if (previewTab) {
         const next = list.map(t => t.id === previewTab.id ? {
           ...t, type: data.type, path: data.path, title: data.title,
@@ -2592,7 +2641,7 @@ export const useApp = create<AppState>((set, get) => ({
       // Add new tab to split pane.
       const newTab: Tab = {
         id: crypto.randomUUID(), type: data.type, title: data.title,
-        path: data.path, preview: true, paneId: activePaneLeaf.id,
+        path: data.path, preview: !data.permanent, paneId: activePaneLeaf.id,
         ...revealPatch,
       } as any;
       const newTree = replaceNode(tree, activePaneLeaf.id, {
@@ -2605,7 +2654,7 @@ export const useApp = create<AppState>((set, get) => ({
 
     // Default: open in the main pane.
     const mainList = list.filter(t => !(t as TerminalTab).paneId);
-    const previewTab = mainList.find(t => t.preview);
+    const previewTab = data.permanent ? undefined : mainList.find(t => t.preview);
     const setActive = (id: string): Partial<AppState> =>
       ({ activeTab: { ...s.activeTab, [taskId]: id } });
 
@@ -2632,7 +2681,7 @@ export const useApp = create<AppState>((set, get) => ({
 
     const newTab: Tab = {
       id: crypto.randomUUID(), type: data.type, title: data.title,
-      path: data.path, preview: true,
+      path: data.path, preview: !data.permanent,
       ...revealPatch,
     } as any;
     return { tabs: { ...s.tabs, [taskId]: [...list, newTab] }, ...setActive(newTab.id) };

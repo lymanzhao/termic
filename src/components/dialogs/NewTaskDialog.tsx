@@ -21,11 +21,13 @@ import { withCreateLock } from "@/lib/createLock";
 import { usePendingTasks } from "@/store/pendingTasks";
 import { uniqueBranch, derivedBranch } from "@/lib/quickTask";
 import { cn } from "@/lib/utils";
-import { Check, Loader2, AlertTriangle, GitBranch, Link2, FolderGit2, Plus, CircleDot, History } from "lucide-react";
+import { Check, Loader2, AlertTriangle, GitBranch, Link2, FolderGit2, Plus, CircleDot, History, Zap } from "lucide-react";
 import { SandboxPicker, DockerEngineNote } from "@/components/SandboxPicker";
 import { ListField } from "@/components/settings/Controls";
+import { projectYoloDefault, yoloForCreate } from "@/lib/projectSandboxDefault";
 import { SANDBOX_PRESETS, presetHint, presetLabel } from "@/lib/sandboxPresets";
-import { selectionToFields, type MemberMode, type ImportableWorktree, type SandboxSelection, type ForgeIssue, type IssueLookup } from "@/lib/types";
+import { selectionToFields, isTaskCaged, type MemberMode, type ImportableWorktree, type SandboxSelection, type ForgeIssue, type IssueLookup, type BranchContext } from "@/lib/types";
+import { BRANCH_CHOICES_MAX, branchChoices, checkoutTaskName, isKnownBranch, remoteNames } from "@/lib/existingBranch";
 import { projectForgeIssues } from "@/lib/ipc";
 import { buildIssuePrompt, issueBranch, issueTaskName } from "@/lib/issuePrompt";
 import { readMemberModes, persistMemberMode, seedMemberMode } from "@/components/dialogs/memberModes";
@@ -135,6 +137,23 @@ export function NewTaskDialog() {
   // SandboxSelection (off / Seatbelt's 3 modes / docker) rather than a
   // separate mode + engine - see SandboxPicker.tsx.
   const [selection, setSelection] = useState<SandboxSelection>("off");
+  // YOLO for THIS task, seeded on open from the project's default, then the
+  // app-wide one (Settings → Sandbox). Unlike the sandbox picker it does NOT
+  // remember the last pick: that habit is not scoped to a project, so ticking
+  // it once in a trusted repo would pre-tick it in the next untrusted one.
+  // What gets SENT is `yoloForCreate` (off for a caged task or a non-agent).
+  const [yolo, setYolo] = useState(false);
+  // Set when the default said YOLO but the first message was written by
+  // someone else (a deep link's `prompt`, or a picked issue), so the box
+  // starts unticked and the hint says why. docs/ipc.md's deep-link model is
+  // that a human reads the form before Create because whoever can edit the
+  // ticket controls that text; skipping the agent's prompts on it would turn
+  // "reads the form" into "approves every command the text talks it into".
+  // Cleared the moment the user ticks or unticks the box themselves.
+  const [yoloHeld, setYoloHeld] = useState<"link" | "issue" | null>(null);
+  // The resolved default at open, for "blank task instead": once the issue's
+  // text is cleared out of the box, nothing foreign is left and it applies.
+  const yoloDefaultRef = useRef(false);
   // Sandbox is macOS-only. On unsupported platforms, disable every
   // Seatbelt card except Off so we never save a mode that would only fail
   // later at spawn.
@@ -216,6 +235,12 @@ export function NewTaskDialog() {
   // Derived: Seatbelt cage on (Docker is its own separate flag below).
   // Drives the 2-column layout + "send lists" gating.
   const sandbox = !dockerWanted && sandboxMode !== "off" && canSandbox;
+  // YOLO is moot inside a cage (spawn turns it on, `isTaskCaged`) and has no
+  // meaning when the default tab is not an agent, so the checkbox shows the
+  // first as "auto" and hides for the second.
+  const yoloCaged = isTaskCaged({ sandbox_mode: sandboxMode, docker_sandbox_enabled: dockerWanted });
+  const yoloApplies = !isTerminalCli(cli);
+  const yoloArg = yoloForCreate(yolo, selection, yoloApplies);
   // Import mode (issue #5): instead of branching a fresh worktree, adopt
   // one that already exists on disk. Only offered for single-repo git
   // projects (multi composition / non-git folders don't apply). When on,
@@ -238,6 +263,16 @@ export function NewTaskDialog() {
   const [issueLoading, setIssueLoading] = useState(false);
   const [issueSelected, setIssueSelected] = useState<ForgeIssue | null>(null);
   const [issueQuery, setIssueQuery] = useState("");
+  // Existing-branch mode: check out a branch that already exists (typically
+  // someone else's, to review it) into a new worktree instead of cutting one.
+  // Same shape as import mode: a picker replaces the branch field, and the
+  // task-type toggle goes because the answer is always a worktree.
+  // `checkoutBranch` is its own state rather than `branch`, so the
+  // name-to-branch derive effect below can never overwrite a picked branch.
+  const [checkoutMode, setCheckoutMode] = useState(false);
+  const [checkoutBranch, setCheckoutBranch] = useState("");
+  const [checkoutRefs, setCheckoutRefs] = useState<BranchContext | null>(null);
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
   // Resume-args override, set at create so it applies from the FIRST spawn.
   // Exactly the field the task menu's "Resume override" edits
   // (Task.resume_override, task_set_resume_override): same storage, same
@@ -432,6 +467,11 @@ export function NewTaskDialog() {
       p?.default_sandbox_mode ?? (p?.default_sandbox ? "enforce" : null);
     const globalDefault = usePrefs.getState().globalDefaultSandboxKind;
     setSelection(readLastSandbox() ?? projectDefaultSandbox ?? globalDefault);
+    const yoloDefault = projectYoloDefault(p, usePrefs.getState().defaultYolo);
+    yoloDefaultRef.current = yoloDefault;
+    const promptFromLink = !!seed?.prompt;
+    setYolo(yoloDefault && !promptFromLink);
+    setYoloHeld(yoloDefault && promptFromLink ? "link" : null);
     // Seed with project's lists immediately; once Settings loads,
     // merge global defaults on top (dedupe-preserving order).
     setSbRw((p?.sandbox_rw_paths ?? []).join("\n"));
@@ -503,6 +543,12 @@ export function NewTaskDialog() {
     setIssueMode(false);
     setIssueSelected(null);
     setIssueLookup(null);
+    // Existing-branch mode is per-open too, like issue mode beside it: a
+    // branch picked for one project must not survive into the next open.
+    setCheckoutMode(false);
+    setCheckoutBranch("");
+    setCheckoutRefs(null);
+    setCheckoutLoading(false);
     // A seed can ask to open straight into the issue picker (the palette's
     // "New task from an issue…" row routes through the project picker and
     // arrives here). Only where issues are a thing at all - `canImp` is the
@@ -574,6 +620,7 @@ export function NewTaskDialog() {
   function enterImport() {
     if (!projectId) return;
     setImportMode(true);
+    setCheckoutMode(false);
     setErr(null);
     if (importList.length === 0 && !importLoading) loadImportable(projectId);
   }
@@ -605,6 +652,30 @@ export function NewTaskDialog() {
     seedPromptWhenReady(taskId, prompt.trim(), SETUP_SPAWN_DEADLINE_MS);
   }
 
+  /** Flip into existing-branch mode. Re-reads the repo's branches on every
+   *  entry (local git, no network), so one fetched since the dialog opened
+   *  shows up. A branch this repo has never fetched is simply typed: Rust
+   *  fetches it on create (`checkout_existing_branch`). */
+  function enterCheckout() {
+    if (!projectId) return;
+    setCheckoutMode(true);
+    setImportMode(false);
+    setImportSelected(null);
+    if (issueMode) exitIssues();
+    setErr(null);
+    setCheckoutLoading(true);
+    projectBranchContext(projectId)
+      .then(setCheckoutRefs)
+      .catch(e => setErr(String(e)))
+      .finally(() => setCheckoutLoading(false));
+  }
+
+  function exitCheckout() {
+    setCheckoutMode(false);
+    setCheckoutBranch("");
+    setErr(null);
+  }
+
   // Adopt an existing worktree. No worktree-add / file-copy / setup
   // script, so this skips the streaming phases entirely.
   /** Flip into issue mode and fetch. Re-fetches on every entry so a freshly
@@ -612,6 +683,7 @@ export function NewTaskDialog() {
   function enterIssues() {
     setIssueMode(true);
     setImportMode(false);
+    setCheckoutMode(false);
     setErr(null);
     if (!projectId) return;
     setIssueLoading(true);
@@ -648,6 +720,26 @@ export function NewTaskDialog() {
     );
   }, [issueLookup, issueQuery]);
 
+  // The picker's rows, filtered by what is typed. Local git only, so this is
+  // cheap; the cap in branchChoices is what keeps a repo with thousands of
+  // remote refs from rendering thousands of buttons.
+  const checkoutView = useMemo(
+    () => (checkoutRefs ? branchChoices(checkoutRefs, checkoutBranch) : null),
+    [checkoutRefs, checkoutBranch],
+  );
+  // Memoized with the rows: both walk every remote ref, and this dialog
+  // re-renders on each keystroke in ANY field.
+  const checkoutRemotes = useMemo(() => (checkoutRefs ? remoteNames(checkoutRefs) : []), [checkoutRefs]);
+  const checkoutUnfetched = useMemo(
+    () => !!checkoutRefs && !!checkoutBranch.trim() && !isKnownBranch(checkoutRefs, checkoutBranch),
+    [checkoutRefs, checkoutBranch],
+  );
+  // The task name a checkout gets when Name is left blank: the branch minus
+  // its remote, the same default `termic new --checkout` uses. Shown as the
+  // Name field's placeholder, so the default is visible before Create.
+  const checkoutName = checkoutTaskName(checkoutBranch, checkoutRemotes);
+  const effectiveName = checkoutMode ? (name.trim() || checkoutName) : name.trim();
+
   function exitIssues() {
     setIssueMode(false);
     // Drop the composed prompt with it. The name and branch survive because
@@ -655,6 +747,10 @@ export function NewTaskDialog() {
     // opens "GitHub issue #266:" is actively wrong on a task that is no longer
     // about that issue, and "blank task instead" says what it clears.
     if (issueSelected) setPrompt("");
+    // The issue's text just left the box, so the reason YOLO stepped back
+    // left with it (see `yoloHeld`). Not e2e-covered: picking an issue needs
+    // a real forge, which the fixture repo is not.
+    if (yoloHeld === "issue") { setYolo(yoloDefaultRef.current); setYoloHeld(null); }
     setIssueSelected(null);
     setErr(null);
   }
@@ -677,6 +773,11 @@ export function NewTaskDialog() {
     // and picking a second issue has to replace the first one's prompt or the
     // agent gets handed two.
     setPrompt(buildIssuePrompt(issue, MAX_PROMPT_CHARS));
+    // The issue's author wrote that prompt, so a YOLO default steps back
+    // (see `yoloHeld`). A box the user ticked themselves steps back too: the
+    // text it was ticked for has just been replaced. One already held for a
+    // link now says "the issue", since that is whose text is in the box.
+    if (yolo || yoloHeld) { setYolo(false); setYoloHeld("issue"); }
     setErr(null);
   }
 
@@ -698,6 +799,7 @@ export function NewTaskDialog() {
         // the agent switches to one with nothing to resume, but the typed
         // value would otherwise still ride along.
         resumeOverrideArg(),
+        yoloArg,
       ));
       await loadAll();
       setActive(w.id);
@@ -732,6 +834,8 @@ export function NewTaskDialog() {
         undefined,
         undefined, // no externally-started session id from this dialog
         resumeOverrideArg(),
+        undefined, // no agent args from this dialog
+        yoloArg,
       ));
       await loadAll();
       setActive(w.id);
@@ -764,7 +868,8 @@ export function NewTaskDialog() {
     // task the sidebar quick menu's Main checkout creates, so the two entry
     // points can't drift into different task shapes.
     if (mode === "repo_root") { submitRepoRoot(); return; }
-    if (!projectId || !name.trim() || !branch.trim()) return;
+    const taskBranch = checkoutMode ? checkoutBranch.trim() : branch.trim();
+    if (!projectId || !effectiveName || !taskBranch) return;
     if (submittingRef.current) return;
     submittingRef.current = true;
     const taskId = crypto.randomUUID();
@@ -793,7 +898,7 @@ export function NewTaskDialog() {
     // this IS the fix for GH #242 (worktree creation no longer locks the
     // whole window behind a modal). The dialog closes on the next line;
     // CreatingTaskPane (MainArea) and PendingTaskRow (Sidebar) take over.
-    pendingAdd({ id: taskId, projectId, name: name.trim(), cli });
+    pendingAdd({ id: taskId, projectId, name: effectiveName, cli });
     setActive(taskId);
     close();
     try {
@@ -825,15 +930,20 @@ export function NewTaskDialog() {
           docker_sandbox_enabled: dockerWanted,
           docker_extra_mounts:    dockerWanted ? splitLines(dockerMounts) : undefined,
           resume_override: resumeOverrideArg(),
+          yolo: yoloArg,
         }));
       } else {
         await withCreateLock(() => taskCreate({
           id: taskId,
           project_id: projectId,
-          name: name.trim(),
+          name: effectiveName,
           cli,
           base_branch: base.trim() || null,
-          branch: branch.trim(),
+          branch: taskBranch,
+          // Existing-branch mode: Rust checks the branch out as it is and
+          // never cuts a new one, so an unknown name fails here instead of
+          // becoming a fresh branch off the base.
+          checkout_existing: checkoutMode || undefined,
           // Capability-gated like import: the field hides when the agent has
           // nothing to resume, but typed state would otherwise ride along.
           resume_override: resumeOverrideArg(),
@@ -845,6 +955,7 @@ export function NewTaskDialog() {
           sandbox_allowed_hosts:  sandbox ? splitLines(sbHosts) : undefined,
           docker_sandbox_enabled: dockerWanted,
           docker_extra_mounts:    dockerWanted ? splitLines(dockerMounts) : undefined,
+          yolo: yoloArg,
         }));
       }
       await loadAll();
@@ -885,7 +996,9 @@ export function NewTaskDialog() {
         ? (mode === "repo_root" ? t("newTask.titleMultiRoot") : t("newTask.titleMulti"))
         : importMode
           ? t("newTask.titleImport")
-          : mode === "repo_root" ? t("newTask.titleRoot") : t("newTask.titleWorktree")}
+          : checkoutMode
+            ? t("newTask.titleCheckout")
+            : mode === "repo_root" ? t("newTask.titleRoot") : t("newTask.titleWorktree")}
       description={undefined}
       // The four mode switches ride the title line rather than each taking a
       // `gap-4` form row. They are chrome - "make this a different KIND of
@@ -898,11 +1011,27 @@ export function NewTaskDialog() {
           {/* Import (issue #5): adopt a worktree that already exists on disk
               instead of branching a fresh one. Only offered when there is
               actually something to adopt, hence the count. */}
-          {canImport && !importMode && mode === "worktree" && importList.length > 0 && (
+          {canImport && !importMode && !checkoutMode && mode === "worktree" && importList.length > 0 && (
             <button type="button" onClick={enterImport} {...dialogTitleAction}>
               <FolderGit2 className="h-3.5 w-3.5" />
               {t("newTask.importAction")}
               <span className="text-[var(--color-fg-faint)]">({importList.length})</span>
+            </button>
+          )}
+          {/* Check out a branch that already exists (a colleague's, to
+              review it) instead of cutting a new one. Worktree mode only,
+              like import: the point is a separate folder for a separate
+              agent. */}
+          {canImport && !importMode && !checkoutMode && mode === "worktree" && (
+            <button type="button" data-testid="checkout-branch-toggle" onClick={enterCheckout} {...dialogTitleAction}>
+              <GitBranch className="h-3.5 w-3.5" />
+              Existing branch
+            </button>
+          )}
+          {checkoutMode && (
+            <button type="button" data-testid="checkout-branch-exit" onClick={exitCheckout} {...dialogTitleAction}>
+              <Plus className="h-3.5 w-3.5" />
+              New branch instead
             </button>
           )}
           {/* Start from an issue. Only for repos actually hosted on a forge
@@ -910,7 +1039,7 @@ export function NewTaskDialog() {
               gh/glab can reach). Doubles as the discovery point for the CLIs:
               a GitHub repo whose owner has never installed gh still sees the
               entry and learns what it would buy them. */}
-          {canIssues && forgeProvider && !issueMode && !importMode && (
+          {canIssues && forgeProvider && !issueMode && !importMode && !checkoutMode && (
             <button type="button" onClick={enterIssues} {...dialogTitleAction}>
               <CircleDot className="h-3.5 w-3.5" />
               {t("newTask.fromIssue", { forge: forgeProvider === "gitlab" ? "GitLab" : "GitHub" })}
@@ -956,8 +1085,8 @@ export function NewTaskDialog() {
         issueMode && sandbox
           ? "max-w-[107rem]"
           : issueMode || sandbox
-            ? (isMulti ? "max-w-[95.5rem]" : importMode ? "max-w-[83.5rem]" : "max-w-[71.5rem]")
-            : (isMulti ? "max-w-3xl" : importMode ? "max-w-2xl" : "max-w-xl")
+            ? (isMulti ? "max-w-[95.5rem]" : importMode || checkoutMode ? "max-w-[83.5rem]" : "max-w-[71.5rem]")
+            : (isMulti ? "max-w-3xl" : importMode || checkoutMode ? "max-w-2xl" : "max-w-xl")
       }
       // A long worktree form (sandbox panel, multi-repo members, …) can
       // exceed the viewport — pin Cancel/Create to the bottom instead of
@@ -972,7 +1101,7 @@ export function NewTaskDialog() {
               variant="primary"
               type="submit"
               form="new-task-form"
-              disabled={busy || !name.trim() || (mode === "repo_root" ? false : importMode ? !importSelected : !branch.trim())}
+              disabled={busy || !effectiveName || (mode === "repo_root" ? false : importMode ? !importSelected : checkoutMode ? !checkoutBranch.trim() : !branch.trim())}
             >
               {importMode ? t("newTask.import") : t("common:create")}
             </Button>
@@ -1044,7 +1173,7 @@ export function NewTaskDialog() {
             (and, for multi, the per-member list: every member runs live) and
             creates in the repo's live checkout. Non-git projects can't
             worktree, so the Worktree button is disabled there. */}
-        {!importMode && (
+        {!importMode && !checkoutMode && (
           <div className="flex flex-col gap-1.5">
             {/* Label + toggle share one row (not label-above-control like
                 every other Field) — this is the field people re-adjust most
@@ -1100,14 +1229,79 @@ export function NewTaskDialog() {
             naming) follows as its own field, not folded into this group. */}
         <div className="flex flex-col gap-2">
           <Field label={t("newTask.nameLabel")}>
-            <Input value={name} onChange={e => setName(e.target.value)} placeholder={t("newTask.namePlaceholder")} autoFocus required />
+            {/* A checkout's name may stay blank: it defaults to the branch,
+                shown here as the placeholder, as `termic new --checkout`
+                does. */}
+            <Input
+              data-testid="new-task-name"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder={checkoutMode && checkoutName ? checkoutName : t("newTask.namePlaceholder")}
+              autoFocus
+              required={!checkoutMode}
+            />
           </Field>
 
           {!importMode && mode === "worktree" && (<>
-          {/* Always editable. Auto-fills as “feature/<name>” while you type
+          {checkoutMode ? (
+          // The branch to check out: typed, or picked from the repo's own
+          // refs. The typed text is the value (the rows only fill it in), so
+          // a branch this repo has never fetched is still one keystroke away.
+          <Field label="Branch" hint="A local branch, or one on a remote. A remote branch gets a local branch that tracks it.">
+            <div className="flex flex-col gap-1.5">
+              <Input
+                data-testid="checkout-branch-input"
+                value={checkoutBranch}
+                onChange={e => setCheckoutBranch(e.target.value)}
+                placeholder="origin/alice/fix-login"
+                autoFocus
+              />
+              {checkoutLoading ? (
+                <div className="flex items-center gap-2 px-1 py-2 text-[12.5px] text-[var(--color-fg-faint)]">
+                  <Loader2 className="h-4 w-4 animate-spin text-[var(--color-accent)]" /> Reading branches…
+                </div>
+              ) : checkoutView && checkoutView.choices.length > 0 ? (
+                <div data-testid="checkout-branch-list" className="max-h-[200px] overflow-auto rounded-md border border-[var(--color-border-soft)]">
+                  {checkoutView.choices.map(c => {
+                    const picked = checkoutBranch.trim() === c.ref;
+                    return (
+                      <button
+                        key={c.ref}
+                        type="button"
+                        data-branch-ref={c.ref}
+                        onClick={() => setCheckoutBranch(c.ref)}
+                        title={c.ref}
+                        className={cn(
+                          "flex w-full items-center gap-2.5 border-b border-[var(--color-border-soft)] px-3 py-1.5 text-left last:border-b-0 hover:bg-[var(--color-hover)]",
+                          picked && "bg-[var(--color-accent-deep)]/10",
+                        )}
+                      >
+                        <GitBranch className={cn("h-3.5 w-3.5 shrink-0", picked ? "text-[var(--color-accent)]" : "text-[var(--color-fg-faint)]")} />
+                        <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-[var(--color-fg)]">{c.ref}</span>
+                        <span className="shrink-0 text-[11px] text-[var(--color-fg-faint)]">{c.source}</span>
+                        {picked && <Check className="h-4 w-4 shrink-0 text-[var(--color-accent)]" />}
+                      </button>
+                    );
+                  })}
+                  {checkoutView.truncated && (
+                    <div className="px-3 py-1.5 text-[11.5px] text-[var(--color-fg-faint)]">
+                      Showing the first {BRANCH_CHOICES_MAX}. Type to narrow.
+                    </div>
+                  )}
+                </div>
+              ) : null}
+              {checkoutUnfetched && (
+                <p data-testid="checkout-branch-unfetched" className="text-[11.5px] text-[var(--color-fg-dim)]">
+                  Not fetched yet. Termic will look for it on the remote when you create the task.
+                </p>
+              )}
+            </div>
+          </Field>
+          ) : (
+          /* Always editable. Auto-fills as “feature/<name>” while you type
               the name, then stops the moment you touch it, so pasting a
               branch from Linear (“username/my-feature”) is a true one-shot:
-              select all, paste, done. No prefix control to fight (#15). */}
+              select all, paste, done. No prefix control to fight (#15). */
           <FieldInline label={t("newTask.branchName")} hint={t("newTask.branchNameHint")}>
             <div className="flex flex-col gap-1">
               <Input
@@ -1128,6 +1322,7 @@ export function NewTaskDialog() {
               )}
             </div>
           </FieldInline>
+          )}
 
           {/* The multi-repo host variant's hint is a full sentence (members
               fall back separately) — too long for FieldInline's one line,
@@ -1145,7 +1340,12 @@ export function NewTaskDialog() {
             </Field>
             )
           ) : (
-            <FieldInline label={t("newTask.branchFrom")} hint={t("newTask.branchFromHint")}>
+            // A checkout cuts nothing, so here the base only decides what the
+            // diff pane compares the branch against.
+            <FieldInline
+              label={checkoutMode ? t("newTask.compareAgainst") : t("newTask.branchFrom")}
+              hint={checkoutMode ? t("newTask.compareAgainstHint") : t("newTask.branchFromHint")}
+            >
               <div className="flex flex-col gap-1">
                 <Input
                   value={base}
@@ -1428,6 +1628,47 @@ export function NewTaskDialog() {
             </div>
           )}
         </Field>
+        )}
+
+        {/* YOLO, seeded from the defaults (this project's, then Settings →
+            Sandbox) and shown BEFORE Create, so a default is never a silent
+            auto-approve on an uncaged task. The same two states as the Race
+            dialog's checkbox: live and red when the agent would run uncaged,
+            disabled "auto" when the cage already turns it on. */}
+        {yoloApplies && (
+          <Field
+            label="YOLO"
+            hint={yoloCaged
+              ? "Auto-on: the sandbox is the boundary, so the agent's own prompts are skipped."
+              : !yolo && yoloHeld
+                ? `Off for this task: the first message came from ${yoloHeld === "link" ? "a link" : "the issue"}, so someone else wrote it. Tick it if you trust the text.`
+                : yolo
+                ? "Nothing cages the agent: it runs every command without asking. Change it later from the task menu."
+                : "The agent asks before running commands. The default is set in Settings → Sandbox."}
+          >
+            <label
+              data-testid="new-task-yolo"
+              data-yolo-state={yoloCaged ? "auto" : yolo ? "on" : "off"}
+              data-yolo-held={yoloHeld ?? undefined}
+              className={cn(
+                "flex w-fit items-center gap-2 text-[13px] select-none",
+                yoloCaged
+                  ? "cursor-default text-[var(--color-fg-faint)]"
+                  : "cursor-pointer text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
+                !yoloCaged && yolo && "text-[var(--color-err)] hover:text-[var(--color-err)]",
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={yoloCaged || yolo}
+                disabled={yoloCaged}
+                onChange={e => { setYolo(e.target.checked); setYoloHeld(null); }}
+                className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded border-[var(--color-border)] bg-[var(--color-bg-2)] text-[var(--color-accent)] focus:ring-0 focus:ring-offset-0 disabled:cursor-default"
+              />
+              <Zap className="h-3.5 w-3.5 shrink-0" fill={yoloCaged || yolo ? "currentColor" : "none"} />
+              {yoloCaged ? "Auto-on inside the sandbox" : "Skip permission prompts"}
+            </label>
+          </Field>
         )}
       </div>
 

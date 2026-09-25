@@ -42,6 +42,7 @@ import * as ipc from "@/lib/ipc";
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { newScratchTab, restoreScratchTabs } from "@/lib/scratchTabs";
+import { padHandler } from "@/lib/scratchCli";
 import { requestCloseTab, requestCloseTabs } from "@/lib/closeTab";
 import type { ScratchTab } from "@/lib/types";
 
@@ -242,5 +243,59 @@ describe("promoting a pad", () => {
     // rewrite that would clobber the name.
     useApp.getState().promoteScratchTab(TASK, pad.id, "other.md");
     expect((useApp.getState().tabs[TASK] ?? [])[0]).toMatchObject({ path: "notes.md" });
+  });
+});
+
+
+// An agent's pad writes (CLI / MCP, via padHandler) mark the pad unseen when
+// the user is not looking at it, and showing the tab clears the mark. The
+// user's own typing never goes through padHandler, so it never marks.
+describe("a pad an agent writes while you are elsewhere", () => {
+  const TERM = "term-1";
+  beforeEach(() => {
+    useApp.setState({
+      activeTaskId: TASK,
+      tabs: { [TASK]: [{ id: TERM, type: "terminal", title: "claude", cli: "claude" } as never] },
+      activeTab: { [TASK]: TERM },
+    });
+    useUI.setState({ windowFocused: true, windowless: false });
+  });
+  const padTab = () => pads()[0];
+  const record = (id: string, title: string) =>
+    vi.mocked(ipc.scratchList).mockResolvedValue([{ id, title } as never]);
+
+  it("marks a pad the agent creates behind your back, and showing it clears the mark", async () => {
+    const { pads: [info] } = await padHandler({ taskId: TASK, op: "new", title: "findings", content: "x" });
+    expect(padTab().unseen).toBe(true);
+    expect(useApp.getState().activeTab[TASK]).toBe(TERM); // no focus stolen
+    record(info.id, "findings");
+    useApp.getState().setActiveTabId(TASK, padTab().id);
+    expect(padTab().unseen).toBe(false);
+  });
+
+  it("marks a write to a pad you are not on, and leaves one you are watching alone", async () => {
+    const { pads: [info] } = await padHandler({ taskId: TASK, op: "new", title: "log", content: "" });
+    record(info.id, "log");
+    useApp.getState().setActiveTabId(TASK, padTab().id);
+    // On screen in a focused window: the user sees it land, no mark.
+    await padHandler({ taskId: TASK, op: "write", pad: info.id, content: "a", append: true });
+    expect(padTab().unseen).toBe(false);
+    // Same tab, but the user is in another app: marked.
+    useUI.setState({ windowFocused: false });
+    await padHandler({ taskId: TASK, op: "write", pad: info.id, content: "b", append: true });
+    expect(padTab().unseen).toBe(true);
+    // Away on another tab: still marked, and an extra write does not churn
+    // the store (bail when already marked).
+    useUI.setState({ windowFocused: true });
+    useApp.getState().setActiveTabId(TASK, TERM);
+    useApp.getState().patchTab(TASK, padTab().id, { unseen: true });
+    const before = useApp.getState().tabs;
+    await padHandler({ taskId: TASK, op: "write", pad: info.id, content: "c", append: true });
+    expect(useApp.getState().tabs).toBe(before);
+  });
+
+  it("is not agent news: it never sets unread, which feeds notifications", async () => {
+    await padHandler({ taskId: TASK, op: "new", title: "quiet", content: "x" });
+    expect(padTab().unread ?? null).toBeNull();
   });
 });

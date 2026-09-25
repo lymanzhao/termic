@@ -79,6 +79,45 @@ than being pinned to the tail.
 Rows carry `data-launcher-cli="<id>"` so tests can assert the order by id
 instead of by display name.
 
+## The project row's task filter
+
+The project header's hover bar carries a filter icon, left of the
+settings cog (`sidebar/ProjectTaskFilter.tsx`, GH #324). It opens a bar
+on its OWN line under the header, full width: a text input and a bell.
+Inline in the header, the input left a long project name almost no room.
+The bell keeps only tasks with a notification and shows how many there
+are. Both AND, per project, in
+`useUI.taskFilters`, never persisted. The matching is a pure function of
+store state (`lib/taskFilter.ts`, unit-tested) evaluated at render, so a
+CLI rename or a notification arriving moves a row with no extra wiring.
+
+- **Text matches the task name and each terminal tab's STABLE title**
+  (the user's rename, else the default), never `liveTitle`. Agents
+  rewrite their OSC title every second, and matching on it made rows
+  flap in and out of the list. A task whose tabs are not loaded falls
+  back to `persisted_tabs`, titled the way a restore would title them.
+- **"Notification" is the tray's classification**, via the shared
+  `aggregateTabsState` (`lib/cliAgentState.ts`): waiting or done, with
+  working outranking both. The per-project counts therefore add up to
+  the tray numeral; a second definition would make the two disagree.
+- **The active task is always listed.** Opening a task clears its
+  notification, so under the bell the row just clicked would vanish
+  from under the cursor. It drops out once another task is selected.
+  "No matching tasks" appears only when the list is empty: printed
+  under the kept active row, it read as a contradiction.
+- **Turning a filter on expands the project once**, through the normal
+  collapse state: a filter whose results sit behind a chevron reads as
+  "nothing matched". Once, not for as long as it is on: forcing it open
+  at render made the chevron dead while a filter was up.
+- **The header holds one filter icon**, lit while any filter (text or
+  bell) is on. It opens a bar under the header: the input, then the bell
+  with its count. An active filter keeps its bar and pins the header's
+  controls; an empty, abandoned bar folds away. A filter whose results sit behind a chevron reads as
+  "nothing matched", and the stored collapse is left untouched so
+  clearing the filter folds it back.
+- Escape in the input and its clear button both empty it. The feature
+  is absent in compact mode.
+
 ## Run state in the sidebar
 
 A run tab's controls live in its tab pill (restart + a red Stop while the PTY
@@ -170,6 +209,87 @@ whose Rust contract is same-project ids) and drop on the Archived column
 (shared `confirmAndArchive`, so the confirm dialog, delete-branch checkbox,
 open-PR warning and spinner come with it). Every other drop snaps back with
 no write. Restore stays in History; the Archived column links there.
+
+## Task groups in the sidebar
+
+When an agent inside task A creates task B (`termic new`, or MCP `task_new`),
+both land in one group led by A. The agent can name and colour the group itself: `termic group --name
+... --color ...` (MCP `task_group`); the `new` reply prints the group it
+joined and `TERMIC_CLI_HELP` teaches the verb, so an agent finds it
+without being told. The CLI reads
+`$TERMIC_TASK_ID` itself, so an agent gets grouping without being told
+about it; `--no-group` opts out. MCP gets the same id from the
+`X-Termic-Task` header the installed headers helper sends from the
+agent's environment, so its `task_new` groups the same way (an explicit
+`parentTask` overrides it). A worker that orchestrates in turn adds to
+the ROOT group: groups are flat on purpose, since a tree in a 260px
+sidebar is unreadable and "these belong to one job" is the question.
+
+Drawing (`src/lib/taskGroups.ts`, `TaskGroupBlock.tsx`): a group is one
+contiguous block at its FIRST member's position, a caption row in the
+group's accent (name, member count) above a 2px rail of the same colour.
+The caption copies a task row's box model, so its icon sits in the loose
+rows' chevron column and its label in their name column; the rail is the
+members wrapper's left border, under the icon's centre, and members sit
+18px in, the step a project folder gives its members. All four are
+asserted by measurement in the e2e spec, since "a few px off" is exactly
+what a screenshot cannot settle. The rename input inherits the caption's
+font and has no padding or border (its outline is outside the box), so
+entering rename moves no text.
+A group exists while any live task carries it, one member included, the
+same rule as a project folder; a group spanning two projects draws its
+share in each. The label is the group's own name or,
+unnamed, the lead's live name, so renaming the orchestrator renames the
+group until someone names it. Founding colours skip red first (`blue`,
+`teal`, ... `red` last): a red caption on a fresh group reads as an error.
+
+Editing: right-click the caption for the swatch row, Rename group and
+Ungroup tasks (the project-folder menu body, `GroupActionsMenuItems`).
+A task row's menu has Move to group, the project row's submenu for tasks:
+the project's groups (a check on the current one), New group (a group of
+just this task, whose caption opens its rename straight away) and Remove
+from group. Its group list is read from the store while the menu is open,
+not subscribed, so no row re-renders for a menu nobody has open. Dragging a row INTO a block
+joins it and OUT leaves it: during the drag the row wears whichever
+block the cursor is inside (header included), so the block grows and
+shrinks under it before anything is written, and the drop applies the
+change to the store in the same update the drag state clears in, so the
+row does not snap back to its old group for the IPC round-trip. No drag
+gesture creates a group (dropping on a row already means reorder); New
+group does.
+
+A click anywhere on the caption COLLAPSES / expands the group (it hovers like
+a task row), and a double-click renames. A double-click arrives as click(1),
+click(2), dblclick: the second click is ignored and the dblclick undoes the
+first one's toggle, so a rename leaves the group as it was, at the cost of a
+brief collapse flash during the gesture. The alternative, delaying every
+single click by the double-click window, makes every expand feel slow. The
+chevron in the icon slot is a button for the keyboard and shows the STORED
+collapse state, including while a filter is overriding it (see below); a
+drop after a block drag swallows its trailing click. Collapsed, the caption
+shows one of each mark any member's row would draw, in a fixed order
+(attention, done, partial, working, delegated), beside the member count:
+never just the most urgent, since "two finished and one needs you" is the
+point, and the count is what says tasks are tucked away rather than gone. Each member contributes exactly its row's own mark (`taskWorkBadge`
+plus the partial override), via `groupBadgeKinds`, so the caption cannot
+claim what the hidden rows would not. `setActiveTask` expands the group of
+the task it activates (every "go to task" route: click, cmd+1..9, the
+next-waiting jump, a notification), and a collapsed group still renders
+the ACTIVE task's row, which covers the routes that only preview a place
+(`previewPlace`, the ctrl+tab walk) without writing anything. A project's task FILTER
+shows its matches even inside a collapsed group, and a group with no match is
+not drawn; the chevron keeps showing the stored state meanwhile, so a click
+while filtering visibly collapses instead of storing a collapse nobody sees
+(which then snapped the group shut when the filter cleared). Joining a
+collapsed group by drag or Move to group opens it, so the task you placed
+stays in view. The icon rail ignores collapse: it has no caption to expand
+from. State is `collapsedTaskGroups` in localStorage, keyed by group id,
+pruned in `loadAll`.
+
+Dragging the CAPTION moves the whole block within its project, the task
+twin of the project-folder drag: it hit-tests only top-level items (loose
+rows and other blocks), moves the members through the store as one run,
+and writes the display order through `task_reorder` on drop.
 
 ## What a task is called (name vs branch)
 
@@ -293,6 +413,49 @@ read live, so editing it there changes every future issue task
 A plain shell or registry terminal has no prompt box, so the composed prompt has
 nowhere to go: the column says so at the point the issue was chosen rather than
 letting Create drop it silently.
+
+## Checking out an existing branch
+
+For reviewing or continuing someone else's branch in its own folder, beside
+whatever the main checkout is doing. The "Existing branch" switch on the New
+Task title line (worktree mode, single-repo git projects, the same gate as
+"Import a worktree") and `termic new --checkout <branch>` both send
+`task_create` with `checkout_existing: true`, and Rust's
+`checkout_existing_branch` (lib.rs) decides what that means:
+
+- a **local** branch is used as it is, even when the remote one has moved on:
+  it may hold your own commits, and a checkout must not move it;
+- otherwise the branch is looked up on the remote, taking `origin/alice/fix`
+  or a bare `alice/fix` (the default remote). It is **fetched** first when
+  "fetch before create" is on, so a branch pushed since your last fetch works,
+  then gets a local branch **tracking** it, which is what `git checkout` DWIMs
+  to and what makes push and pull on it reach their branch;
+- an unknown name is an **error**. It never falls through to the new-branch
+  path, which is the whole reason the mode exists: typing a remote-only branch
+  into the ordinary "Branch name" field makes `rev-parse --verify` miss it and
+  cuts a fresh branch of that name from main, so an agent reviews main under
+  the colleague's branch name and nothing says so.
+
+"Branch from" becomes "Compare against" in this mode: nothing is cut from it,
+so it only sets `Task.base_branch`, the ref the diff pane compares against. A
+typed one has to resolve, like `--base` on the new-branch path, or the diff
+would quietly fall back to HEAD.
+
+The picker lists `project_branch_context` (local git, no network): local
+branches, then remote ones whose name is not already local, capped at
+`BRANCH_CHOICES_MAX` rows (`src/lib/existingBranch.ts`). The typed text is the
+value and the rows only fill it in, so a branch nobody has fetched yet is still
+one keystroke away, and the field says it will be fetched. Name may stay
+blank: it defaults to the branch minus its remote, shown as the placeholder.
+
+**Restore remembers it was a checkout.** The task records
+`checkout_existing`, and `ensure_restore_branch` reads it when archive deleted
+the local branch (Settings > Tasks > "Delete the branch when archiving", off
+by default): a checkout's branch comes back from the remote, fetched and
+tracked like the first time, while a task's own branch is still cut from its
+base. Without the flag, restoring such a task used to give a fresh branch off
+main under the colleague's name. If the remote no longer has the branch
+either, restore fails with an error instead of doing that.
 
 ## Title bar contents, and what moved out of it
 
@@ -479,6 +642,17 @@ reading that survives the fact that the tabs before it are already gone.
 `confirmBulkClose` therefore counts dirty FILES and live agents only, and a set
 of nothing but pads skips it entirely rather than stacking two dialogs on one
 decision.
+
+A pad an AGENT creates or writes (`termic scratchpad`, MCP `scratchpad_*`)
+while it is not on screen in a focused window gets `ScratchTab.unseen`: a
+hollow ring in the done colour on its tab, in place of the grey dirty dot a
+pad always carries (a pad is dirty for its whole life, so that dot says
+nothing). Showing the tab clears it, by click or by `useSeenWhenWatched` when
+you come back to a window where it is already in front. It is its own field,
+not `unread`, because `unread` is agent news: the OS notifier and the
+sidebar's work badges read it, and a pad edit must reach neither. The user's
+own typing goes through the editor, never through `padHandler`, so it never
+marks. A pad with no open tab has nowhere to show the mark.
 
 ## Close vs Quit (windowless mode)
 

@@ -288,6 +288,88 @@ describe("termic:// deep links", () => {
   });
 });
 
+// A YOLO default is for prompts the user wrote. A link's prompt was written by
+// whoever could edit the ticket, and the whole model above is that a human
+// reads it before Create; with the agent's own prompts skipped, reading it
+// would be the last check before every command it talks the agent into. So
+// the dialog starts unticked and says why, and the user can still tick it. A
+// link with no prompt carries nothing foreign, so the default applies.
+describe("termic:// deep links and the YOLO default", () => {
+  let projectName: string;
+  let prev = false;
+
+  /** The YOLO control as the user sees it, or null when not rendered. */
+  const yolo = () =>
+    browser.execute((sel) => {
+      const dlg = document.querySelector(sel)?.closest('[role="dialog"]');
+      const el = dlg?.querySelector('[data-testid="new-task-yolo"]');
+      if (!el) return null;
+      return {
+        state: el.getAttribute("data-yolo-state"),
+        held: el.getAttribute("data-yolo-held"),
+        // The Field's hint sits beside the control, inside the same wrapper.
+        hint: el.parentElement?.textContent ?? "",
+      };
+    }, NAME_INPUT);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    projectName = await browser.execute(
+      () =>
+        window.__termic!.useApp.getState().projects
+          .find((p: any) => p.name === "fixture-repo")!.name as string,
+    );
+    prev = await browser.execute(() => !!window.__termic!.usePrefs.getState().defaultYolo);
+    await browser.execute(() => window.__termic!.usePrefs.getState().setDefaultYolo(true));
+  });
+
+  afterEach(async () => {
+    await closeDialog();
+  });
+
+  after(async () => {
+    await browser.execute((v) => window.__termic!.usePrefs.getState().setDefaultYolo(v), prev);
+  });
+
+  it("starts unticked, and says why, when the link carries a prompt", async () => {
+    await openLink(
+      `termic://new?project=${projectName}&agent=fakeagent&name=yolo-link`
+        + `&p=${encodeURIComponent("text from a ticket")}`,
+    );
+    await waitVisible(NAME_INPUT);
+    const y = await yolo();
+    expect(y?.state).toBe("off");
+    expect(y?.held).toBe("link");
+    expect(y?.hint).toContain("came from a link");
+  });
+
+  it("still lets the user tick it", async () => {
+    await openLink(
+      `termic://new?project=${projectName}&agent=fakeagent&name=yolo-link-ticked`
+        + `&p=${encodeURIComponent("text from a ticket")}`,
+    );
+    await waitVisible(NAME_INPUT);
+    await browser.execute((sel) => {
+      const dlg = document.querySelector(sel)?.closest('[role="dialog"]');
+      (dlg?.querySelector('[data-testid="new-task-yolo"] input') as HTMLElement).click();
+    }, NAME_INPUT);
+    await browser.waitUntil(async () => (await yolo())?.state === "on", {
+      timeout: 5_000, timeoutMsg: "the YOLO box never ticked",
+    });
+    // The explanation goes once the choice is the user's own.
+    expect((await yolo())?.held).toBeNull();
+  });
+
+  it("applies the default to a link with no prompt", async () => {
+    await openLink(`termic://new?project=${projectName}&agent=fakeagent&name=yolo-no-prompt`);
+    await waitVisible(NAME_INPUT);
+    const y = await yolo();
+    expect(y?.state).toBe("on");
+    expect(y?.held).toBeNull();
+  });
+});
+
 describe("termic:// deep links — rejected links", () => {
   before(async () => {
     await waitForAppShell();

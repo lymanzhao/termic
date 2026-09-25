@@ -30,7 +30,7 @@ vi.mock("@/lib/archiveTask", () => ({
 
 import {
   usePr, newCommentsSince, commentPromptFor, watchTickNow, openPrArchiveWarning,
-  pollableTasks, prStatusPassNow,
+  pollableTasks, prStatusPassNow, initPrRefreshOnFocus, stopPrRefreshOnFocus,
 } from "@/store/pr";
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
@@ -687,5 +687,55 @@ describe("background status poller (#281)", () => {
 
     expect(usePr.getState().byTask["ws-bg-merge"].lookup?.pr?.state).toBe("merged");
     expect(archiveAndRefresh).toHaveBeenCalledWith("ws-bg-merge", false);
+  });
+});
+
+
+// A PR the agent opened from its own terminal has no identity on the task
+// yet, so the background tick skips it; focusing the task is what finds it.
+describe("refresh on focus", () => {
+  beforeEach(() => {
+    stopPrRefreshOnFocus();
+    vi.mocked(ipc.taskPrStatus).mockResolvedValue(lookupWith("open"));
+    useApp.setState({ activeTaskId: null });
+    useUI.setState({ windowFocused: true });
+  });
+
+  it("looks up the PR when a task becomes active, even with no identity yet", async () => {
+    seedApp();
+    initPrRefreshOnFocus();
+    useApp.setState({ activeTaskId: "ws1" });
+    await vi.waitFor(() => expect(usePr.getState().byTask.ws1?.lookup?.pr?.number).toBe(7));
+    expect(ipc.taskPrStatus).toHaveBeenCalledWith("ws1");
+    // ...and records the identity, so the background tick owns it from here.
+    expect(useApp.getState().tasks[0].pr_number).toBe(7);
+    stopPrRefreshOnFocus();
+  });
+
+  it("looks again when the window regains focus, within the 30s floor only once", async () => {
+    seedApp();
+    initPrRefreshOnFocus();
+    useApp.setState({ activeTaskId: "ws1" });
+    await vi.waitFor(() => expect(ipc.taskPrStatus).toHaveBeenCalledTimes(1));
+    useUI.setState({ windowFocused: false });
+    useUI.setState({ windowFocused: true });
+    await Promise.resolve();
+    // Inside the floor: no second subprocess however often you refocus.
+    expect(ipc.taskPrStatus).toHaveBeenCalledTimes(1);
+    // Past it: the refocus looks again.
+    usePr.setState({ byTask: { ws1: { ...usePr.getState().byTask.ws1, fetchedAt: 0 } } });
+    useUI.setState({ windowFocused: false });
+    useUI.setState({ windowFocused: true });
+    await vi.waitFor(() => expect(ipc.taskPrStatus).toHaveBeenCalledTimes(2));
+    stopPrRefreshOnFocus();
+  });
+
+  it("skips tasks a PR lookup means nothing for", async () => {
+    seedApp(undefined, { is_main_checkout: true });
+    initPrRefreshOnFocus();
+    useApp.setState({ activeTaskId: "ws1" });
+    await Promise.resolve();
+    expect(ipc.taskPrStatus).not.toHaveBeenCalled();
+    stopPrRefreshOnFocus();
   });
 });

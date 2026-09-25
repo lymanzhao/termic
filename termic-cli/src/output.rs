@@ -3,7 +3,7 @@
 //! CLI output.
 
 use serde::Serialize;
-use termic_proto::{
+use termic_proto::{GroupData, 
     send_mode, AgentsData, ApplyData, ArchiveData, DiffData, DiffStat, NewData, OpenData,
     ProjectInfo, ProjectRemoveData, PromptEntry, QuitData, RenameData, ResultData, SendData,
     StreamEvent, TabCloseData, TabData, TabStatus, TaskStatus, TaskSummary, WaitData, WaitOutcome,
@@ -216,6 +216,31 @@ pub fn new_created_text(t: &TaskSummary) -> String {
     }
     push("path:", t.path.clone());
     push("id:", t.id.clone());
+    // Say it out loud: an agent that does not know its tasks are grouped
+    // never names the group, and the user reads "grp-orchestrator" forever.
+    if let Some(g) = &t.group {
+        push("group:", format!("{} (name it: termic group --name \"...\")", g.name));
+    }
+    lines.join("\n")
+}
+
+/// `group`: the group in one block, or a line saying there is none and how
+/// one forms.
+pub fn group_text(d: &GroupData) -> String {
+    let Some(g) = &d.group else {
+        return format!(
+            "{} is in no task group (tasks it creates with `new` will form one; `group --name` names it now)",
+            d.task
+        );
+    };
+    let name = if g.named { format!("\"{}\"", g.name) } else { format!("\"{}\" (follows its lead task's name)", g.name) };
+    let mut lines = vec![format!("{}: task group {name}", d.task)];
+    if let Some(c) = &g.color {
+        lines.push(format!("  colour:  {c}"));
+    }
+    if !g.members.is_empty() {
+        lines.push(format!("  members: {}", g.members.join(", ")));
+    }
     lines.join("\n")
 }
 
@@ -744,6 +769,7 @@ mod tests {
             work_state: Some("working".into()),
             open_tabs: Some(2),
             diff: Some(DiffStat { files_changed: 3, insertions: 10, deletions: 2, untracked: 1 }),
+            group: None,
         }
     }
 

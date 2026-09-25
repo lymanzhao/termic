@@ -39,44 +39,31 @@ describe("cliFallbackCommand", () => {
 
 describe("buildAgentBriefing", () => {
   const block = buildAgentBriefing({ task, projectName: "termic", cli: "termic" });
+  const lines = block.split("\n");
+  const cmd = lines.find(l => l.trimStart().startsWith("termic send"))!;
 
-  it("is a short fragment, not a document", () => {
-    // It gets pasted INSIDE a larger prompt. The protocol lives in the CLI's
-    // own help ($TERMIC_CLI_HELP, `send --help`), so re-teaching it here is
-    // what made an earlier draft unreadable. Guard the size, not the prose.
-    expect(block.split("\n").length).toBeLessThanOrEqual(5);
+  it("is one block tagged with the task it is about", () => {
+    // Pasted INSIDE someone else's prompt: the tag makes it one clearly
+    // attributed unit, and two pasted briefings can never blur together.
+    expect(lines[0]).toBe(
+      '<termic-task id="task-abc123" name="review-auth" project="termic" agent="codex" path="/Users/x/.termic/worktrees/review-auth">',
+    );
+    expect(lines[lines.length - 1]).toBe("</termic-task>");
   });
 
-  it("tells the reader to preserve the quoting and the variable", () => {
-    // The reader is an agent that will REWRITE this line to slot its prompt
-    // in, and flipping the outer quotes to single (or inventing a value for
-    // $TERMIC_TASK_ID) breaks the reply address silently. This sentence is
-    // the only thing here that is not already in the CLI's own help.
-    expect(block).toContain("Keep the outer double quotes and leave $TERMIC_TASK_ID as written");
+  it("is short: the protocol lives in the CLI's own help", () => {
+    // $TERMIC_CLI_HELP and `send --help` teach the rest; re-teaching it here
+    // is what made an earlier draft 35 lines nobody read.
+    expect(lines.length).toBeLessThanOrEqual(5);
   });
 
-  it("frames WHAT this is before naming it", () => {
-    // Pasted cold into someone else's prompt, the identity alone never says
-    // why a task id is sitting in the middle of their instructions.
-    expect(block.startsWith("You can talk to another coding agent working alongside you:")).toBe(true);
-  });
-
-  it("names the task, its project and which agent is running it", () => {
-    expect(block).toContain(`the Termic task "review-auth" (project termic, codex)`);
-  });
-
-  it("says the channel runs both ways", () => {
-    expect(block).toContain("Prompt it, and it prompts you back when it is done");
-  });
-
-  it("carries the id and the directory, which the reader cannot derive", () => {
-    // The name is renameable, so the id is what a command must address.
-    expect(block).toContain("id task-abc123");
-    expect(block).toContain("working in /Users/x/.termic/worktrees/review-auth");
+  it("escapes a task name that would break out of its attribute", () => {
+    const b = buildAgentBriefing({ task: { ...task, name: 'say "hi" & <go>' } as Task, projectName: "termic", cli: "termic" });
+    expect(b.split("\n")[0]).toContain('name="say &quot;hi&quot; &amp; &lt;go>"');
   });
 
   it("addresses the task by id in the command, never by name", () => {
-    expect(block).toContain("termic send task-abc123 -p ");
+    expect(cmd).toContain("termic send task-abc123 -p ");
     expect(block).not.toContain("send review-auth");
   });
 
@@ -87,48 +74,41 @@ describe("buildAgentBriefing", () => {
     expect(b.match(/\/usr\/local\/bin\/termic-dev/g)).toHaveLength(2);
   });
 
-  it("names what goes in the prompt slot instead of an abstract placeholder", () => {
-    expect(block).toContain("<your prompt here: what you want it to do>");
-    expect(block).toContain("done: <what you did> -- ");
-  });
-
-  it("puts the reply address in DOUBLE quotes so the sender's shell expands it", () => {
-    // The whole point: `-p "... $TERMIC_TASK_ID ..."` is substituted by the
-    // SENDING agent's shell, handing the receiver a literal id. Single quotes
-    // there would block expansion and force a paragraph of instructions.
-    const cmd = block.split("\n")[2];
+  it("puts the sender's identity in DOUBLE quotes so the sender's shell fills it", () => {
+    // `-p "... $TERMIC_TASK_ID ..."` is substituted by the SENDING agent's
+    // shell, handing the receiver a literal address; single quotes would
+    // block that. The inner reply is single-quoted so it nests unescaped.
     const arg = cmd.slice(cmd.indexOf(' -p "') + 4);
     expect(arg.startsWith('"')).toBe(true);
     expect(arg.endsWith('"')).toBe(true);
-    expect(arg).toContain("$TERMIC_TASK_ID");
-    // ...and the inner -p is single-quoted, so it nests without escaping.
-    expect(arg).toContain("-p '[Agent message from");
+    expect(arg).toContain("-p '[message from ");
   });
 
-  it("signs both directions so neither agent mistakes a peer for the user", () => {
-    // Outbound: the sender's header and signature, its id filled by its shell.
-    const cmd = block.split("\n")[2];
-    expect(cmd).toContain('-p "[Agent message from <you>, task $TERMIC_TASK_ID]');
-    expect(cmd).toMatch(/-- <you>, task \$TERMIC_TASK_ID"$/);
-    // The reply: the receiving task signs as itself, with its real id.
-    expect(cmd).toContain("-p '[Agent message from codex, task task-abc123] done: <what you did> -- codex'");
+  it("signs both directions with agent, task name and id", () => {
+    // Outbound: the sender, filled in by its shell.
+    expect(cmd).toContain('-p "[message from agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID]');
+    expect(cmd).toMatch(/-- agent:<you> task:\$TERMIC_TASK id:\$TERMIC_TASK_ID"$/);
+    // The reply: the receiving task, literally, as itself.
+    const them = "agent:codex task:review-auth id:task-abc123";
+    expect(cmd).toContain(`-p '[message from ${them}] done: <what you did> -- ${them}'`);
+  });
+
+  it("tells the reader to preserve the quoting and the variables", () => {
+    // The reader is an agent that REWRITES this line to slot its prompt in;
+    // flipping the quotes or inventing values breaks the reply silently.
+    expect(block).toContain("Keep the outer double quotes and the $TERMIC_ variables as written");
   });
 
   it("never suggests --wait", () => {
-    // Discouraging it is the CLI help's job now; the fragment just omits it.
     expect(block).not.toContain("--wait");
   });
 
-  it("degrades to a readable line when the project name is unknown", () => {
+  it("degrades to a readable attribute when the project name is unknown", () => {
     expect(buildAgentBriefing({ task, projectName: null, cli: "termic" }))
-      .toContain(`"review-auth" (project unknown project, codex)`);
+      .toContain('project="unknown project"');
   });
 
   it("makes no claim about a worktree, which a main-checkout task has none of", () => {
-    // The long draft asserted "working in its own git worktree" for every
-    // task, which is simply false for a repo-root one.
-    // (Checked as a phrase: the fixture's own dir legitimately contains the
-    // word, since worktrees live under .termic/worktrees/.)
     expect(block).not.toMatch(/its own git worktree|working in its/);
   });
 });
@@ -155,7 +135,9 @@ describe("buildAgentBriefing sandbox caveat", () => {
     expect(build({ sandbox_mode: undefined, sandbox_enabled: true })).toContain("sandboxed (enforcing)");
   });
 
-  it("costs nothing on a task it does not apply to", () => {
+  it("stays inside the tag, and costs nothing on a task it does not apply to", () => {
+    const caged = build({ sandbox_mode: "enforce" }).split("\n");
+    expect(caged[caged.length - 1]).toBe("</termic-task>");
     expect(build({ sandbox_mode: "off" }).split("\n").length).toBe(5);
   });
 });

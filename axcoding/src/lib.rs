@@ -1,24 +1,15 @@
 //! axcoding: research prototypes, not product code.
 //!
-//! Two things live here:
-//! - `harness` / `repl` / `ctx` / `playbook`: a Self-Improving RLM harness.
-//!   The root model never sees the long context; it explores it through a
-//!   scripting REPL and may spend sub-model calls on slices it chooses.
-//!   After each run a reflection step updates a persistent playbook.
-//! - `bin/axcoding_agent.rs`: the same ideas stripped to pi's philosophy:
-//!   an explicit loop over an append-only transcript, few tools, no magic.
+//! `bin/axcoding_agent.rs`: a minimal coding agent built to pi's
+//! philosophy: an explicit loop over an append-only transcript, few
+//! tools, no magic.
 //!
 //! The `Llm` trait is the seam: real backends are thin adapters (rig),
 //! tests drive everything through `llm_fake::ScriptedLlm` with no network.
 
 pub mod auth;
-pub mod ctx;
-pub mod ctxbuild;
-pub mod harness;
 pub mod llm_fake;
 pub mod llm_rig;
-pub mod playbook;
-pub mod repl;
 pub mod session;
 pub mod tools;
 pub mod tui;
@@ -43,7 +34,8 @@ pub enum Role {
 }
 
 /// Minimal append-only transcript entry. Deliberately dumber than rig's
-/// message model: the harness owns the loop, so it only needs this.
+/// message model: the loop lives in `bin/axcoding_agent.rs`, so it only
+/// needs this.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -135,7 +127,7 @@ pub type EventStream = std::pin::Pin<
 >;
 
 /// The only thing a backend must do: one completion, no loop.
-/// The loop lives in `harness` (and in `bin/axcoding_agent.rs`) so it stays visible.
+/// The loop lives in `bin/axcoding_agent.rs` so it stays visible.
 pub trait Llm: Send + Sync + 'static {
     fn complete(
         &self,
@@ -178,14 +170,4 @@ pub fn clip(s: &str, max_chars: usize) -> String {
     format!("{cut}…[+{} chars]", s.chars().count() - max_chars)
 }
 
-/// Where the playbook lives by default: `$AXCODING_HOME` or `$HOME/.axcoding/`,
-/// shared across tasks and runs, so the self-improvement actually
-/// accumulates. Same relocation the auth file honors, which is what makes
-/// the dir a real login store. `--data` overrides. Falls back to CWD when
-/// `$HOME` is unset (should not happen on macOS/Linux, but a hardcoded
-/// panic would be worse).
-pub fn default_data_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").ok();
-    auth::axcoding_home(home.as_deref())
-}
 

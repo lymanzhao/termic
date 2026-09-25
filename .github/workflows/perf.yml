@@ -16,6 +16,12 @@ name: Performance (nightly)
 # So this job reports. It writes a step summary you can read without
 # downloading anything, and uploads the JSON so a series can be assembled
 # later. A metric earns a threshold only after its real spread is known.
+#
+# ONE row has earned one, as of 2026-09-22: the Tauri process's memory slope
+# under view churn (memory.perf.ts), which sat between -0.01 and +0.01
+# MiB/cycle across 36 nights because it is an invariant of the code rather
+# than a measurement of the runner. That spec throws above 0.15. Everything
+# else here, including every timing, still only reports. See docs/perf-ci.md.
 
 on:
   workflow_dispatch:

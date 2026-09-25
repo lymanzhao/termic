@@ -11,7 +11,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApp } from "@/store/app";
-import { projectSandboxDefault } from "@/lib/projectSandboxDefault";
+import { projectSandboxDefault, projectYoloDefault, yoloForCreate } from "@/lib/projectSandboxDefault";
+import { usePrefs } from "@/store/prefs";
 import { SandboxIcon, DockerSandboxIcon, sandboxPickerLabelT } from "@/components/SandboxIcon";
 import { selectionToFields } from "@/lib/types";
 import { useUI } from "@/store/ui";
@@ -20,7 +21,7 @@ import { importQuickWorktree, readNewTaskMode, writeNewTaskMode, type NewTaskMod
 import { taskImportableWorktrees, taskRestore, projectBranchContext, projectUpdate } from "@/lib/ipc";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { DropdownItem, DropdownSeparator, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
-import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight, History } from "lucide-react";
+import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight, History, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Agent, BranchContext, ImportableWorktree, Project } from "@/lib/types";
 
@@ -96,6 +97,11 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   // One resolver shared with the settings picker and the create path, so the
   // row cannot claim a cage the created task does not get.
   const sandboxDefault = projectSandboxDefault(project);
+  // Whether an AGENT created from this menu starts in YOLO (quickYolo in
+  // quickTask.ts applies it). A shell / terminal pick never gets it, which the
+  // note's wording ("agents") already covers.
+  const appDefaultYolo = usePrefs(s => s.defaultYolo);
+  const yoloDefault = yoloForCreate(projectYoloDefault(project, appDefaultYolo), sandboxDefault, true);
   const isMulti = (project?.type ?? "single") === "multi";
   // Non-git projects (issue #4) have no branches / worktrees — the only way
   // in is the main checkout (agent at the folder root). Force that mode and
@@ -275,6 +281,23 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                 <span className="text-[var(--color-fg)]">
                   {sandboxDefault === "docker" ? "Docker" : sandboxPickerLabelT(selectionToFields(sandboxDefault).mode, tChrome)}
                 </span>
+              </span>
+            </div>
+          )}
+
+          {/* Same disclosure for YOLO, for the same reason: the quick path has
+              no checkbox to show the default in, so without this line it
+              would switch approvals off with nothing on screen saying so.
+              Red Zap, the sidebar row's own mark. Hidden when off (the
+              baseline) and when the cage above already turns YOLO on. */}
+          {yoloDefault && (
+            <div
+              data-testid="quick-create-yolo-note"
+              className="mt-1 flex items-center gap-1.5 px-0.5 text-[11.5px] leading-snug text-[var(--color-fg-dim)]"
+            >
+              <Zap className="h-3 w-3 shrink-0 text-[var(--color-err)]" fill="currentColor" />
+              <span>
+                YOLO: <span className="text-[var(--color-fg)]">agents skip their permission prompts</span>
               </span>
             </div>
           )}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { projectSandboxDefault, mergeLists } from "./projectSandboxDefault";
+import { projectSandboxDefault, projectYoloDefault, yoloForCreate, mergeLists } from "./projectSandboxDefault";
 import type { Project } from "@/lib/types";
 
 const proj = (over: Partial<Project> = {}) => ({ id: "p", name: "p", ...over }) as Project;
@@ -32,6 +32,44 @@ describe("projectSandboxDefault", () => {
     expect(projectSandboxDefault(proj({ default_docker: true, default_sandbox: true }))).toBe("docker");
     expect(projectSandboxDefault(proj({ default_docker: true, default_sandbox_mode: "enforce" })))
       .toBe("docker");
+  });
+});
+
+describe("projectYoloDefault", () => {
+  it("follows the app-wide default when the project has no opinion", () => {
+    // `null` is what Rust's `None` serializes to; undefined is a record from
+    // before the field existed. Both inherit.
+    for (const p of [proj(), proj({ default_yolo: null }), undefined, null]) {
+      expect(projectYoloDefault(p, false)).toBe(false);
+      expect(projectYoloDefault(p, true)).toBe(true);
+    }
+  });
+
+  it("lets the project's own answer win in both directions", () => {
+    expect(projectYoloDefault(proj({ default_yolo: true }), false)).toBe(true);
+    // The case the override exists for: YOLO everywhere except this repo.
+    expect(projectYoloDefault(proj({ default_yolo: false }), true)).toBe(false);
+  });
+});
+
+describe("yoloForCreate", () => {
+  it("sends the choice for an agent in an uncaged task", () => {
+    expect(yoloForCreate(true, "off", true)).toBe(true);
+    expect(yoloForCreate(false, "off", true)).toBe(false);
+  });
+
+  it("treats Monitoring as uncaged, since it blocks nothing", () => {
+    expect(yoloForCreate(true, "monitor", true)).toBe(true);
+  });
+
+  it("stores nothing for a caged task, where spawn turns YOLO on anyway", () => {
+    for (const sel of ["enforce", "enforce-fs", "docker"] as const) {
+      expect(yoloForCreate(true, sel, true)).toBe(false);
+    }
+  });
+
+  it("stores nothing when the default tab is not an agent", () => {
+    expect(yoloForCreate(true, "off", false)).toBe(false);
   });
 });
 

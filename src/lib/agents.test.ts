@@ -1735,11 +1735,14 @@ describe("resume picker", () => {
     expect(resumePickerArgsForCli("claude")).toEqual(["--resume"]);
   });
 
-  it("the picker replaces every resume block and keeps the task name", () => {
+  it("the picker replaces every resume block, and names nothing", () => {
+    // claude applies --name to the session PICKED, which in a main checkout
+    // can be a sibling task's: it was renamed to this task and then read as
+    // this task's in every later picker.
     const args = spawnArgsForCli("claude", {
       yolo: false, resume: false, isPrimary: true, task, picker: ["--resume"],
     });
-    expect(args).toEqual(["--resume", "--name", "improve-tests"]);
+    expect(args).toEqual(["--resume"]);
     expect(args.join(" ")).not.toMatch(/--session-id|--continue/);
   });
 

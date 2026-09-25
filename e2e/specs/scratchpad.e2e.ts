@@ -422,6 +422,40 @@ describe("scratchpads from the CLI", () => {
     expect(l.data.pads.map((p: any) => p.id)).toContain(padId);
   });
 
+  it("rings the pad's tab when an agent changes it behind your back, until you look", async () => {
+    const [pad] = (await pads(taskId)).filter((p: any) => p.title === "Findings");
+    // The visible tab strip's copy of the pill (every visited task stays
+    // mounted, so scope to this task and a laid-out element).
+    const ring = () => browser.execute((id, tid) => {
+      const pill = [...document.querySelectorAll(`[data-task-id="${id}"] [data-tab-id="${tid}"]`)]
+        .find((el) => el.getBoundingClientRect().width > 0);
+      return !!pill?.querySelector('[data-testid="pad-unseen"]');
+    }, taskId, pad.id) as Promise<boolean>;
+    // Created by the agent while another tab was in front: ringed.
+    await browser.waitUntil(ring, { timeout: 5_000, timeoutMsg: "a pad the agent created was not marked unseen" });
+    await snap("scratchpad-unseen-ring.png");
+
+    // Looking at it clears the ring: a real click on the pill.
+    await browser.execute((id, tid) => {
+      const pill = [...document.querySelectorAll(`[data-task-id="${id}"] [data-tab-id="${tid}"]`)]
+        .find((el) => el.getBoundingClientRect().width > 0) as HTMLElement;
+      pill.click();
+    }, taskId, pad.id);
+    await browser.waitUntil(async () => !(await ring()), { timeout: 5_000, timeoutMsg: "showing the pad did not clear its ring" });
+
+    // Away on another tab, the agent appends: the ring is back.
+    const ids = await browser.execute(
+      (id) => (window.__termic!.useApp.getState().tabs[id] ?? []).map((t: any) => t.id as string), taskId,
+    ) as string[];
+    const other = ids.find((t) => t !== pad.id)!;
+    await browser.execute((id, t) => window.__termic!.useApp.getState().setActiveTabId(id, t), taskId, other);
+    const w = await cliRpc({ cmd: "pad_write", task: taskId, pad: pad.scratchId, content: "- more\n", append: true });
+    expect(w.ok).toBe(true);
+    await browser.waitUntil(ring, { timeout: 5_000, timeoutMsg: "an append while you were elsewhere did not ring the pad" });
+    // Put the text back for the next case, which asserts on it exactly.
+    await cliRpc({ cmd: "pad_write", task: taskId, pad: pad.scratchId, content: "# Findings\n" });
+  });
+
   it("writes into the OPEN pad live, and reads back the human's edits", async () => {
     const [pad] = (await pads(taskId)).filter((p: any) => p.title === "Findings");
     await browser.execute((id, tid) => window.__termic!.useApp.getState().setActiveTabId(id, tid), taskId, pad.id);

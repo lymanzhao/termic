@@ -2430,6 +2430,7 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
   // run, so a fixed id killed last time would already be dead here.
   const PICKED = crypto.randomUUID();
   let taskId: string | null = null;
+  let siblingId: string | null = null;
 
   before(() => writeFileSync(join(dataDir, "e2e-dead-sessions"), ""));
 
@@ -2457,6 +2458,7 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
 
   after(async () => {
     if (taskId) await archiveTask(taskId);
+    if (siblingId) await archiveTask(siblingId);
   });
 
   it("opens the picker instead of a fresh session, and says why", async () => {
@@ -2526,6 +2528,76 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
     // And exactly once: no loop back into the picker.
     await browser.pause(2500);
     expect(spawnArgv(id).length).toBe(before + 3);
+  });
+
+  // Main-checkout tasks share a cwd, so claude's picker lists the siblings'
+  // conversations too, newest first. Storing a sibling's pick swapped the two
+  // tasks: the sibling's own resume was then refused ("running in another
+  // terminal"), which cleared ITS id and opened ITS picker in turn.
+  it("does not store a sibling task's conversation picked there, and names its task", async () => {
+    const id = taskId!;
+    siblingId = await openTask("e2e-picker-sibling", true, "fakeclaude");
+    const sib = siblingId;
+    await waitForAgentReady(sib);
+    await browser.pause(2500);
+    await submitToAgent(sib, "hello");
+    await browser.waitUntil(async () => !!(await stored(sib)),
+      { timeout: 10_000, timeoutMsg: "the sibling's minted id was never persisted" });
+    const theirs = (await stored(sib))!;
+
+    await browser.execute((t) => window.__termic!.useApp.getState().setActiveTask(t), id);
+    await waitForAgentReady(id);
+    await browser.pause(2500);
+    await submitToAgent(id, "mine");
+    await browser.waitUntil(async () => !!(await stored(id)),
+      { timeout: 10_000, timeoutMsg: "the picker task's minted id was never persisted" });
+    kill((await stored(id))!);
+
+    const before = spawnArgv(id).length;
+    await relaunch(id);
+    await waitSpawns(id, before + 2, "no picker spawn followed the failed resume");
+    // No --name on the picker: claude would rename whichever session is
+    // picked, and a sibling's would then read as this task's.
+    expect(spawnArgv(id)[before + 1]).not.toContain("--name");
+    await waitForAgentReady(id);
+    await submitToAgent(id, `pick ${theirs}`);
+    await browser.waitUntil(
+      async () => (await toasts()).some(m => m.includes('belongs to "e2e-picker-sibling"')),
+      { timeout: 10_000, timeoutMsg: "no toast named the task that owns the picked conversation" });
+    expect(await stored(id)).toBe(null);
+    expect(await stored(sib)).toBe(theirs);
+  });
+
+  // Every refusal measured exits non-zero. A user quitting a tab right after
+  // relaunching it exits 0, and reading that as a failed resume cleared a good
+  // id and opened the picker, which is how the swap above got started.
+  it("a clean quit inside the failure window keeps the stored id", async () => {
+    const id = taskId!;
+    const ptyOf = () => browser.execute(
+      (t) => (window.__termic!.useApp.getState().tabs[t] ?? [])[0]?.ptyId ?? null, id);
+    // The last case left nothing stored: this relaunch mints.
+    await relaunch(id);
+    await waitForAgentReady(id);
+    await browser.pause(2500);
+    await submitToAgent(id, "keep me");
+    await browser.waitUntil(async () => !!(await stored(id)),
+      { timeout: 10_000, timeoutMsg: "the minted id was never persisted" });
+    const kept = (await stored(id))!;
+
+    const before = spawnArgv(id).length;
+    await relaunch(id);
+    // The argv line is written after fakeclaude installs its INT trap, so a
+    // Ctrl+C from here on is a clean quit (exit 0), as it is in claude.
+    await waitSpawns(id, before + 1, "the task never respawned");
+    await browser.waitUntil(async () => !!(await ptyOf()), { timeout: 1_000 });
+    await browser.execute(async (t) => {
+      const st = window.__termic!.useApp.getState();
+      await window.__termic!.ipc.ptyWrite((st.tabs[t] ?? [])[0]?.ptyId, [3]);
+    }, id);
+    await browser.pause(2500);
+    expect(spawnArgv(id).length).toBe(before + 1);
+    expect(spawnArgv(id)[before]).toContain(`--resume ${kept}`);
+    expect(await stored(id)).toBe(kept);
   });
 });
 
@@ -2914,6 +2986,67 @@ describe("delegated work", () => {
     });
     expect(await delegatedLabel(taskId)).toBe(null);
     await snap("agent-delegated-three.png");
+  });
+
+  // Another agent's message (`termic send`, MCP task_send: the report-back
+  // path) reaches an orchestrator stalled on delegated work at once, instead
+  // of queueing until every subagent is back. The user's own message queue is
+  // NOT changed by this: it still waits for the turn to end.
+  it("delivers another agent's message while delegated or partially done, and leaves the queue alone", async function () {
+    this.timeout(90_000);
+    const echoed = async (text: string) => {
+      const logs = await cliRpc({ cmd: "logs", task: "e2e-delegated" });
+      return String(logs.data?.data ?? "").includes(`FAKE-AGENT echo: ${text}`);
+    };
+    const report = async (text: string) => {
+      const r = await cliRpc({ cmd: "send", task: "e2e-delegated", prompt: text });
+      expect(r.ok).toBe(true);
+      expect(r.data.mode).toBe("delivered");
+      await browser.waitUntil(() => echoed(text), {
+        timeout: 20_000, timeoutMsg: `the delivered report "${text}" never reached the agent`,
+      });
+    };
+    // The previous report leaves the same visible "subagent" label behind.
+    // Wait for this turn's IDs and idle hook before testing queue behavior.
+    const waitForReport = async (ids: string) => browser.waitUntil(
+      async () => browser.execute((id, expected) => {
+        const tab = window.__termic!.useApp.getState().tabs[id]?.[0];
+        return tab?.delegatedWork?.ids.join(",") === expected
+          && tab?.workState === "working" && tab?.delegatedIdle === true;
+      }, taskId, ids),
+      { timeout: 20_000, timeoutMsg: `delegated report ${ids} never reached the tab` },
+    );
+
+    // Delegated: the report goes straight in, ring and all.
+    await submitToAgent(taskId, "#delegated 2 subagent e1,e2");
+    await waitForReport("e1,e2");
+    expect(await taskViewBadge(taskId)).toBe("working");
+    await report("report-while-delegated");
+
+    // Partially done: same.
+    await submitToAgent(taskId, "#delegated 2 subagent f1,f2");
+    await waitForReport("f1,f2");
+    await submitToAgent(taskId, "#delegated 1 subagent f2");
+    await browser.waitUntil(async () => (await taskViewBadge(taskId)) === "partial", {
+      timeout: 20_000, timeoutMsg: `never read as partial (saw ${await taskViewBadge(taskId)})`,
+    });
+    await report("report-while-partial");
+
+    // The user's queue is unchanged: a message queued now is HELD while the
+    // turn is open, and goes once it ends.
+    await submitToAgent(taskId, "#delegated 2 subagent g1,g2");
+    await waitForReport("g1,g2");
+    await browser.execute((id) => {
+      const s = window.__termic!.useApp.getState();
+      s.enqueueAgentMessage(id, s.tabs[id][0].id, "user-queued-while-delegated");
+    }, taskId);
+    await browser.pause(2_000);
+    expect(await queuedCount(taskId)).toBe(1);
+    expect(await echoed("user-queued-while-delegated")).toBe(false);
+    await submitToAgent(taskId, "#hookdone");
+    await browser.waitUntil(async () => (await queuedCount(taskId)) === 0 && (await echoed("user-queued-while-delegated")), {
+      timeout: 20_000, timeoutMsg: "the queued message never went once the turn ended",
+    });
   });
 
   // Detached work, and the one case in the state machine that no signal can

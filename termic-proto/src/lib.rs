@@ -67,7 +67,29 @@ use std::io::{self, BufRead, Read, Write};
 ///
 /// v13: the `pad_*` verbs. An agent creates, writes, reads and lists its
 /// task's scratchpads, and an open pad shows the write live.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// v14: `new` gains `checkout`, an EXISTING branch to check out into the
+/// new worktree (fetched and tracked when it only exists on the remote)
+/// instead of cutting a new one. A v13 server would drop the field and
+/// quietly cut a fresh branch named after the task.
+///
+/// v15: `new` carries `parent_task`, so a task an agent creates joins the
+/// agent's sidebar task group; the `group` verb shows or renames/recolours
+/// it; task summaries carry `group`.
+pub const PROTOCOL_VERSION: u32 = 15;
+
+/// The argv `new` pins to a task's agent: the generic `--arg` values, then
+/// `--model <m>` LAST, so an explicit model wins when the agent parses
+/// last-value-wins. Shared by the CLI and the MCP server so `task_new` and
+/// `termic new` cannot compose it differently.
+pub fn compose_task_agent_args(args: &[String], model: Option<&str>) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(model) = model {
+        out.push("--model".into());
+        out.push(model.into());
+    }
+    out
+}
 
 /// serde default for `QuitData::running`.
 pub(crate) fn default_true() -> bool { true }
@@ -259,8 +281,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
         /// Base branch for a worktree task. Absent = the repo default.
+        /// With `checkout`, only what the diff compares against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        /// Check out this EXISTING branch into the new worktree (v14): a
+        /// local branch, `<remote>/<branch>`, or a name that only exists
+        /// on the remote (fetched and tracked). Never cuts a new branch;
+        /// an unknown one is an error. Implies worktree mode; exclusive
+        /// with `from`. `name` may be empty, the webview derives it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout: Option<String>,
         /// Adopt this EXISTING registered worktree instead of creating
         /// one (GH #169). Absolute path (the CLI canonicalizes). Mutually
         /// exclusive with mode/base; no setup script runs.
@@ -291,6 +321,12 @@ pub enum Command {
         /// The CLI's working directory, for project resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// v15: the caller's own task id (`$TERMIC_TASK_ID`), when an agent
+        /// inside a task is the one creating this one. The new task joins
+        /// that task's sidebar group, founding it if needed. Cosmetic and
+        /// caller-asserted: an unknown id is ignored, never an error.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_task: Option<String>,
     },
     /// Block until the task's agent is quiescent: settled AND its
     /// message queue is empty. Streamed reply (state + heartbeat
@@ -422,6 +458,25 @@ pub enum Command {
         /// same-project live duplicate is a Conflict.
         name: String,
         /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// v15: show or change a task's sidebar TASK GROUP (the block a task an
+    /// agent creates joins, led by that agent's task). With neither `name`
+    /// nor `color` it only reports. Setting either on a task in no group
+    /// founds a group of one around it, so an orchestrator can name its
+    /// group before it spawns anyone. `name: ""` returns the group to
+    /// following its lead task's name. cwd-aware when `task` absent.
+    Group {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// An accent key: red, orange, yellow, green, teal, blue, purple, pink.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
@@ -691,6 +746,7 @@ pub enum ReplyData {
     Quit(QuitData),
     Archive(ArchiveData),
     Rename(RenameData),
+    Group(GroupData),
     Pad(PadData),
     ProjectList(ProjectListData),
     ProjectAdd(ProjectAddData),
@@ -951,6 +1007,32 @@ pub struct RenameData {
     pub old_name: String,
 }
 
+/// A task's sidebar task group, as `group` and task summaries report it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TaskGroupInfo {
+    /// The group's id: its lead task's id for a group an agent founded.
+    pub id: String,
+    /// What the sidebar shows: the group's own name, else its lead's.
+    pub name: String,
+    /// True when `name` is the group's own; false when it follows the lead.
+    pub named: bool,
+    /// Accent key, if the group has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Live members as `project/name`, lead first. Only `group` fills it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GroupData {
+    /// The task asked about, as `project/name`.
+    pub task: String,
+    /// Its group after the call, or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TaskGroupInfo>,
+}
+
 /// One scratchpad, as `pad list` and every other pad verb report it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PadInfo {
@@ -1037,6 +1119,10 @@ pub struct TaskSummary {
     /// (non-git project, git error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffStat>,
+    /// The sidebar task group this task is in (v15). A `new` run from inside
+    /// a task reports here the group the new task joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TaskGroupInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1613,6 +1699,7 @@ mod tests {
                 agent_args: vec!["--effort".into(), "high".into(), "--model".into(), "opus".into()],
                 mode: Some("worktree".into()),
                 base: Some("develop".into()),
+                checkout: None,
                 from: None,
                 resume: None,
                 sandbox: Some("enforce-fs".into()),
@@ -1622,6 +1709,7 @@ mod tests {
                 wait: true,
                 timeout_ms: Some(60_000),
                 cwd: Some("/repo/web".into()),
+                parent_task: None,
             },
             Command::New {
                 name: "bare".into(),
@@ -1631,6 +1719,7 @@ mod tests {
                 agent_args: Vec::new(),
                 mode: None,
                 base: None,
+                checkout: None,
                 from: None,
                 resume: None,
                 sandbox: None,
@@ -1640,6 +1729,28 @@ mod tests {
                 wait: false,
                 timeout_ms: None,
                 cwd: None,
+                parent_task: None,
+            },
+            // v14 checkout shape: an existing branch, the name left to the app.
+            Command::New {
+                name: String::new(),
+                prompt: None,
+                prompt_ref: None,
+                agent: None,
+                agent_args: Vec::new(),
+                mode: Some("worktree".into()),
+                base: Some("origin/develop".into()),
+                checkout: Some("origin/alice/fix".into()),
+                from: None,
+                resume: None,
+                sandbox: None,
+                yolo: false,
+                project: None,
+                open: false,
+                wait: false,
+                timeout_ms: None,
+                cwd: None,
+                parent_task: None,
             },
             // v7 import shape (GH #169): adopt a worktree + resume a session.
             Command::New {
@@ -1650,6 +1761,7 @@ mod tests {
                 agent_args: Vec::new(),
                 mode: None,
                 base: None,
+                checkout: None,
                 from: Some("/tasks/web/poll-linear".into()),
                 resume: Some("018f2c1e-aaaa-bbbb-cccc-1234567890ab".into()),
                 sandbox: None,
@@ -1659,6 +1771,7 @@ mod tests {
                 wait: false,
                 timeout_ms: None,
                 cwd: None,
+                parent_task: None,
             },
             Command::Wait {
                 task: Some("fix-auth".into()),
@@ -1839,6 +1952,7 @@ mod tests {
             work_state: Some("working".into()),
             open_tabs: Some(2),
             diff: Some(DiffStat { files_changed: 3, insertions: 10, deletions: 2, untracked: 1 }),
+            group: None,
         };
         for data in [
             ReplyData::Hello(HelloData {

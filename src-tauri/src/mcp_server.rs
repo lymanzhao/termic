@@ -49,6 +49,14 @@ pub(crate) const MCP_PORT_FILE: &str = "mcp-port";
 /// server parses it, the settings page shows it, and the one-click
 /// installer writes it.
 pub(crate) const MCP_TOKEN_HEADER: &str = "X-Termic-Token";
+/// The task the calling agent runs in, sent by the headers helper Termic
+/// installs (it reads `$TERMIC_TASK_ID` from the AGENT's environment, since
+/// the client runs the helper as its own child). It gives MCP what the CLI
+/// gets from its env: `task_new` groups under the caller, and the verbs the
+/// CLI aims at "your own task" do the same here. Caller-asserted, exactly
+/// like the CLI's env var, so it only ever DEFAULTS a target the token
+/// holder could name explicitly anyway; it grants nothing.
+pub(crate) const MCP_TASK_HEADER: &str = "X-Termic-Task";
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
 /// Cap on the request line + headers together, enforced pre-auth (the
@@ -303,6 +311,9 @@ struct HttpRequest {
     /// connect time instead: no env var, no shell edit, and no copy of
     /// the credential in any client config.
     termic_token: Option<String>,
+    /// `X-Termic-Task` (MCP_TASK_HEADER): the caller's own task id, empty
+    /// when the helper ran outside a Termic task.
+    termic_task: Option<String>,
     /// `Host`, checked against the loopback names: the DNS-rebinding
     /// stop, since a rebound page's request is same-origin and so
     /// carries no `Origin` to reject.
@@ -338,6 +349,7 @@ fn read_request(stream: &TcpStream) -> std::io::Result<Result<HttpRequest, u16>>
     let mut mcp_name = None;
     let mut host = None;
     let mut termic_token = None;
+    let mut termic_task = None;
     let mut chunked = false;
     let mut bad_length = false;
     loop {
@@ -387,6 +399,9 @@ fn read_request(stream: &TcpStream) -> std::io::Result<Result<HttpRequest, u16>>
                 _ if k.eq_ignore_ascii_case(MCP_TOKEN_HEADER) => {
                     termic_token = Some(v.to_string())
                 }
+                _ if k.eq_ignore_ascii_case(MCP_TASK_HEADER) => {
+                    termic_task = Some(v.trim().to_string()).filter(|v| !v.is_empty())
+                }
                 "host" => host = Some(v.to_string()),
                 "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
                 _ => {}
@@ -434,6 +449,7 @@ fn read_request(stream: &TcpStream) -> std::io::Result<Result<HttpRequest, u16>>
         mcp_name,
         host,
         termic_token,
+        termic_task,
         body,
     }))
 }
@@ -719,16 +735,27 @@ fn rpc_response(server: &McpServer, req: &HttpRequest) -> (u16, Vec<u8>) {
             with_cache_hints(serde_json::json!({
                 "supportedVersions": [SPEC_REVISION],
                 "capabilities": { "tools": {} },
+                // DiscoverResult's optional guidance for the model. It is
+                // the only place this server can say WHO the caller
+                // probably is, since no call carries a task identity.
+                "instructions": MCP_INSTRUCTIONS,
             })),
         ),
         "tools/list" => tools_list(id),
-        "tools/call" => tools_call(server, id, &params),
+        "tools/call" => tools_call(server, id, &params, req.termic_task.as_deref()),
         // A method this server does not implement is 404 at the HTTP
         // layer; the JSON-RPC body is what separates it from a 404 out
         // of something that is not an MCP endpoint at all.
         _ => rpc_error(id, 404, -32601, &format!("unknown method \"{method}\"")),
     }
 }
+
+/// Guidance for the model, returned by `server/discover` (the 2026-07-28
+/// `DiscoverResult.instructions`). The CLI says the same in its own verbs
+/// (`agent_overview!` in termic-cli/src/lib.rs): keep the two in step. The
+/// point is the first sentence: an agent that does not realise it is running
+/// INSIDE a Termic task never thinks to start siblings or report back.
+const MCP_INSTRUCTIONS: &str = "Termic runs coding agents side by side, each in its own task (a git worktree, or the project's main checkout, with its own terminal), listed in the app's sidebar. If your environment has TERMIC_TASK_ID, you are one of those agents, running INSIDE a Termic task right now, and these tools drive the app around you. From there you can: launch new tasks with their own agents (task_new; they join your task's group in the sidebar, which you name for the batch of work with task_group); prompt another task's agent (task_send) and read what it produced (task_log, task_result); open another agent tab in a task (task_tab); retitle your own task (task_rename); and keep notes, plans, findings, logs and reports the user should READ in scratchpads (scratchpad_new, scratchpad_write): a tab in your task that updates live and stays out of git, so use one instead of dropping temporary .md files into the repo. Coordinate by prompting each other rather than blocking: end a prompt with how the other agent should report back to you (a task_send to your task id). Sign every prompt you send another agent, first line and last: [message from agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>] ... -- agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>, with the values written out (there is no shell here to fill them in; TERMIC_TASK holds your task name). A prompt that arrives WITH that header came from another agent, not the user: the id is where to reply. When Termic set this client up, it tells the server which task you run in, so task_rename, task_group and task_tab default to your own task, exactly like the CLI; name other tasks explicitly. Without TERMIC_TASK_ID you are driving Termic from outside it.";
 
 /// UnsupportedProtocolVersionError. The `supported` list has to be
 /// machine-readable in `data`: that is what a client retries from, and
@@ -884,6 +911,17 @@ fn arg_bool(a: &Args, k: &str) -> Result<bool, String> {
     }
 }
 
+fn arg_str_list(a: &Args, k: &str) -> Result<Vec<String>, String> {
+    match a.get(k) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(xs)) => xs
+            .iter()
+            .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("\"{k}\" must be an array of strings")))
+            .collect(),
+        Some(_) => Err(format!("\"{k}\" must be an array of strings")),
+    }
+}
+
 fn arg_u64(a: &Args, k: &str) -> Result<Option<u64>, String> {
     match a.get(k) {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -900,6 +938,29 @@ const P_TASK: ParamDef = ParamDef {
     required: true,
     description: "Task name or id.",
     cli_flag: Some("task"),
+};
+/// `task` on the tools that default to the caller's own task.
+const P_TASK_SELF: ParamDef = ParamDef {
+    name: "task",
+    json_type: "string",
+    required: false,
+    description: "Task name or id. Omitted: your own task.",
+    cli_flag: Some("task"),
+};
+const P_LIBRARY: ParamDef = ParamDef {
+    name: "library",
+    json_type: "string",
+    required: false,
+    description: "Prompt-library selector (see the prompts tool): a prompt id like builtin:review, or its exact title. Delivers that prompt's body; with prompt too, the body, a blank line, then prompt.",
+    cli_flag: Some("--library"),
+};
+/// The scratchpad verbs take the task as `--task`, not a positional.
+const P_PAD_TASK: ParamDef = ParamDef {
+    name: "task",
+    json_type: "string",
+    required: false,
+    description: "Task name or id. Omitted: your own task.",
+    cli_flag: Some("--task"),
 };
 const P_PROJECT: ParamDef = ParamDef {
     name: "project",
@@ -981,6 +1042,19 @@ const TOOLS: &[ToolDef] = &[
             // CLI flag to assert against).
             ParamDef { name: "mode", json_type: "string", required: false, description: "\"worktree\" for a task on its own git worktree and branch, or \"main\" to work in the project's main checkout. Omitted means the app's last-used mode, so pass it when the answer matters.", cli_flag: None },
             ParamDef { name: "base", json_type: "string", required: false, description: "Base branch for a worktree task.", cli_flag: Some("--base") },
+            ParamDef { name: "checkout", json_type: "string", required: false, description: "Existing branch to check out instead of creating one (local, or on the remote: fetched and tracked). Implies worktree mode.", cli_flag: Some("--checkout") },
+            // Defaults to the caller's task (MCP_TASK_HEADER), the way the
+            // CLI reads $TERMIC_TASK_ID; explicit to group under another.
+            ParamDef { name: "parentTask", json_type: "string", required: false, description: "Group under this task instead of your own (the default when you run inside Termic).", cli_flag: None },
+            ParamDef { name: "noGroup", json_type: "boolean", required: false, description: "Keep the new task out of your task group.", cli_flag: Some("--no-group") },
+            P_LIBRARY,
+            ParamDef { name: "model", json_type: "string", required: false, description: "Model for the new task's agent (appended after args, so it wins).", cli_flag: Some("--model") },
+            ParamDef { name: "args", json_type: "array", required: false, description: "Extra argv for the new task's agent, one element per entry.", cli_flag: Some("--arg") },
+            ParamDef { name: "from", json_type: "string", required: false, description: "Absolute path of an EXISTING registered git worktree to adopt as the task instead of creating one (no setup script runs; excludes mode and base).", cli_flag: Some("--from") },
+            ParamDef { name: "resume", json_type: "string", required: false, description: "Session id the agent resumes on its first spawn (agents with id-resume support only).", cli_flag: Some("--resume") },
+            ParamDef { name: "sandbox", json_type: "string", required: false, description: "off, monitor, enforce or enforce-fs; default the project's. enforce and enforce-fs deny the new agent this control plane, so it can never report back: ask it for a file in its worktree instead.", cli_flag: Some("--sandbox") },
+            ParamDef { name: "yolo", json_type: "boolean", required: false, description: "Skip the agent's permission prompts (its YOLO flag). Unattended tasks need this or an enforcing sandbox, or they stop at the first prompt.", cli_flag: Some("--yolo") },
+            ParamDef { name: "open", json_type: "boolean", required: false, description: "Select the new task in the window and raise it.", cli_flag: Some("--open") },
             P_WAIT,
             P_TIMEOUT,
         ],
@@ -989,33 +1063,35 @@ const TOOLS: &[ToolDef] = &[
         build: |a| Ok(Command::New {
             name: need_str(a, "name")?,
             prompt: arg_str(a, "prompt")?,
-            // The prompt-library selector (CLI -P/--library) has no MCP
-            // param in Phase A: the tool surface mirrors the design
-            // doc's verb list, and widening it is a scope decision.
-            prompt_ref: None,
+            prompt_ref: arg_str(a, "library")?,
             agent: arg_str(a, "agent")?,
-            agent_args: Vec::new(),
+            agent_args: proto::compose_task_agent_args(&arg_str_list(a, "args")?, arg_str(a, "model")?.as_deref()),
             mode: arg_str(a, "mode")?,
             base: arg_str(a, "base")?,
-            from: None,
-            resume: None,
-            sandbox: None,
-            yolo: false,
+            checkout: arg_str(a, "checkout")?,
+            from: arg_str(a, "from")?,
+            resume: arg_str(a, "resume")?,
+            sandbox: arg_str(a, "sandbox")?,
+            yolo: arg_bool(a, "yolo")?,
             project: arg_str(a, "project")?,
-            open: false,
+            open: arg_bool(a, "open")?,
             wait: arg_bool(a, "wait")?,
             timeout_ms: arg_u64(a, "timeoutMs")?,
             cwd: None,
+            // --no-group wins over the caller default AND an explicit parent.
+            parent_task: if arg_bool(a, "noGroup")? { None } else { arg_str(a, "parentTask")? },
         }),
     },
     ToolDef {
         name: "task_send",
         cli_verb: "send",
-        description: "Prompt the task's running agent (queued if busy). With no agent running, resume restores the last session and fresh spawns a new one.",
+        description: "Prompt the task's running agent (queued if busy, not while it waits on its subagents). With no agent running, resume restores the last session and fresh spawns a new one. Agent to agent: sign the prompt as the server instructions say ([message from agent:<you> task:<your task name> id:<your task id>] first, the same after -- last).",
         params: &[
-            P_TASK,
+            ParamDef { name: "task", json_type: "string", required: false, description: "Task name or id. Required unless here.", cli_flag: Some("task") },
             P_PROJECT,
-            ParamDef { name: "prompt", json_type: "string", required: true, description: "The prompt to deliver.", cli_flag: Some("--prompt") },
+            ParamDef { name: "here", json_type: "boolean", required: false, description: "Target your own task instead of naming one.", cli_flag: Some("--here") },
+            ParamDef { name: "prompt", json_type: "string", required: false, description: "The prompt to deliver (required unless library).", cli_flag: Some("--prompt") },
+            P_LIBRARY,
             ParamDef { name: "resume", json_type: "boolean", required: false, description: "No agent running: restore the last session, then deliver.", cli_flag: Some("--resume") },
             ParamDef { name: "fresh", json_type: "boolean", required: false, description: "No agent running: spawn a fresh agent, then deliver. Refused alongside tab, which targets something already open.", cli_flag: Some("--fresh") },
             P_TAB,
@@ -1027,8 +1103,14 @@ const TOOLS: &[ToolDef] = &[
         build: |a| Ok(Command::Send {
             task: Some(need_str(a, "task")?),
             project: arg_str(a, "project")?,
-            prompt: need_str(a, "prompt")?,
-            prompt_ref: None, // see task_new
+            prompt: {
+                let p = arg_str(a, "prompt")?.unwrap_or_default();
+                if p.trim().is_empty() && arg_str(a, "library")?.is_none() {
+                    return Err("\"prompt\" is required (or give \"library\")".into());
+                }
+                p
+            },
+            prompt_ref: arg_str(a, "library")?,
             resume: arg_bool(a, "resume")?,
             fresh: arg_bool(a, "fresh")?,
             wait: arg_bool(a, "wait")?,
@@ -1123,7 +1205,7 @@ const TOOLS: &[ToolDef] = &[
         cli_verb: "rename",
         description: "Rename a task's sidebar label (branch and worktree keep their names).",
         params: &[
-            P_TASK,
+            P_TASK_SELF,
             P_PROJECT,
             ParamDef { name: "name", json_type: "string", required: true, description: "The new display name.", cli_flag: Some("name") },
         ],
@@ -1133,6 +1215,101 @@ const TOOLS: &[ToolDef] = &[
             task: Some(need_str(a, "task")?),
             project: arg_str(a, "project")?,
             name: need_str(a, "name")?,
+            cwd: None,
+        }),
+    },
+    ToolDef {
+        name: "task_group",
+        cli_verb: "group",
+        description: "Show, name or recolour a task's sidebar group (tasks you create join yours). Name it for the batch of work. Setting either on an ungrouped task founds a group.",
+        params: &[
+            P_TASK_SELF,
+            P_PROJECT,
+            ParamDef { name: "name", json_type: "string", required: false, description: "Group name; \"\" follows the lead task's name.", cli_flag: Some("--name") },
+            ParamDef { name: "color", json_type: "string", required: false, description: "red, orange, yellow, green, teal, blue, purple or pink.", cli_flag: Some("--color") },
+        ],
+        destructive: false,
+        read_only: false,
+        build: |a| Ok(Command::Group {
+            task: Some(need_str(a, "task")?),
+            project: arg_str(a, "project")?,
+            name: arg_str(a, "name")?,
+            color: arg_str(a, "color")?,
+            cwd: None,
+        }),
+    },
+    // Scratchpads: the place for an agent's temporary output. The CLI's
+    // `scratchpad` verbs, same wire commands, same "your own task" default.
+    ToolDef {
+        name: "scratchpad_new",
+        cli_verb: "scratchpad new",
+        description: "Create a scratchpad: a note that lives with the task but OUTSIDE the worktree, shown to the user as a tab that updates live. Use it for plans, findings, logs, reports and any other temporary output meant to be READ rather than committed, instead of writing throwaway .md files into the repo (nothing here reaches git). Returns the pad id, the stable selector.",
+        params: &[
+            P_PAD_TASK,
+            P_PROJECT,
+            ParamDef { name: "title", json_type: "string", required: false, description: "A fixed tab title (else it is named after its first line).", cli_flag: Some("--title") },
+            ParamDef { name: "content", json_type: "string", required: false, description: "Initial text.", cli_flag: Some("--content") },
+        ],
+        destructive: false,
+        read_only: false,
+        build: |a| Ok(Command::PadNew {
+            task: arg_str(a, "task")?,
+            project: arg_str(a, "project")?,
+            title: arg_str(a, "title")?,
+            content: arg_str(a, "content")?,
+            cwd: None,
+        }),
+    },
+    ToolDef {
+        name: "scratchpad_write",
+        cli_verb: "scratchpad write",
+        description: "Replace a scratchpad's text, or append to it (append suits progress logs). An open pad updates in place, so the user watches it fill.",
+        params: &[
+            ParamDef { name: "pad", json_type: "string", required: true, description: "Pad id, or its exact title (case-insensitive).", cli_flag: Some("pad") },
+            P_PAD_TASK,
+            P_PROJECT,
+            ParamDef { name: "content", json_type: "string", required: true, description: "The text.", cli_flag: Some("--content") },
+            ParamDef { name: "append", json_type: "boolean", required: false, description: "Add to the end instead of replacing.", cli_flag: Some("--append") },
+        ],
+        destructive: false,
+        read_only: false,
+        build: |a| Ok(Command::PadWrite {
+            task: arg_str(a, "task")?,
+            project: arg_str(a, "project")?,
+            pad: need_str(a, "pad")?,
+            content: need_str(a, "content")?,
+            append: arg_bool(a, "append")?,
+            cwd: None,
+        }),
+    },
+    ToolDef {
+        name: "scratchpad_read",
+        cli_verb: "scratchpad read",
+        description: "Read a scratchpad's text as the window shows it, including edits the user has not paused on yet (a user may leave you notes there).",
+        params: &[
+            ParamDef { name: "pad", json_type: "string", required: true, description: "Pad id, or its exact title (case-insensitive).", cli_flag: Some("pad") },
+            P_PAD_TASK,
+            P_PROJECT,
+        ],
+        destructive: false,
+        read_only: true,
+        build: |a| Ok(Command::PadRead {
+            task: arg_str(a, "task")?,
+            project: arg_str(a, "project")?,
+            pad: need_str(a, "pad")?,
+            cwd: None,
+        }),
+    },
+    ToolDef {
+        name: "scratchpad_list",
+        cli_verb: "scratchpad list",
+        description: "List a task's scratchpads: id, title, and whether each is open in the window.",
+        params: &[P_PAD_TASK, P_PROJECT],
+        destructive: false,
+        read_only: true,
+        build: |a| Ok(Command::PadList {
+            task: arg_str(a, "task")?,
+            project: arg_str(a, "project")?,
             cwd: None,
         }),
     },
@@ -1165,7 +1342,7 @@ const TOOLS: &[ToolDef] = &[
         cli_verb: "tab",
         description: "Open a tab inside a running task (the app's \"+\" menu as a tool), optionally delivering a first prompt to it. Returns the new tab's id, which is the stable selector other tools take.",
         params: &[
-            P_TASK,
+            P_TASK_SELF,
             P_PROJECT,
             // The kind is explicit rather than free text because the
             // kinds differ in sandbox, resume and YOLO behaviour, and a
@@ -1173,6 +1350,8 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "kind", json_type: "string", required: true, description: "\"agent\" (needs agentId), \"terminal\" (needs agentId naming a terminal entry), \"shell\" for a plain login shell, or \"default\" for another tab of whatever the task already runs.", cli_flag: None },
             ParamDef { name: "agentId", json_type: "string", required: false, description: "Registry id for the agent and terminal kinds; see task_agents. Ignored by the other kinds.", cli_flag: Some("--agent") },
             ParamDef { name: "prompt", json_type: "string", required: false, description: "Deliver this prompt into the tab just opened (agent kinds only).", cli_flag: Some("--prompt") },
+            P_LIBRARY,
+            ParamDef { name: "resume", json_type: "string", required: false, description: "Session id the new agent tab resumes (agents with id-resume support only).", cli_flag: Some("--resume") },
             P_WAIT,
             P_TIMEOUT,
         ],
@@ -1200,10 +1379,10 @@ const TOOLS: &[ToolDef] = &[
                 project: arg_str(a, "project")?,
                 kind,
                 prompt: arg_str(a, "prompt")?,
-                prompt_ref: None,
+                prompt_ref: arg_str(a, "library")?,
                 wait: arg_bool(a, "wait")?,
                 timeout_ms: arg_u64(a, "timeoutMs")?,
-                resume: None,
+                resume: arg_str(a, "resume")?,
                 cwd: None,
             })
         },
@@ -1300,10 +1479,12 @@ fn tool_schema(t: &ToolDef) -> serde_json::Value {
     let mut props = serde_json::Map::new();
     let mut required = Vec::new();
     for p in t.params {
-        props.insert(
-            p.name.into(),
-            serde_json::json!({ "type": p.json_type, "description": p.description }),
-        );
+        let mut schema = serde_json::json!({ "type": p.json_type, "description": p.description });
+        // The only array param shape we have: a list of argv strings.
+        if p.json_type == "array" {
+            schema["items"] = serde_json::json!({ "type": "string" });
+        }
+        props.insert(p.name.into(), schema);
         if p.required {
             required.push(serde_json::Value::String(p.name.into()));
         }
@@ -1372,7 +1553,7 @@ impl cli_server::EventSink for NoopSink {
     }
 }
 
-fn tools_call(server: &McpServer, id: serde_json::Value, params: &serde_json::Value) -> (u16, Vec<u8>) {
+fn tools_call(server: &McpServer, id: serde_json::Value, params: &serde_json::Value, caller: Option<&str>) -> (u16, Vec<u8>) {
     let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
         return rpc_error(id, 200, -32602, "params.name is required");
     };
@@ -1392,7 +1573,18 @@ fn tools_call(server: &McpServer, id: serde_json::Value, params: &serde_json::Va
     if let Some(unknown) = args.keys().find(|k| !tool.params.iter().any(|p| p.name == k.as_str())) {
         return rpc_error(id, 200, -32602, &format!("unknown argument \"{unknown}\" for tool \"{name}\""));
     }
-    let mut cmd = match (tool.build)(args) {
+    // The CLI's "your own task" defaults, from the caller's task header. An
+    // argument the caller passed always wins; nothing is filled without it.
+    let args = with_caller_defaults(tool.name, args, caller);
+    if SELF_DEFAULT_TOOLS.contains(&tool.name) && !args.contains_key("task") {
+        return rpc_error(
+            id,
+            200,
+            -32602,
+            "name the task: this client did not say which Termic task it runs in (re-run Termic's MCP setup for your client to have it send that)",
+        );
+    }
+    let mut cmd = match (tool.build)(&args) {
         Ok(c) => c,
         Err(msg) => return rpc_error(id, 200, -32602, &msg),
     };
@@ -1411,6 +1603,30 @@ fn tools_call(server: &McpServer, id: serde_json::Value, params: &serde_json::Va
     };
     let reply = cli_server::dispatch_authenticated(&req, server.host.as_ref(), &mut NoopSink);
     rpc_result(id, tool_reply_payload(reply))
+}
+
+/// Tools whose `task` defaults to the caller's own, as the CLI's `rename`,
+/// `group` and `tab` default to `$TERMIC_TASK_ID`.
+const SELF_DEFAULT_TOOLS: &[&str] = &[
+    "task_rename", "task_group", "task_tab",
+    "scratchpad_new", "scratchpad_write", "scratchpad_read", "scratchpad_list",
+];
+
+/// `args` with the caller's task filled in where the CLI would have used
+/// `$TERMIC_TASK_ID`: `task_new`'s parent (grouping) and the self-targeting
+/// tools' `task`. Only absent keys are filled.
+fn with_caller_defaults(tool: &str, args: &Args, caller: Option<&str>) -> Args {
+    let mut out = args.clone();
+    let Some(caller) = caller else { return out };
+    let key = match tool {
+        "task_new" => "parentTask",
+        // `send --here`: the caller's own task, only when asked for.
+        "task_send" if args.get("here").and_then(|v| v.as_bool()) == Some(true) => "task",
+        t if SELF_DEFAULT_TOOLS.contains(&t) => "task",
+        _ => return out,
+    };
+    out.entry(key.to_string()).or_insert_with(|| serde_json::Value::String(caller.to_string()));
+    out
 }
 
 /// Map a dispatch Reply onto the tools/call result PAYLOAD; the shared
@@ -1730,7 +1946,12 @@ fn helper_command(token_path: &Path) -> String {
     // Single-quoted for the shell, with any embedded apostrophe closed,
     // escaped and reopened, so a path like /Users/O'Brien still parses.
     let quoted = format!("'{}'", token_path.to_string_lossy().replace('\'', "'\\''"));
-    format!("printf '{{\"{MCP_TOKEN_HEADER}\":\"%s\"}}' \"$(cat {quoted})\"")
+    // The task header comes from the AGENT's environment: the client runs
+    // this helper as its own child, so $TERMIC_TASK_ID is whatever task the
+    // agent runs in, and empty outside Termic (the server ignores empty).
+    format!(
+        "printf '{{\"{MCP_TOKEN_HEADER}\":\"%s\",\"{MCP_TASK_HEADER}\":\"%s\"}}' \"$(cat {quoted})\" \"${{TERMIC_TASK_ID:-}}\""
+    )
 }
 
 /// The codex block a user pastes: the same two tables the installer
@@ -2889,7 +3110,25 @@ mod tests {
         // an explicit `destructiveHint: false` on the safe mutating
         // tools, because the schema's default for an omitted one is
         // TRUE and clients may prompt on ordinary calls without it.
-        const RECORDED: usize = 11300;
+        // 11400: task_new's `checkout` (an existing branch into a new
+        // worktree), about 200 bytes with its description cut to the
+        // one sentence an agent needs to pick it over `base`. In parallel,
+        // task_new's `parentTask`, the one way an MCP caller can say which
+        // task it runs in, so its children group under it.
+        // 12100: task_group, so an agent can NAME the group its tasks
+        // form (the CLI's `group`; every agent-facing verb ships on both).
+        // 12250: task_send names the agent-to-agent signature, since an MCP
+        // caller has no shell to fill it in and must write it out.
+        // 16900: FULL CLI parity, decided by the maintainer: task_new's
+        // --sandbox/--yolo/--model/--arg/--from/--resume/--open/--no-group/
+        // -P, send's --here/-P, tab's -P/--resume, and the four scratchpad
+        // tools with descriptions that steer agents off throwaway .md files.
+        // Roughly 38% more per session, paid on purpose: "the MCP must be a
+        // clone of the CLI". every_cli_flag_has_an_mcp_param_or_a_reason
+        // keeps it that way.
+        // 17100: the two lines above meeting in one tree (parity plus
+        // `checkout`, which landed in parallel).
+        const RECORDED: usize = 17100;
         assert!(
             size <= RECORDED,
             "serialized tools/list grew to {size} bytes (recorded {RECORDED}); grow it consciously"
@@ -3139,6 +3378,46 @@ mod tests {
         spawn_with(host, Box::new(|| true))
     }
 
+    // ── "you are inside Termic" guidance ─────────────────────────────
+
+    /// The discover instructions and the CLI overview name tools and verbs
+    /// in prose, which no compiler checks. A renamed or removed one would
+    /// leave both texts sending agents to something that does not exist.
+    #[test]
+    fn inside_termic_guidance_only_names_things_that_exist() {
+        for word in MCP_INSTRUCTIONS.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if (word.starts_with("task_") || word.starts_with("project_") || word.starts_with("scratchpad_")) && word.len() > 5 {
+                assert!(TOOLS.iter().any(|t| t.name == word), "MCP_INSTRUCTIONS names unknown tool {word}");
+            }
+        }
+        let help = termic_cli::machine_help();
+        let overview = help["overview"].as_str().expect("help --json carries an overview");
+        let verbs: Vec<&str> = help["commands"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        // Every `backticked` word in the overview that looks like a verb is one.
+        for chunk in overview.split('`').skip(1).step_by(2) {
+            let verb = chunk.split_whitespace().next().unwrap_or("");
+            assert!(verbs.iter().any(|v| v.split(' ').next() == Some(verb)), "overview names unknown verb `{verb}`");
+        }
+        for text in [MCP_INSTRUCTIONS, overview] {
+            assert!(text.contains("TERMIC_TASK_ID"), "says how an agent knows it is inside a task");
+            assert!(text.contains("INSIDE a Termic task"));
+            assert!(!text.contains('\u{2014}'), "no em dashes in agent-facing copy");
+        }
+    }
+
+    #[test]
+    fn discover_returns_the_instructions() {
+        let (addr, token, _sd) = spawn(true);
+        let (status, v) = rpc(
+            addr,
+            &token,
+            "server/discover",
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "server/discover" }),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(v["result"]["instructions"], MCP_INSTRUCTIONS);
+    }
+
     // ── registry parity vs machine_help() ────────────────────────────
 
     /// Drift gate (mcp.md "Registry parity"): both surfaces render from
@@ -3201,10 +3480,6 @@ mod tests {
             ("path", "prints a path for shell substitution; callers get it from task_status"),
             ("help", "the CLI's own help; tools/list is the MCP equivalent"),
             ("prompts show", "folded into the prompts tool's optional selector, matching the wire"),
-            ("scratchpad list", "scratchpads are notes for the human in the window; an MCP caller has its own scratch space"),
-            ("scratchpad new", "scratchpads are notes for the human in the window; an MCP caller has its own scratch space"),
-            ("scratchpad write", "scratchpads are notes for the human in the window; an MCP caller has its own scratch space"),
-            ("scratchpad read", "scratchpads are notes for the human in the window; an MCP caller has its own scratch space"),
         ];
         for cmd in commands {
             let verb = cmd["name"].as_str().unwrap();
@@ -3219,6 +3494,42 @@ mod tests {
                 !(exposed && excluded),
                 "CLI verb \"{verb}\" is both exposed and listed as excluded"
             );
+        }
+    }
+
+    /// Flag-level parity, the gap `mcp_registry_matches_machine_help` left
+    /// open: it proves every VERB is exposed, not every FLAG, which is how
+    /// task_new ended up without --sandbox, --yolo, --model and seven more.
+    /// Every CLI flag and positional maps to a tool param, or is listed here
+    /// with the reason it has no MCP form. A new CLI flag fails this until
+    /// someone decides.
+    #[test]
+    fn every_cli_flag_has_an_mcp_param_or_a_reason() {
+        const UNMAPPED: &[(&str, &str, &str)] = &[
+            ("list", "--quiet", "output formatting; a tool returns structured JSON"),
+            ("new", "--worktree", "the tool's single `mode` enum"),
+            ("new", "--main", "the tool's single `mode` enum"),
+            ("tab", "--terminal", "the tool's `kind` enum"),
+            ("tab", "--shell", "the tool's `kind` enum"),
+            ("apply", "--yes", "a TTY confirmation; the tool carries destructiveHint"),
+            ("archive", "--yes", "a TTY confirmation; the tool carries destructiveHint"),
+            ("project remove", "--yes", "a TTY confirmation; the tool carries destructiveHint"),
+        ];
+        let help = termic_cli::machine_help();
+        for c in help["commands"].as_array().unwrap() {
+            let verb = c["name"].as_str().unwrap();
+            let Some(tool) = TOOLS.iter().find(|t| t.cli_verb == verb) else { continue }; // verb-level EXCLUDED
+            let mapped: Vec<&str> = tool.params.iter().filter_map(|p| p.cli_flag).collect();
+            let args = c["args"].as_array().unwrap().iter().filter_map(|a| a["name"].as_str());
+            let flags = c["flags"].as_array().unwrap().iter().filter_map(|f| f["flag"].as_str());
+            for arg in args.chain(flags) {
+                let allowed = UNMAPPED.iter().any(|(v, f, _)| *v == verb && *f == arg);
+                assert!(
+                    mapped.contains(&arg) || allowed,
+                    "CLI `{verb} {arg}` has no param on {} and no reason in UNMAPPED",
+                    tool.name
+                );
+            }
         }
     }
 
@@ -3394,6 +3705,124 @@ command = \"/bin/true\"\n";
         assert!(cmd.contains(MCP_TOKEN_HEADER));
     }
 
+    /// Run the helper the way a client does (through sh, in the agent's
+    /// environment) and parse what it prints.
+    fn run_helper(token_file: &Path, task: Option<&str>) -> serde_json::Value {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(helper_command(token_file)).env_remove("TERMIC_TASK_ID");
+        if let Some(t) = task {
+            cmd.env("TERMIC_TASK_ID", t);
+        }
+        let out = cmd.output().unwrap();
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("helper printed non-JSON ({e}): {:?}", String::from_utf8_lossy(&out.stdout)))
+    }
+
+    #[test]
+    fn the_helper_sends_the_agents_own_task_from_its_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mcp-token");
+        std::fs::write(&f, "tok123").unwrap();
+        let inside = run_helper(&f, Some("task-abc"));
+        assert_eq!(inside[MCP_TOKEN_HEADER], "tok123");
+        assert_eq!(inside[MCP_TASK_HEADER], "task-abc");
+        // Outside Termic the header is empty, which the server ignores.
+        assert_eq!(run_helper(&f, None)[MCP_TASK_HEADER], "");
+    }
+
+    fn build(tool: &str, args: serde_json::Value) -> Result<Command, String> {
+        let t = TOOLS.iter().find(|t| t.name == tool).unwrap();
+        (t.build)(args.as_object().unwrap())
+    }
+
+    #[test]
+    fn task_new_takes_the_cli_new_flags() {
+        let Command::New { agent_args, sandbox, yolo, open, from, resume, prompt_ref, parent_task, .. } = build(
+            "task_new",
+            serde_json::json!({
+                "name": "x", "args": ["--effort", "low"], "model": "worker", "sandbox": "monitor",
+                "yolo": true, "open": true, "from": "/w", "resume": "S1", "library": "builtin:review",
+                "parentTask": "p",
+            }),
+        ).unwrap() else { panic!() };
+        // Composed exactly as `termic new --arg ... --model ...` composes it.
+        assert_eq!(agent_args, ["--effort", "low", "--model", "worker"]);
+        assert_eq!((sandbox.as_deref(), yolo, open), (Some("monitor"), true, true));
+        assert_eq!((from.as_deref(), resume.as_deref(), prompt_ref.as_deref()), (Some("/w"), Some("S1"), Some("builtin:review")));
+        assert_eq!(parent_task.as_deref(), Some("p"));
+        // noGroup beats an explicit parent AND the caller default.
+        let Command::New { parent_task, .. } = build("task_new", serde_json::json!({ "name": "x", "parentTask": "p", "noGroup": true })).unwrap() else { panic!() };
+        assert_eq!(parent_task, None);
+        assert!(build("task_new", serde_json::json!({ "name": "x", "args": [1] })).is_err(), "argv entries are strings");
+    }
+
+    #[test]
+    fn task_send_takes_a_library_prompt_alone_but_not_nothing() {
+        let Command::Send { prompt, prompt_ref, .. } = build("task_send", serde_json::json!({ "task": "t", "library": "builtin:review" })).unwrap() else { panic!() };
+        assert_eq!((prompt.as_str(), prompt_ref.as_deref()), ("", Some("builtin:review")));
+        assert!(build("task_send", serde_json::json!({ "task": "t" })).is_err());
+    }
+
+    #[test]
+    fn caller_defaults_fill_only_what_the_cli_would_and_never_override() {
+        let empty = Args::new();
+        let d = with_caller_defaults("task_new", &empty, Some("me"));
+        assert_eq!(d.get("parentTask").and_then(|v| v.as_str()), Some("me"));
+        for t in SELF_DEFAULT_TOOLS {
+            assert_eq!(with_caller_defaults(t, &empty, Some("me")).get("task").and_then(|v| v.as_str()), Some("me"));
+        }
+        // Explicit arguments win.
+        let mut given = Args::new();
+        given.insert("task".into(), "other".into());
+        assert_eq!(with_caller_defaults("task_rename", &given, Some("me"))["task"], "other");
+        // `send --here` is the only way send aims at the caller.
+        let mut here = Args::new();
+        here.insert("here".into(), true.into());
+        assert_eq!(with_caller_defaults("task_send", &here, Some("me"))["task"], "me");
+        for t in ["scratchpad_new", "scratchpad_write", "scratchpad_read", "scratchpad_list"] {
+            assert_eq!(with_caller_defaults(t, &empty, Some("me"))["task"], "me", "{t}");
+        }
+        // Verbs the CLI never aims at "your own task" are left alone.
+        assert!(with_caller_defaults("task_archive", &empty, Some("me")).is_empty());
+        assert!(with_caller_defaults("task_send", &empty, Some("me")).is_empty());
+        // No header, no defaults.
+        assert!(with_caller_defaults("task_new", &empty, None).is_empty());
+    }
+
+    #[test]
+    fn a_self_tool_uses_the_callers_task_header_and_refuses_without_it() {
+        let (addr, token, _sd) = spawn(true);
+        let body = |args: serde_json::Value| {
+            let mut b = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "task_group", "arguments": args },
+            });
+            b["params"]["_meta"] = meta();
+            b.to_string()
+        };
+        let headers = |task: Option<&'static str>| {
+            let mut h = vec![
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "task_group"),
+                ("MCP-Protocol-Version", SPEC_REVISION),
+                ("Content-Type", "application/json"),
+            ];
+            if let Some(t) = task {
+                h.push((MCP_TASK_HEADER, t));
+            }
+            h
+        };
+        // With the header: `group` alone reports the CALLER's task (w3 = solo).
+        let (status, _, resp) = post(addr, Some(&token), &headers(Some("w3")), &body(serde_json::json!({})));
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        assert!(v["result"]["structuredContent"]["task"].as_str().unwrap().ends_with("/solo"), "{v}");
+        // Without it: a clear refusal saying how to fix it, never a guess.
+        let (_, _, resp) = post(addr, Some(&token), &headers(None), &body(serde_json::json!({})));
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("did not say which Termic task"), "{v}");
+    }
+
     #[test]
     fn port_file_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -3461,3 +3890,4 @@ command = \"/bin/true\"\n";
         assert_eq!(token_from_file(dir.path()), None, "rejects loose mode");
     }
 }
+

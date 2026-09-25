@@ -1708,7 +1708,7 @@ pub fn render_filter_for(task: &Task, agent_override: Option<&str>) -> String {
         // nothing else: no telemetry, no update checks, no auth flow. A
         // deny here means the code grew an endpoint or the user aimed it
         // at a new relay; add the host deliberately, like every other row.
-        "axcoding" | "axcoding-rlm" => hosts.extend([
+        "axcoding" => hosts.extend([
             r"^api\.anthropic\.com$".into(),
             r"^api\.openai\.com$".into(),
             // Zhipu GLM's Anthropic-compatible relay, where cc-switch's

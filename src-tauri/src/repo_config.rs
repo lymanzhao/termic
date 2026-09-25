@@ -12,13 +12,20 @@
 // See `repo_config_for` in lib.rs.
 //
 // Plain serde round-trip via `serde_yml` — read into `RepoConfig`,
-// write back. Hand-written comments are not preserved across a write.
+// write back. Hand-written comments are not preserved across a write;
+// `HEADER` is re-emitted as the first line on every one.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const FILE_NAME: &str = ".termic.yaml";
+
+/// First line of every `.termic.yaml` termic writes. The file lands in a
+/// team's repo, where most readers have never heard of termic, so it says
+/// what wrote it and where to look. Written by `save`, the only writer, so a
+/// scaffold and every later edit from the UI both carry it.
+pub const HEADER: &str = "# Termic repo config: https://termic.dev\n";
 
 /// Which sandbox allow-list a write targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +143,7 @@ pub fn save(repo_root: &Path, cfg: &RepoConfig) -> Result<()> {
         cfg.version = 1;
     }
     let raw = serde_yml::to_string(&cfg).context("serialize .termic.yaml")?;
-    let text = indent_block_sequences(&raw);
+    let text = format!("{HEADER}{}", indent_block_sequences(&raw));
     let path = repo_root.join(FILE_NAME);
     crate::write_atomic(&path, text.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -242,6 +249,24 @@ pub fn add_allowed(repo_root: &Path, kind: AllowKind, value: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_write_starts_with_the_header_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = || std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(scaffold(dir.path()).unwrap());
+        let first = read();
+        assert!(first.starts_with("# "), "{first}");
+        assert_eq!(first.lines().next().unwrap(), HEADER.trim_end());
+        assert!(HEADER.contains("https://termic.dev"));
+        // A later save rewrites the file: still one header, still first.
+        add_allowed(dir.path(), AllowKind::Host, "api.acme.com").unwrap();
+        let again = read();
+        assert!(again.starts_with(HEADER), "{again}");
+        assert_eq!(again.matches("termic.dev").count(), 1);
+        // And the comment does not get in the way of reading it back.
+        assert_eq!(load(dir.path()).unwrap().unwrap().sandbox.allowed_hosts, vec!["api.acme.com"]);
+    }
 
     #[test]
     fn save_load_round_trip() {

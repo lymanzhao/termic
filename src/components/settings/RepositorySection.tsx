@@ -45,6 +45,7 @@ export function RepositorySection({ projectId }: { projectId: string }) {
   // The feature's name follows the type-checking switch (lib/lsp/featureName).
   // Up here with the other hooks: this component early-returns further down.
   const typeChecking = usePrefs(s => s.codeIntelDiagnostics);
+  const appDefaultYolo = usePrefs(s => s.defaultYolo);
   // App-wide browser, only to describe what "follow the app-wide setting"
   // currently resolves to in the dropdown label. MUST stay up here with the
   // other hooks: this component early-returns when no project is selected,
@@ -748,7 +749,7 @@ export function RepositorySection({ projectId }: { projectId: string }) {
               <Trans
                 t={t}
                 i18nKey={isMulti ? "repo.filesHintMulti" : "repo.filesHintSingle"}
-                components={{ 1: <code className="font-mono" /> }}
+                components={{ 1: <code className="font-mono" />, 3: <code className="font-mono" /> }}
               />
             </div>
             <textarea
@@ -954,6 +955,36 @@ export function RepositorySection({ projectId }: { projectId: string }) {
                   dockerOffered ? undefined : t("repo.dockerUnavailable")
                 }
               />
+            </div>
+
+            {/* This project's YOLO default. Three answers because the field
+                is optional: no opinion inherits Settings → Sandbox, and "Off"
+                keeps a project asking on a machine that is otherwise YOLO.
+                Personal (projects.json) only, never .termic.yaml: a committed
+                file must not be able to switch approvals off for a clone. */}
+            <div>
+              <div className="text-[13.5px] font-medium">New tasks start in YOLO</div>
+              <div className="mt-0.5 mb-2 text-[12.5px] text-[var(--color-fg-dim)]">
+                Whether new tasks of this project skip the agent's own permission prompts. The New Task
+                dialog starts here and lets you change it per task. Saved on this machine only, not in{" "}
+                <code className="font-mono">.termic.yaml</code>.
+              </div>
+              <select
+                data-testid="project-default-yolo"
+                value={draft.default_yolo == null ? "inherit" : draft.default_yolo ? "on" : "off"}
+                onChange={(e) => patch(
+                  "default_yolo",
+                  e.target.value === "inherit" ? null : e.target.value === "on",
+                )}
+                className={cn(
+                  "rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-[13.5px] text-[var(--color-fg)] outline-none focus:border-[var(--color-accent)] min-w-[140px]",
+                  flashRing("default_yolo"),
+                )}
+              >
+                <option value="inherit">App default ({appDefaultYolo ? "on" : "off"})</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
             </div>
 
             {/* Only meaningful for a Docker default; hidden otherwise rather

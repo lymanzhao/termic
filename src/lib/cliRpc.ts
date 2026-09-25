@@ -19,7 +19,8 @@
 // `wait` works even while this webview is busy).
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useApp } from "@/store/app";
 import { waitForAgentReady } from "@/lib/agentReady";
 import { usePrefs } from "@/store/prefs";
@@ -28,6 +29,7 @@ import {
   onPtyData,
   projectAdd,
   ptyAlive,
+  projectBranchContext,
   projectGitBranches,
   projectRemove,
   settingsLoad,
@@ -37,7 +39,11 @@ import {
   taskRename,
   taskSetYolo,
   tasksList,
+  taskGroupJoin,
+  taskGroupNew,
+  taskGroupUpdate,
 } from "@/lib/ipc";
+import { nextGroupColor } from "@/lib/taskGroups";
 import { startArchive } from "@/lib/archiveTask";
 import { withCreateLock } from "@/lib/createLock";
 import { markUnattendedSpawn } from "@/lib/unattendedSpawns";
@@ -56,6 +62,7 @@ import {
   type NewTaskMode,
 } from "@/lib/quickTask";
 import { slugify } from "@/lib/utils";
+import { checkoutTaskName, remoteNames } from "@/lib/existingBranch";
 import { padHandler } from "@/lib/scratchCli";
 import type { SandboxMode, Task, TerminalTab } from "@/lib/types";
 
@@ -118,6 +125,11 @@ interface NewTaskParams {
   /** "worktree" | "main"; absent = the GUI's remembered mode. */
   mode?: string;
   base?: string;
+  /** EXISTING branch to check out into the new worktree (`new --checkout`):
+   *  local, `<remote>/<branch>`, or only on the remote. Forces worktree
+   *  mode; with it `base` is only the diff baseline and `name` may be
+   *  empty. */
+  checkout?: string;
   /** Existing worktree to ADOPT instead of creating one (GH #169,
    *  `new --from`). Path already canonicalized and project-matched by
    *  the server; Rust still validates it is a worktree of this repo. */
@@ -131,6 +143,9 @@ interface NewTaskParams {
   open?: boolean;
   prompt?: string;
   promptId?: string;
+  /** The task whose agent ran `termic new` / MCP `task_new`, already checked
+   *  live by the server. The new task joins its sidebar group. */
+  parentTaskId?: string;
 }
 
 /** The main checkout stays uncaged unless explicitly opted in, and
@@ -160,7 +175,14 @@ async function mainCheckoutSandbox(
  *  GUI would: derived + auto-numbered branch for worktrees, the shared
  *  repo checkout for main mode. */
 async function createTask(p: NewTaskParams, mode: NewTaskMode): Promise<Task> {
-  const name = p.name.trim();
+  const checkout = checkoutBranchOf(p);
+  let name = (p.name ?? "").trim();
+  // `new --checkout` may leave the name to us: the branch minus its remote,
+  // the same default the New Task dialog's Existing branch mode shows.
+  if (checkout && !name) {
+    const ctx = await projectBranchContext(p.projectId).catch(() => null);
+    name = checkoutTaskName(checkout, ctx ? remoteNames(ctx) : []);
+  }
   const cli = typeof p.agent === "string" && p.agent ? p.agent : undefined;
   const pins = sandboxPins(p.sandbox);
   return withCreateLock(async () => {
@@ -181,6 +203,23 @@ async function createTask(p: NewTaskParams, mode: NewTaskMode): Promise<Task> {
     if (slugify(name) === "") {
       throw new Error("Task name must contain at least one letter or number.");
     }
+    const base_branch = typeof p.base === "string" && p.base.trim() ? p.base.trim() : null;
+    // The branch as asked for, never derived or auto-numbered: Rust checks
+    // it out as it exists, and an unknown one is an error, not a new branch.
+    if (checkout) {
+      return taskCreate({
+        id: crypto.randomUUID(),
+        project_id: p.projectId,
+        name,
+        cli,
+        agent_args: p.agentArgs,
+        base_branch,
+        branch: checkout,
+        checkout_existing: true,
+        resume_session_id: resume,
+        ...(pins ?? {}),
+      });
+    }
     let branch = derivedBranch(name, usePrefs.getState().branchPrefix);
     // Auto-number past an existing branch, the dialog's behavior
     // (issue #129). Best-effort: on failure the Rust backstop still
@@ -196,12 +235,17 @@ async function createTask(p: NewTaskParams, mode: NewTaskMode): Promise<Task> {
       name,
       cli,
       agent_args: p.agentArgs,
-      base_branch: typeof p.base === "string" && p.base.trim() ? p.base.trim() : null,
+      base_branch,
       branch,
       resume_session_id: resume,
       ...(pins ?? {}),
     });
   });
+}
+
+/** The branch `new --checkout` asked for, or undefined for any other create. */
+function checkoutBranchOf(p: NewTaskParams): string | undefined {
+  return typeof p.checkout === "string" && p.checkout.trim() ? p.checkout.trim() : undefined;
 }
 
 /** Rust's import refusals cross the string-only RPC error channel with the
@@ -372,8 +416,9 @@ async function newTaskHandler(raw: unknown, progress: Progress): Promise<{ taskI
   const p = raw as NewTaskParams;
   if (typeof p?.projectId !== "string" || !p.projectId) throw new Error("new_task requires a projectId");
   const importing = typeof p.from === "string" && !!p.from;
-  // Importing derives a missing name from the worktree's branch.
-  if (!importing && (typeof p?.name !== "string" || !p.name.trim())) {
+  const checkout = checkoutBranchOf(p);
+  // Importing and checking out derive a missing name from the branch.
+  if (!importing && !checkout && (typeof p?.name !== "string" || !p.name.trim())) {
     throw new Error("new_task requires a name");
   }
   // Cold launch: the RPC ready-latch can beat loadAll, and an
@@ -399,15 +444,26 @@ async function newTaskHandler(raw: unknown, progress: Progress): Promise<{ taskI
   // checkout for them and so do we (the server already rejected an
   // EXPLICIT --worktree with a clear error).
   const nonGit = useApp.getState().projects.find(pr => pr.id === p.projectId)?.non_git === true;
+  // The server refuses this first; the store is re-checked because a
+  // checkout on a plain folder would otherwise quietly open the main
+  // checkout instead.
+  if (checkout && nonGit) throw new Error("checkout needs a git repository; this project is a plain folder");
+  // A checkout is always a worktree: the branch goes into its own folder.
   const mode: NewTaskMode = nonGit
     ? "repo_root"
-    : p.mode === "worktree" ? "worktree" : p.mode === "main" ? "repo_root" : readNewTaskMode();
+    : checkout || p.mode === "worktree" ? "worktree" : p.mode === "main" ? "repo_root" : readNewTaskMode();
 
   const task = importing ? await importTask(p) : await createTask(p, mode);
   // Before anything mounts, so the first spawn composes the flags in.
   // (The import path carried yolo in the create payload itself.)
   if (!importing && p.yolo) await taskSetYolo(task.id, true).catch(() => {});
   if (typeof p.prompt === "string" && p.prompt) markUnattendedSpawn(task.id);
+  // Before loadAll, so the row appears already inside its group rather than
+  // popping into it a beat later. Cosmetic, so a failure (the parent was
+  // archived in between, another profile) never fails the create.
+  if (typeof p.parentTaskId === "string" && p.parentTaskId) {
+    await taskGroupJoin(task.id, p.parentTaskId, nextGroupColor(useApp.getState().tasks)).catch(() => {});
+  }
 
   await useApp.getState().loadAll();
   useApp.getState().mountTasks([task.id]);
@@ -486,7 +542,10 @@ async function deliverOrQueue(
 ): Promise<{ mode: string; capable: boolean }> {
   const ptyId = tab.ptyId;
   if (!ptyId) throw new Error("the agent tab lost its PTY before the prompt could be typed");
-  const busy = capable && (tab.workState === "working" || (tab.queue?.length ?? 0) > 0);
+  // An agent stalled on delegated work (its own loop stopped, subagents or
+  // shells still running) takes the prompt now rather than queueing it.
+  const busy = capable
+    && ((tab.workState === "working" && !tab.delegatedIdle) || (tab.queue?.length ?? 0) > 0);
   if (busy) {
     useApp.getState().enqueueAgentMessage(p.taskId, tab.id, p.prompt, 1, p.promptId);
     return { mode: "queued", capable };
@@ -743,6 +802,40 @@ async function renameTaskHandler(params: unknown): Promise<null> {
   if (typeof name !== "string" || !name.trim()) throw new Error("rename_task requires a name");
   await withCreateLock(async () => {
     await taskRename(taskId, name);
+    await useApp.getState().loadAll();
+  });
+  return null;
+}
+
+/** `termic group --name/--color` (and MCP `task_group`). A key that is ABSENT
+ *  leaves that property as it is; `name: ""` returns the group to following
+ *  its lead's name. A task in no group founds a group of one around itself
+ *  first, coloured like any founding, so an orchestrator can name its group
+ *  before it spawns anyone. The server validated the colour key. */
+export async function setTaskGroupHandler(params: unknown): Promise<null> {
+  const p = params as { taskId?: unknown; name?: unknown; color?: unknown };
+  const taskId = p?.taskId;
+  if (typeof taskId !== "string" || !taskId) throw new Error("set_task_group requires a taskId");
+  const name = typeof p.name === "string" ? p.name.trim() : undefined;
+  const color = typeof p.color === "string" && p.color ? p.color : undefined;
+  if (name === undefined && color === undefined) return null;
+  await withCreateLock(async () => {
+    const app = useApp.getState();
+    if (!app.tasks.some(t => t.id === taskId)) await app.loadAll();
+    const all = useApp.getState().tasks;
+    const task = all.find(t => t.id === taskId);
+    if (!task) throw new Error("no such task");
+    if (!task.group) {
+      await taskGroupNew(taskId, color ?? nextGroupColor(all));
+      await useApp.getState().loadAll();
+    }
+    const g = useApp.getState().tasks.find(t => t.id === taskId)?.group;
+    if (!g) throw new Error("the task's group could not be read back");
+    await taskGroupUpdate(
+      g.id,
+      name !== undefined ? name || null : g.name ?? null,
+      color ?? g.color ?? null,
+    );
     await useApp.getState().loadAll();
   });
   return null;
@@ -1114,6 +1207,7 @@ const handlers: Record<string, Handler> = {
   send_prompt: sendPromptHandler,
   archive_task: archiveTaskHandler,
   rename_task: renameTaskHandler,
+  set_task_group: setTaskGroupHandler,
   pad: padHandler,
   project_add: projectAddHandler,
   project_remove: projectRemoveHandler,
@@ -1148,7 +1242,15 @@ let started = false;
 export function initCliRpc(): Promise<UnlistenFn> {
   if (started) return Promise.resolve(() => {});
   started = true;
-  return listen<RpcRequest>("cli-rpc://request", ev => {
+  // THIS window's listener, never the global `listen`: Tauri 2's global
+  // listen defaults to target Any, which also receives what Rust `emit_to`s
+  // at ANOTHER window. With a second profile window open, every request ran
+  // in both webviews: one `new` created the task in the right window while
+  // the other re-ran git against the same repo and failed on the branch the
+  // first had just made, and that fast failure was the reply the caller got.
+  // Measured: profiles.e2e.ts "serves a CLI/MCP request in exactly one
+  // window", which reproduces the report without this scoping.
+  return getCurrentWebviewWindow().listen<RpcRequest>("cli-rpc://request", ev => {
     void dispatch(ev.payload);
   })
     .then(unlisten => {

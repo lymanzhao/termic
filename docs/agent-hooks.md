@@ -272,7 +272,11 @@ interactive terminal to start one in.
 
 The id lands on the tab whose terminal it arrived in (`TERMIC_PTY` is per
 spawn), keyed by tab id, so several agent tabs in one task, in any order, each
-keep their own. On the TypeScript side a reported id also supersedes the id the
+keep their own. Unless another tab already holds it: a
+main-checkout task's picker (or a `/resume`) lists its siblings' sessions, and
+storing one of those swapped the two tasks, so it is dropped with a toast
+naming the owner (`sessionHolder`, see
+[adding-an-agent.md](adding-an-agent.md) "When a stored id stops resolving"). On the TypeScript side a reported id also supersedes the id the
 spawn minted: that one is only held once the spawn survives `RESUME_FAILURE_MS`
 and only persisted on the first prompt, so a `/clear` before either used to be
 undone by the next Enter (`sessionReportedRef` in `TerminalPane`).

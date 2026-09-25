@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, dashboardBadge, dismissOverlays, ensureActiveTask, pointerDrag, requireTermicApi, keysIn, snap, waitForAppShell, waitForText, waitForTextGone, waitGone, waitVisible } from "../helpers";
+import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, cliRpc, dashboardBadge, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, requireWorkBadges, keysIn, setWindowPresence, snap, submitToAgent, waitForAgentReady, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -760,6 +760,44 @@ describe("branch new tasks from", () => {
       prefilled,
     );
     createdTaskIds.push((created as any).id);
+  });
+
+  // The quick path has no dialog to show the YOLO default in, so it applies
+  // it the way it applies the project's cage, says so in the menu, and the
+  // created task carries it from its first spawn.
+  it("applies the YOLO default to a quick-created agent task", async () => {
+    const nameInput = 'input[placeholder="Task name"]';
+    const NOTE = '[data-testid="quick-create-yolo-note"]';
+    const prev = await browser.execute(() => !!window.__termic!.usePrefs.getState().defaultYolo);
+    await browser.execute(() => window.__termic!.usePrefs.getState().setDefaultYolo(true));
+    try {
+      await openNewTaskMenu(projectId);
+      await settleMenuMode("main");
+      expect(await browser.execute((sel) => !!document.querySelector(sel), NOTE)).toBe(true);
+      await browser.keys("Escape");
+
+      await pickFromNewTaskMenu(projectId, "main", "FakeAgent", nameInput);
+      await waitVisible(nameInput);
+      const name = `e2e-quick-yolo-${Date.now()}`;
+      await browser.execute((sel, n) => {
+        const input = document.querySelector(sel) as HTMLInputElement;
+        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!
+          .set!.call(input, n);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }, nameInput, name);
+      await keysIn(nameInput, "Enter");
+      await browser.waitUntil(
+        () => browser.execute((pid, n) => window.__termic!.useApp.getState().tasks
+          .some((t: any) => t.project_id === pid && t.name === n), projectId, name),
+        { timeout: 10_000, timeoutMsg: "quick-created agent task never appeared" },
+      );
+      const created = await browser.execute((pid, n) => window.__termic!.useApp.getState().tasks
+        .find((t: any) => t.project_id === pid && t.name === n), projectId, name) as any;
+      createdTaskIds.push(created.id);
+      expect(created.yolo).toBe(true);
+    } finally {
+      await browser.execute((v) => window.__termic!.usePrefs.getState().setDefaultYolo(v), prev);
+    }
   });
 
   // GH #242: the sidebar's quick-create row is a SECOND worktree-creation
@@ -1905,6 +1943,78 @@ describe("new task menu puts the project default first", () => {
 // dir because Rust canonicalizes every member path on add, and
 // `task_create_multi` matches the per-task member specs against those
 // canonical strings — a raw `/var/...` would come back "member not found".
+describe("recursive files to copy (GH #320)", () => {
+  let repo = "";
+  let projectId = "";
+
+  before(() => {
+    repo = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-recursive-copy-")));
+    execSync(`git init -b main -q "${repo}"`);
+    execSync(`git -C "${repo}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`);
+    mkdirSync(path.join(repo, "evals/deep"), { recursive: true });
+    writeFileSync(path.join(repo, ".env"), "ROOT=1");
+    writeFileSync(path.join(repo, "evals/.env"), "EVALS=1");
+    writeFileSync(path.join(repo, "evals/deep/.env.local"), "DEEP=1");
+  });
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+    await browser.execute(async (root) => {
+      const t = window.__termic!;
+      for (const task of t.useApp.getState().tasks.filter(
+        (task: any) => task.name === "e2e-recursive-copy-task" && !task.archived,
+      )) {
+        await t.ipc.taskArchive(task.id);
+      }
+      for (const project of t.useApp.getState().projects.filter(
+        (project: any) => project.root_path === root,
+      )) {
+        await t.ipc.projectRemove(project.id);
+      }
+      await t.useApp.getState().loadAll();
+    }, repo);
+    if (repo) rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("copies root and nested env files into a single-repo worktree", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    const result = await browser.execute(async (root) => {
+      const t = window.__termic!;
+      const project = await t.ipc.projectAdd(root);
+      await t.ipc.projectUpdate({ ...project, files_to_copy: ["**/.env*"] });
+      const task = await t.ipc.taskCreate({
+        project_id: project.id,
+        name: "e2e-recursive-copy-task",
+        cli: "shell",
+        base_branch: "main",
+        branch: "e2e-recursive-copy-task",
+      });
+      await t.useApp.getState().loadAll();
+      return { projectId: project.id as string, path: task.path as string };
+    }, repo);
+    projectId = result.projectId;
+
+    expect(readFileSync(path.join(result.path, ".env"), "utf8")).toBe("ROOT=1");
+    expect(readFileSync(path.join(result.path, "evals/.env"), "utf8")).toBe("EVALS=1");
+    expect(readFileSync(path.join(result.path, "evals/deep/.env.local"), "utf8")).toBe("DEEP=1");
+
+    await browser.execute((id) =>
+      window.__termic!.useApp.getState().openSettings("repositories", id), projectId);
+    await waitVisible('textarea[placeholder*="src/config/local.py"]');
+    expect(await browser.execute(() => {
+      const heading = [...document.querySelectorAll("div")].find(
+        (el) => el.textContent?.trim() === "Files to copy",
+      );
+      return heading?.parentElement?.textContent?.includes("**/.env* at any depth") ?? false;
+    })).toBe(true);
+    await browser.execute(() => document.querySelector(
+      'textarea[placeholder*="src/config/local.py"]',
+    )?.scrollIntoView({ block: "center" }));
+    await snap("recursive-files-to-copy-settings.png");
+  });
+});
+
 describe("multi files to copy (GH #264)", () => {
   const PROJECT_NAME = "e2e-multi-copy";
   let tmp = "";
@@ -1939,14 +2049,16 @@ describe("multi files to copy (GH #264)", () => {
     // Host: gitignored secrets only the project's own list names.
     seedRepo(path.join(tmp, "host"), {
       ".env": "HOST=1",
+      "evals/.env": "HOST_EVALS=1",
       "host-only.txt": "host",
       "README.md": "not copied",
     });
     // alpha declares its own globs in `.termic.yaml` — no override needed.
     seedRepo(path.join(tmp, "alpha"), {
-      ".termic.yaml": "version: 1\nscripts:\n  files_to_copy:\n    - \".env*\"\n    - \"secrets\"\n",
+      ".termic.yaml": "version: 1\nscripts:\n  files_to_copy:\n    - \"**/.env*\"\n    - \"secrets\"\n",
       ".env": "ALPHA=1",
       ".env.local": "ALPHA=2",
+      "evals/.env": "ALPHA_EVALS=1",
       "secrets/key.pem": "PRIVATE",
       "README.md": "not copied",
     });
@@ -1985,7 +2097,7 @@ describe("multi files to copy (GH #264)", () => {
           member(beta, ["config/local.json"]),     // per-member override
         ], false) as any;
         // The multi-repo project's OWN list — the box that had no reader.
-        await t.ipc.projectUpdate({ ...proj, files_to_copy: [".env", "host-only.txt"] });
+        await t.ipc.projectUpdate({ ...proj, files_to_copy: ["**/.env*", "host-only.txt"] });
         // Members are matched by the CANONICAL path Rust stored, not the one
         // passed in above.
         const task = await t.ipc.taskCreateMulti({
@@ -2012,12 +2124,14 @@ describe("multi files to copy (GH #264)", () => {
 
     // Host list → the task root (which IS the host's worktree).
     expect(readFileSync(path.join(created.root, ".env"), "utf8")).toBe("HOST=1");
+    expect(readFileSync(path.join(created.root, "evals/.env"), "utf8")).toBe("HOST_EVALS=1");
     expect(readFileSync(path.join(created.root, "host-only.txt"), "utf8")).toBe("host");
 
     // alpha: resolved from its own committed .termic.yaml, directories included.
     const alphaWt = created.members.alpha;
     expect(readFileSync(path.join(alphaWt, ".env"), "utf8")).toBe("ALPHA=1");
     expect(readFileSync(path.join(alphaWt, ".env.local"), "utf8")).toBe("ALPHA=2");
+    expect(readFileSync(path.join(alphaWt, "evals/.env"), "utf8")).toBe("ALPHA_EVALS=1");
     expect(readFileSync(path.join(alphaWt, "secrets/key.pem"), "utf8")).toBe("PRIVATE");
 
     // beta: the per-member override on the multi-repo project.
@@ -2049,7 +2163,9 @@ describe("multi files to copy (GH #264)", () => {
     }, taskId);
 
     expect(readFileSync(path.join(restored.root, ".env"), "utf8")).toBe("HOST=1");
+    expect(readFileSync(path.join(restored.root, "evals/.env"), "utf8")).toBe("HOST_EVALS=1");
     expect(readFileSync(path.join(restored.members.alpha, ".env.local"), "utf8")).toBe("ALPHA=2");
+    expect(readFileSync(path.join(restored.members.alpha, "evals/.env"), "utf8")).toBe("ALPHA_EVALS=1");
     expect(readFileSync(path.join(restored.members.beta, "config/local.json"), "utf8")).toBe("{\"beta\":true}");
   });
 
@@ -2064,6 +2180,12 @@ describe("multi files to copy (GH #264)", () => {
     await browser.execute((id) =>
       window.__termic!.useApp.getState().openSettings("repositories", id), projectId);
     await waitVisible('[data-testid="member-files-to-copy-beta"]');
+    expect(await browser.execute(() => {
+      const heading = [...document.querySelectorAll("div")].find(
+        (el) => el.textContent?.trim() === "Files to copy",
+      );
+      return heading?.parentElement?.textContent?.includes("**/.env* at any depth") ?? false;
+    })).toBe(true);
 
     await browser.execute(() => {
       const box = document.querySelector(
@@ -2187,6 +2309,93 @@ describe("quick-create sandbox note", () => {
     const present = await browser.execute((sel) => !!document.querySelector(sel), NOTE);
     expect(present).toBe(false);
     await browser.keys("Escape");
+  });
+});
+
+// The quick-create menu says when a new agent task will start in YOLO.
+//
+// Same reason as the sandbox note above: the + menu applies the default with
+// no checkbox to show it in, so without this line it would switch approvals
+// off with nothing on screen having said so. Hidden when the answer is off
+// (the baseline) and when the project's cage already turns YOLO on.
+describe("quick-create YOLO note", () => {
+  const NOTE = '[data-testid="quick-create-yolo-note"]';
+  let projectId = "";
+  let saved: { pref: boolean; project: Record<string, unknown> } | null = null;
+
+  const setProject = (fields: Record<string, unknown>) => browser.execute(async (id, f) => {
+    const t = window.__termic!;
+    const p = t.useApp.getState().projects.find((p: any) => p.id === id);
+    await t.ipc.projectUpdate({ ...p, ...(f as object) });
+    await t.useApp.getState().loadAll();
+  }, projectId, fields);
+  const setAppDefault = (on: boolean) =>
+    browser.execute((v) => window.__termic!.usePrefs.getState().setDefaultYolo(v), on);
+
+  const noteShown = async () => {
+    const trigger = `[data-testid="project-new-task-${projectId}"]`;
+    await waitVisible(trigger);
+    await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.click();
+    }, trigger);
+    await waitVisible('[role="menu"]');
+    const shown = await browser.execute((sel) => !!document.querySelector(sel), NOTE);
+    await browser.keys("Escape");
+    return shown;
+  };
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    const info = await browser.execute(() => {
+      const t = window.__termic!;
+      const p = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo")!;
+      return { id: p.id as string, pref: !!t.usePrefs.getState().defaultYolo, project: {
+        default_yolo: p.default_yolo ?? null,
+        default_sandbox: p.default_sandbox ?? false,
+        default_sandbox_mode: p.default_sandbox_mode ?? null,
+        default_docker: p.default_docker ?? false,
+      } };
+    });
+    projectId = info.id;
+    saved = { pref: info.pref, project: info.project };
+    await setProject({ default_yolo: null, default_sandbox: false, default_sandbox_mode: null, default_docker: false });
+  });
+
+  after(async () => {
+    await browser.keys("Escape");
+    if (saved) {
+      await setAppDefault(saved.pref);
+      await setProject(saved.project);
+    }
+  });
+
+  it("says nothing when no default is on", async () => {
+    await setAppDefault(false);
+    expect(await noteShown()).toBe(false);
+  });
+
+  it("says so when the app-wide default is on", async () => {
+    await setAppDefault(true);
+    expect(await noteShown()).toBe(true);
+  });
+
+  it("follows a project that keeps asking", async () => {
+    await setAppDefault(true);
+    await setProject({ default_yolo: false });
+    expect(await noteShown()).toBe(false);
+    await setProject({ default_yolo: null });
+  });
+
+  it("stays quiet when the project's cage already turns YOLO on", async () => {
+    await setAppDefault(true);
+    await setProject({ default_sandbox: true, default_sandbox_mode: "enforce" });
+    expect(await noteShown()).toBe(false);
+    await setProject({ default_sandbox: false, default_sandbox_mode: null });
   });
 });
 
@@ -2333,3 +2542,263 @@ async function setDialogInput(selector: string, value: string): Promise<void> {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }, selector, value);
 }
+
+// GH #324: the project row's task filter. A filter icon opens a bar under
+// the header: a text input (task name + stable agent tab titles), and a bell
+// that keeps only tasks with a notification. Both are live: a CLI rename or a
+// notification arriving moves a row in or out with nothing else happening.
+describe("sidebar task filter", () => {
+  let pid = "";
+  let home = "";
+  let alpha = "";
+  let beta = "";
+  let gamma = "";
+  const row = (id: string) => `[data-sidebar-task-id="${id}"]`;
+  const INPUT = () => `[data-testid="project-filter-input-${pid}"]`;
+  const TOGGLE = () => `[data-testid="project-filter-toggle-${pid}"]`;
+  const CLEAR = () => `[data-testid="project-filter-clear-${pid}"]`;
+  const BELL = () => `[data-testid="project-filter-bell-${pid}"]`;
+  const COUNT = () => `[data-testid="project-filter-bell-count-${pid}"]`;
+  const EMPTY = () => `[data-testid="project-filter-empty-${pid}"]`;
+
+  const present = (id: string) =>
+    browser.execute((sel) => !!document.querySelector(sel), row(id));
+  const expectRows = async (want: Record<string, boolean>, msg: string) => {
+    let last: Record<string, boolean> = {};
+    await browser.waitUntil(async () => {
+      // Built aside and swapped in whole, so a timeout mid-iteration still
+      // reports the last complete reading instead of an empty one.
+      const seen: Record<string, boolean> = {};
+      for (const id of Object.keys(want)) seen[id] = await present(id);
+      last = seen;
+      return Object.keys(want).every(id => seen[id] === want[id]);
+    }, { timeout: 8_000, timeoutMsg: `${msg}: rows ${JSON.stringify(last)}` });
+  };
+  // Raw click: the controls sit at opacity 0 until the row is hovered, and
+  // whether a synthetic pointer counts as hover is not what these cases test.
+  const click = (sel: string) =>
+    browser.execute((s) => (document.querySelector(s) as HTMLElement).click(), sel);
+  /** Type into the filter through React's own input event, opening it first. */
+  const typeFilter = async (value: string) => {
+    if (!(await browser.execute((s) => !!document.querySelector(s), INPUT()))) {
+      await click(TOGGLE());
+      await waitVisible(INPUT());
+    }
+    await browser.execute((sel, v) => {
+      const input = document.querySelector(sel) as HTMLInputElement;
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(input, v);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, INPUT(), value);
+  };
+  /** Park the real pointer off the sidebar, so hover cannot reveal the bar. */
+  const pointerAway = () => $("header[data-active-task]").moveTo();
+  const pinned = () =>
+    browser.execute((s) => document.querySelector(s)?.getAttribute("data-pinned") ?? null, TOGGLE());
+  const opacity = (sel: string) =>
+    browser.execute((s) => {
+      const el = document.querySelector(s);
+      return el ? getComputedStyle(el).opacity : null;
+    }, sel);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    pid = await browser.execute(() =>
+      window.__termic!.useApp.getState().projects.find((p: any) => p.name === "fixture-repo")!.id as string);
+    alpha = await openTask("e2e-filter-alpha");
+    await waitForAgentReady(alpha);
+    beta = await openTask("e2e-filter-beta");
+    await waitForAgentReady(beta);
+    gamma = await openTask("e2e-filter-gamma", false);
+    // The active task is always shown, so keep one that no case filters for.
+    home = await openTask("e2e-filter-home", true, "shell");
+    await browser.execute((id) => {
+      window.__termic!.useApp.getState().setProjectCollapsed(id, false);
+      window.__termic!.useUI.setState({ taskFilters: {} });
+    }, pid);
+    await expectRows({ [alpha]: true, [beta]: true, [gamma]: true }, "setup rows");
+  });
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useUI.setState({ taskFilters: {} }));
+    await setWindowPresence(true);
+    for (const id of [alpha, beta, gamma, home]) if (id) await archiveTask(id);
+  });
+
+  it("opens the filter bar from the filter icon, and closes it again", async () => {
+    const lit = () => browser.execute((s) => document.querySelector(s)!.getAttribute("aria-pressed"), TOGGLE());
+    await click(TOGGLE());
+    await waitVisible(INPUT());
+    // The bell sits in the same bar, to the input's right.
+    await waitVisible(BELL());
+    const focused = await browser.execute((s) => document.activeElement === document.querySelector(s), INPUT());
+    expect(focused).toBe(true);
+    // Open is not active: nothing filters yet, so the icon stays unlit.
+    expect(await lit()).toBe("false");
+    await click(TOGGLE());
+    await waitGone(INPUT());
+  });
+
+  it("lights the filter icon for text and for the bell", async () => {
+    const lit = () => browser.execute((s) => document.querySelector(s)!.getAttribute("aria-pressed"), TOGGLE());
+    await typeFilter("alpha");
+    await browser.waitUntil(async () => (await lit()) === "true", { timeoutMsg: "text did not light the icon" });
+    await keysIn(INPUT(), "Escape");
+    await waitGone(INPUT());
+    expect(await lit()).toBe("false");
+    await click(TOGGLE());
+    await waitVisible(BELL());
+    await click(BELL());
+    await browser.waitUntil(async () => (await lit()) === "true", { timeoutMsg: "the bell did not light the icon" });
+    // An active filter keeps its bar: the icon only focuses it now.
+    await click(TOGGLE());
+    await waitVisible(INPUT());
+    await click(BELL());
+    await waitGone(INPUT());
+    expect(await lit()).toBe("false");
+  });
+
+  it("keeps only tasks whose name matches, and pins the bar", async () => {
+    await typeFilter("ALPHA ");
+    await expectRows({ [alpha]: true, [beta]: false, [gamma]: false }, "name filter");
+    // The bar stays up with the pointer elsewhere, so the user can see why
+    // rows are missing.
+    await browser.waitUntil(async () => (await pinned()) === "true",
+      { timeout: 5_000, timeoutMsg: "an active filter did not pin the bar" });
+    await pointerAway();
+    expect(await opacity(TOGGLE())).toBe("1");
+    await snap("task-filter-name.png");
+  });
+
+  it("matches an agent tab's title", async () => {
+    await browser.execute((id) => {
+      const s = window.__termic!.useApp.getState();
+      const tab = s.tabs[id].find((t: any) => t.type === "terminal");
+      s.renameTab(id, tab.id, "Reviewer");
+    }, beta);
+    await typeFilter("review");
+    await expectRows({ [alpha]: false, [beta]: true, [gamma]: false }, "tab title filter");
+  });
+
+  it("follows a CLI rename live", async () => {
+    await typeFilter("alpha");
+    await expectRows({ [alpha]: true, [gamma]: false }, "before rename");
+    const r = await cliRpc({ cmd: "rename", task: gamma, name: "e2e-filter-alpha-too" });
+    expect(r.ok).toBe(true);
+    await expectRows({ [gamma]: true }, "a rename into the filter did not show the task");
+    await cliRpc({ cmd: "rename", task: gamma, name: "e2e-filter-gamma" });
+    await expectRows({ [gamma]: false }, "a rename out of the filter did not hide the task");
+  });
+
+  it("clears from the button and turns the filter off", async () => {
+    await typeFilter("alpha");
+    await waitVisible(CLEAR());
+    await click(CLEAR());
+    await waitGone(INPUT());
+    await expectRows({ [alpha]: true, [beta]: true, [gamma]: true }, "clear");
+    const filters = await browser.execute(() => window.__termic!.useUI.getState().taskFilters);
+    expect(filters).toEqual({});
+    // Hover may still reveal it, so assert the pin itself, not the opacity.
+    await browser.waitUntil(async () => (await pinned()) === "false",
+      { timeout: 5_000, timeoutMsg: "the bar stayed pinned after the filter was cleared" });
+  });
+
+  it("says nothing under the active task it keeps on screen", async () => {
+    // home is active and in this project, so the list is not empty: it holds
+    // home by exemption. A "no matching tasks" line under a visible row reads
+    // as a contradiction, so the hint waits for a genuinely empty list.
+    await typeFilter("zzz-no-such-task");
+    await expectRows({ [home]: true, [alpha]: false }, "active task exemption");
+    expect(await browser.execute((s) => !!document.querySelector(s), EMPTY())).toBe(false);
+    await keysIn(INPUT(), "Escape");
+    await waitGone(INPUT());
+    // No active task from here to the bell cases, so the list can be empty.
+    await browser.execute(() => window.__termic!.useApp.getState().setActiveTask(null));
+  });
+
+  it("says so when nothing matches, and Escape clears", async () => {
+    await typeFilter("zzz-no-such-task");
+    await waitVisible(EMPTY());
+    await expectRows({ [alpha]: false, [beta]: false, [gamma]: false }, "no match");
+    await keysIn(INPUT(), "Escape");
+    await waitGone(INPUT());
+    await waitGone(EMPTY());
+    await expectRows({ [alpha]: true, [beta]: true, [gamma]: true }, "escape");
+  });
+
+  it("clears from the empty row's action", async () => {
+    await typeFilter("zzz-no-such-task");
+    await waitVisible(EMPTY());
+    await click(`${EMPTY()} button`);
+    await waitGone(EMPTY());
+    await expectRows({ [alpha]: true, [beta]: true, [gamma]: true }, "empty-row clear");
+    await ensureActiveTask(home);
+  });
+
+  it("expands a collapsed project when a filter goes on, and still lets it collapse", async () => {
+    // The header toggles on pointerdown + a document pointerup (it is also
+    // the drag handle), so drive exactly that. A native WebDriver click
+    // stalls on Tauri window-state calls.
+    const clickHeader = () => browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const r = el.getBoundingClientRect();
+      const init = { bubbles: true, button: 0, clientX: r.left + 4, clientY: r.top + r.height / 2, pointerId: 1, isPrimary: true };
+      el.dispatchEvent(new PointerEvent("pointerdown", init));
+      el.dispatchEvent(new PointerEvent("pointerup", init));
+    }, `[data-project-id="${pid}"] span.truncate`);
+    await browser.execute((id) => window.__termic!.useApp.getState().setProjectCollapsed(id, true), pid);
+    await expectRows({ [alpha]: false }, "collapse");
+    await typeFilter("alpha");
+    await expectRows({ [alpha]: true, [beta]: false }, "filter under a collapsed project");
+    // A real click on the header, with the filter still on: the chevron has
+    // to keep working, not be overridden for as long as a filter is up.
+    await clickHeader();
+    await expectRows({ [alpha]: false }, "collapsing with a filter on");
+    await clickHeader();
+    await expectRows({ [alpha]: true }, "expanding with a filter on");
+    await keysIn(INPUT(), "Escape");
+    await expectRows({ [alpha]: true, [beta]: true }, "clear");
+  });
+
+  it("keeps only tasks with a notification behind the bell", async () => {
+    await requireWorkBadges();
+    // Away: the only state in which a badge persists at all.
+    await setWindowPresence(false);
+    await ensureActiveTask(alpha);
+    await submitToAgent(alpha, "#osc9 FakeAgent needs your permission");
+    await waitForWorkBadge(alpha, "attention", { timeout: 15_000, message: "no attention to filter on" });
+    await ensureActiveTask(home);
+
+    await click(TOGGLE());
+    await waitVisible(COUNT());
+    await click(BELL());
+    const pressed = await browser.execute((s) => document.querySelector(s)!.getAttribute("aria-pressed"), BELL());
+    expect(pressed).toBe("true");
+    await expectRows({ [alpha]: true, [beta]: false, [gamma]: false }, "bell filter");
+    // The lit icon is what says rows are hidden, so it must actually show.
+    await pointerAway();
+    const probe = await browser.execute((s) => {
+      const el = document.querySelector(s) as HTMLElement;
+      const st = getComputedStyle(el);
+      return { opacity: st.opacity, pressed: el.getAttribute("aria-pressed") };
+    }, TOGGLE());
+    expect(probe.opacity).toBe("1");
+    expect(probe.pressed).toBe("true");
+    await snap("task-filter-bell.png");
+  });
+
+  it("keeps the active task visible after opening it clears its notification", async () => {
+    const before = Number(await browser.execute((s) => document.querySelector(s)?.textContent ?? "0", COUNT()));
+    await ensureActiveTask(alpha);
+    await browser.waitUntil(
+      async () => Number(await browser.execute((s) => document.querySelector(s)?.textContent ?? "0", COUNT())) === before - 1,
+      { timeout: 8_000, timeoutMsg: "opening the task did not clear its notification" },
+    );
+    // Its notification is gone, but it is the row the user just clicked.
+    await expectRows({ [alpha]: true }, "active task exemption");
+    await ensureActiveTask(home);
+    await expectRows({ [alpha]: false }, "leaving the task drops it from the filtered list");
+    await click(BELL());
+    await expectRows({ [alpha]: true, [beta]: true, [gamma]: true }, "bell off");
+  });
+});

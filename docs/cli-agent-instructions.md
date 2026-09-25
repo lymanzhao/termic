@@ -44,29 +44,32 @@ Two agents coordinate by prompting each other, NOT by blocking on each
 other. When you hand out work, end the prompt with the command you want
 run once that work is done, and let the receiving agent pick the moment:
 
-    "$TERMIC_CLI" send review-auth -p "[Agent message from claude, task
-    $TERMIC_TASK_ID] <your prompt here: what you want it to do>. When done:
-    \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p '[Agent message from <you>,
-    task <your task id>] done: <what you did> -- <you>'
-    -- claude, task $TERMIC_TASK_ID"
+    "$TERMIC_CLI" send review-auth -p "[message from agent:claude
+    task:$TERMIC_TASK id:$TERMIC_TASK_ID] <your prompt here: what you want
+    it to do>. When done, reply: \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p
+    '[message from agent:codex task:review-auth id:<its id>] done: <what
+    you did> -- agent:codex task:review-auth id:<its id>'
+    -- agent:claude task:$TERMIC_TASK id:$TERMIC_TASK_ID"
 
 The outer DOUBLE quotes are load-bearing: YOUR shell expands
-`$TERMIC_TASK_ID` at send time, so the other agent receives a literal
+`$TERMIC_TASK` and `$TERMIC_TASK_ID` at send time, so the other agent receives a literal
 address it can just run. Single quotes there would block expansion and
 leave it guessing at where to reply. `\$TERMIC_CLI` is escaped for the
 opposite reason: the OTHER agent expands its own copy of that one.
 
 Every prompt you send another agent opens with a header and ends with a
-signature, both naming YOU, the sender: your agent name and your own
-`$TERMIC_TASK_ID`.
+signature, both naming YOU, the sender: your agent name, your task's name
+(`$TERMIC_TASK`) and its id (`$TERMIC_TASK_ID`, the address a reply goes
+to). The reply you ask for carries the RECEIVER's identity the same way;
+you know it, since it is the task you are prompting.
 
-    [Agent message from <agent>, task <task id>]
+    [message from agent:<agent> task:<task name> id:<task id>]
     ...
-    -- <agent>, task <task id>
+    -- agent:<agent> task:<task name> id:<task id>
 
 A prompt typed by the user and a prompt sent by an agent arrive in the
 same terminal looking identical, so without this the receiver cannot tell
-a peer's request from the user's instruction. The same goes the other
+a peer's request from the user's instruction, or which peer sent it. The same goes the other
 way: a prompt that arrives WITH that header came from another agent, not
 from the user. Treat it as a request from a peer (the user's own
 instructions win if the two conflict), and put the header and your own
@@ -98,22 +101,23 @@ Ask such a task for a file in its worktree and read that yourself, or
 run it in `monitor` (which reaches the CLI by contract) or uncaged.
 
 The sidebar's task menu has "Copy agent CLI briefing", which puts one
-task's id, directory and that exact command shape on the clipboard as a
-short fragment, ready to paste into a prompt for another agent. It
+task's identity and that exact command shape on the clipboard as a short
+block wrapped in `<termic-task id="..." name="..." project="..."
+agent="..." path="...">`, ready to paste into a prompt for another agent:
+the tag keeps it one clearly attributed unit whatever surrounds it. It
 deliberately does NOT repeat the protocol above, because you are reading
 it here and in `$TERMIC_CLI_HELP` already. It keeps exactly one sentence
-the help does not have: leave the outer double quotes and
-`$TERMIC_TASK_ID` alone. The reader is an agent that rewrites the line
+the help does not have: leave the outer double quotes and the
+`$TERMIC_` variables alone. The reader is an agent that rewrites the line
 to slot its own prompt in, and mangling either kills the reply address
 with no error.
 
 ### Creating a task that produces a result
 
-The file-drop convention is the reliable floor: instruct the created
-agent, in the prompt, to write its deliverable to a named file, then
-read that file. (`result` and `logs` below can read a claude agent's last
-message / the rendered terminal stream, but the file you asked for is
-the deliverable you verify.)
+Ask for a report back. End the prompt you give the new agent with the
+signed `send` to your own task (see "Talking to another agent" above),
+and its result arrives in your terminal when it is done. Termic's agent
+hooks make this reliable, and it is the normal way results come back.
 
 Use `--model <id>` to choose a model for one task without changing the
 agent's shared Settings. Use `--arg=<value>` repeatedly for other agent
@@ -121,13 +125,23 @@ arguments; each value is one argv element, so a flag and its value are
 two occurrences. Explicit `--model` is appended after `--arg` values and
 wins when the agent treats the last model flag as authoritative:
 
-    "$TERMIC_CLI" new implement-auth --agent codex \
+    "$TERMIC_CLI" new implement-auth --agent codex --yolo \
       --arg=--reasoning-effort --arg=low --model <model-id> \
-      -p "Implement the approved authentication plan."
+      -p "[message from agent:claude task:$TERMIC_TASK id:$TERMIC_TASK_ID]
+          Implement the approved authentication plan. When done, reply:
+          \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p '[message from
+          agent:codex task:implement-auth id:<its id>] done: <what you
+          did> -- agent:codex task:implement-auth id:<its id>'
+          -- agent:claude task:$TERMIC_TASK id:$TERMIC_TASK_ID"
 
-Note which half of the protocol applies. A CAGED task cannot report
-back, so the file is the whole channel and you read it on your own
-schedule:
+If no report arrives (the agent stopped early, or you need the answer
+before it replies), `"$TERMIC_CLI" result <task>` reads a claude agent's
+last message and `"$TERMIC_CLI" logs <task>` the rendered terminal.
+
+**Fallback: a file.** Only when the agent cannot report back. A task
+sandboxed in `enforce` / `enforce-fs` is denied the control plane, and a
+script (or anything outside Termic) has no inbox to be prompted at. Then
+the file you ask for is the whole channel, read on your own schedule:
 
     out=$("$TERMIC_CLI" new review-auth --project myproj \
       --sandbox enforce --json \
@@ -137,28 +151,41 @@ schedule:
     # Caged, so nothing will arrive to tell you it finished: get on with
     # your own work and read "$path/RESULT.md" when you next need it.
 
-An UNCAGED task (or `--sandbox monitor`) can do both: write the file AND
-tell you it did, so you are not left checking.
-
-    "$TERMIC_CLI" new review-auth --project myproj --yolo \
-      -p "Review the auth module. Write RESULT.md, change nothing else.
-          When done: \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p 'done:
-          <what you did>'"
-
 Rules that matter:
 
-- Unattended tasks need `--sandbox enforce` (permission prompts
-  self-approve inside the sandbox) or `--yolo` (no sandbox, skips
-  permissions; prefer the sandbox). Otherwise the agent stops at its
-  first permission prompt. The sandbox costs you the report-back, per
-  the section above: that is the trade, pick per task.
+- Unattended tasks need `--yolo` (no sandbox, skips permissions) or
+  `--sandbox enforce` (permission prompts self-approve inside the
+  sandbox); otherwise the agent stops at its first permission prompt.
+  The sandbox costs you the report-back, per the section above: that is
+  the trade, pick per task.
 - Task names must be unique per project; a duplicate name is a clean
   error, so pick a fresh name or archive the old task first.
+
+### Your task group
+
+Every task you create with `new` from inside your own task joins YOUR
+task's group: the sidebar draws them as one coloured block with a
+caption, led by your task, so the user can see which tasks you started.
+A worker that creates tasks adds them to the same group (groups do not
+nest). `new --no-group` keeps a task out.
+
+Name the group for the batch of work, the way you would title a PR:
+
+    "$TERMIC_CLI" group --name "Auth refactor" --color teal
+
+`group` alone prints it (name, colour, members). `--name ""` goes back
+to following your task's name, which is what an unnamed group shows.
+Setting a name or colour on a task in no group founds one around it, so
+you can name the group before creating any workers. Over MCP it is the
+same: `task_new` joins your group with no argument and `task_group`
+names it, because the MCP setup Termic installs tells the server which
+task you run in (the headers helper sends your `$TERMIC_TASK_ID`).
 
 ### Driving an existing task
 
 - `"$TERMIC_CLI" send <task> -p "<text>"` - prompt the RUNNING
-  agent (queues if it is mid-turn). With no agent running, add
+  agent (queues if it is mid-turn, but is typed at once while it only
+  waits on subagents or shells it started). With no agent running, add
   `--resume` (restore the last session) or `--fresh` (new agent, no
   context). `-p -` reads stdin. This is the notification channel above:
   ask for a report back rather than adding `--wait`.
@@ -194,9 +221,12 @@ Rules that matter:
 
 A scratchpad is a tab in a task that holds text outside the worktree:
 nothing in it reaches git, and the user sees it update as you write.
-Use one for findings, a plan, or a running report meant to be READ,
-not committed. Every `scratchpad` verb targets your own task unless you pass
-`--task`.
+Use one for findings, a plan, logs, or a running report meant to be
+READ, not committed: it is the place for temporary output, so never drop
+throwaway `.md` files into the repo instead. Every `scratchpad` verb
+targets your own task unless you pass `--task`. Over MCP the same verbs
+are `scratchpad_new`, `scratchpad_write`, `scratchpad_read` and
+`scratchpad_list`, also defaulting to your own task.
 
 - `"$TERMIC_CLI" scratchpad new --title "<title>" -c "<text>"` - create one
   (it opens without taking focus) and print its id. `-c -` reads stdin.

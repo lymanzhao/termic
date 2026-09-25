@@ -852,6 +852,10 @@ pub(crate) fn dispatch_authenticated(
         Command::Rename { task, project, name, cwd } => {
             handle_rename(&req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref(), name)
         }
+        Command::Group { task, project, name, color, cwd } => handle_group(
+            &req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref(),
+            name.as_deref(), color.as_deref(),
+        ),
         Command::PadList { task, project, cwd } => handle_pad(
             &req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref(),
             serde_json::json!({ "op": "list" }),
@@ -919,7 +923,7 @@ fn handle_list(id: &str, host: &dyn CliHost, project: Option<&str>, quiet: bool)
         .iter()
         .map(|t| {
             let diff = if quiet { None } else { host.diff_stat(t) };
-            summarize(t, &projects, states.as_ref(), diff)
+            summarize(t, &projects, &tasks, states.as_ref(), diff)
         })
         .collect();
     rows.sort_by(|a, b| (&a.project, &a.name).cmp(&(&b.project, &b.name)));
@@ -940,7 +944,7 @@ fn handle_status(
     };
     let states = host.work_states(std::slice::from_ref(&t.id));
     let diff = host.diff_stat(t);
-    let summary = summarize(t, &projects, states.as_ref(), diff.clone());
+    let summary = summarize(t, &projects, &tasks, states.as_ref(), diff.clone());
     let sandbox = sandbox_mode_str(t);
     let sessions = (t.persisted_tabs.len() + t.right_split_tabs.len()) as u32;
     let dirty_files = diff.map(|d| d.files_changed + d.untracked);
@@ -985,7 +989,7 @@ fn handle_open(
         }
     }
     host.raise_window();
-    let summary = resolved.map(|t| summarize(t, &projects, None, None));
+    let summary = resolved.map(|t| summarize(t, &projects, &tasks, None, None));
     Reply::ok(id, ReplyData::Open(proto::OpenData { task: summary, raised: true }))
 }
 
@@ -1090,6 +1094,7 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         agent_args,
         mode,
         base,
+        checkout,
         from,
         resume,
         sandbox,
@@ -1099,6 +1104,7 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         wait,
         timeout_ms,
         cwd,
+        parent_task,
     } = &req.cmd
     else {
         unreachable!("handle_new called with a non-new command")
@@ -1128,10 +1134,22 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
             "from adopts an existing worktree; it cannot combine with a mode or base".into(),
         );
     }
+    // Checkout shape: an existing branch into a NEW worktree, so it can
+    // neither adopt one (`from`) nor run in the main checkout. Same reason
+    // as above for checking what clap already forbids.
+    if checkout.is_some() && (from.is_some() || mode.as_deref() == Some("main")) {
+        return fail(
+            ErrorCode::BadRequest,
+            "checkout puts an existing branch in a new worktree; it cannot combine with from or the main checkout".into(),
+        );
+    }
+    if checkout.as_deref().is_some_and(|b| b.trim().is_empty()) {
+        return fail(ErrorCode::BadRequest, "checkout needs a branch name".into());
+    }
     let mut trimmed = name.trim();
-    // With `from` the name is optional: the webview derives it from the
-    // worktree's branch, the GUI import default.
-    if trimmed.is_empty() && from.is_none() {
+    // With `from` or `checkout` the name is optional: the webview derives
+    // it from the branch, as the GUI import and checkout do.
+    if trimmed.is_empty() && from.is_none() && checkout.is_none() {
         return fail(ErrorCode::BadRequest, "the task name is empty".into());
     }
     // An empty prompt would mint a prompt id nothing ever reports on
@@ -1182,6 +1200,12 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         return fail(
             ErrorCode::BadRequest,
             format!("project \"{}\" is a plain folder (non-git); from needs a git worktree", proj.name),
+        );
+    }
+    if proj.non_git && checkout.is_some() {
+        return fail(
+            ErrorCode::BadRequest,
+            format!("project \"{}\" is a plain folder (non-git); checkout needs a git repository", proj.name),
         );
     }
 
@@ -1287,12 +1311,22 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         host.prompt_reports().expect(pid);
     }
 
+    // The orchestrator this task groups under. Only a task that exists is
+    // passed on (by id, since that is what `$TERMIC_TASK_ID` carries): a
+    // stale id from another data dir, or an agent guessing, just means no
+    // group. Grouping is cosmetic, so it never fails a create.
+    let parent_task_id = parent_task
+        .as_deref()
+        .and_then(|pid| tasks.iter().find(|t| t.id == pid && !t.archived))
+        .map(|t| t.id.clone());
     let params = serde_json::json!({
         "name": trimmed,
+        "parentTaskId": parent_task_id,
         "agent": agent,
         "agentArgs": agent_args,
         "mode": mode,
         "base": base,
+        "checkout": checkout.as_deref().map(str::trim),
         "from": from,
         "resume": resume,
         "sandbox": sandbox,
@@ -1356,7 +1390,7 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         );
     };
     let states = host.work_states(std::slice::from_ref(&task_id));
-    let summary = summarize(task, &projects, states.as_ref(), None);
+    let summary = summarize(task, &projects, &tasks, states.as_ref(), None);
     let _ = sink.emit(&StreamEvent::created(id, summary.clone()));
     if *open {
         host.raise_window();
@@ -3061,7 +3095,7 @@ fn handle_rename(
     // what we asked for (task_rename trims; a racing write loses cleanly).
     let (projects, tasks) = host.projects_tasks();
     let renamed = match tasks.iter().find(|w| w.id == t.id) {
-        Some(w) => summarize(w, &projects, None, None),
+        Some(w) => summarize(w, &projects, &tasks, None, None),
         None => {
             return Reply::err(
                 id,
@@ -3073,6 +3107,63 @@ fn handle_rename(
     Reply::ok(
         id,
         ReplyData::Rename(proto::RenameData { task: renamed, old_name: t.name }),
+    )
+}
+
+/// `group`: report, or rename / recolour, the task's sidebar task group. The
+/// write goes through the webview (`set_task_group`) for the same reason
+/// rename does: the store it lands in is the one the sidebar draws from, and
+/// founding a group needs the webview's colour pick.
+fn handle_group(
+    id: &str,
+    host: &dyn CliHost,
+    task: Option<&str>,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    name: Option<&str>,
+    color: Option<&str>,
+) -> Reply {
+    if let Some(c) = color {
+        if !GROUP_COLORS.contains(&c) {
+            return Reply::err(
+                id,
+                ErrorCode::BadRequest,
+                format!("unknown colour \"{c}\" (one of {})", GROUP_COLORS.join(", ")),
+            );
+        }
+    }
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task, project, cwd) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    if name.is_some() || color.is_some() {
+        if t.archived {
+            return Reply::err(id, ErrorCode::BadRequest, format!("task {} is archived", t.name));
+        }
+        // Absent keys mean "leave as is"; `name: ""` means "follow the lead".
+        let mut params = serde_json::json!({ "taskId": t.id });
+        if let Some(n) = name {
+            params["name"] = serde_json::Value::String(n.trim().to_string());
+        }
+        if let Some(c) = color {
+            params["color"] = serde_json::Value::String(c.to_string());
+        }
+        if let Err(e) = host.rpc("set_task_group", params, PROJECT_RPC_TIMEOUT) {
+            return Reply::err(id, ErrorCode::Internal, format!("updating the group failed ({e})"));
+        }
+    }
+    // Re-read from disk: the reply reports what was persisted.
+    let (projects, tasks) = host.projects_tasks();
+    let Some(now) = tasks.iter().find(|w| w.id == t.id) else {
+        return Reply::err(id, ErrorCode::Internal, "task disappeared while updating its group");
+    };
+    Reply::ok(
+        id,
+        ReplyData::Group(proto::GroupData {
+            task: qualified(&projects, now),
+            group: group_info(now, &projects, &tasks, true),
+        }),
     )
 }
 
@@ -3224,6 +3315,7 @@ fn handle_project_remove(id: &str, host: &dyn CliHost, name: &str) -> Reply {
 fn summarize(
     task: &Task,
     projects: &[Project],
+    tasks: &[Task],
     states: Option<&HashMap<String, WorkStateInfo>>,
     diff: Option<proto::DiffStat>,
 ) -> proto::TaskSummary {
@@ -3254,7 +3346,36 @@ fn summarize(
         work_state: info.map(|i| i.state.clone()),
         open_tabs: info.filter(|i| i.hydrated).map(|i| i.tabs),
         diff,
+        group: group_info(task, projects, tasks, false),
     }
+}
+
+/// The accent keys a group colour may be (src/lib/accents.ts `ACCENTS`).
+/// Checked here so a typo is a clear refusal naming the choices rather than
+/// a colour the sidebar silently draws as the neutral fallback.
+const GROUP_COLORS: &[&str] = &["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"];
+
+/// `task`'s group as callers see it: the label resolved the way the sidebar
+/// resolves it (own name, else the lead task's live name), and, when asked,
+/// the live members lead first.
+fn group_info(task: &Task, projects: &[Project], tasks: &[Task], with_members: bool) -> Option<proto::TaskGroupInfo> {
+    let g = task.group.as_ref()?;
+    let own = g.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let name = own
+        .map(str::to_string)
+        .or_else(|| tasks.iter().find(|t| t.id == g.id).map(|t| t.name.clone()))
+        .unwrap_or_else(|| "Task group".into());
+    let members = if with_members {
+        let mut live: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| !t.archived && t.group.as_ref().is_some_and(|m| m.id == g.id))
+            .collect();
+        live.sort_by_key(|t| t.id != g.id); // lead first, the rest in list order
+        live.into_iter().map(|t| qualified(projects, t)).collect()
+    } else {
+        Vec::new()
+    };
+    Some(proto::TaskGroupInfo { id: g.id.clone(), name, named: own.is_some(), color: g.color.clone(), members })
 }
 
 fn sandbox_mode_str(task: &Task) -> String {
@@ -5822,6 +5943,7 @@ mod tests {
             agent_args: Vec::new(),
             mode: None,
             base: None,
+            checkout: None,
             from: None,
             resume: None,
             sandbox: None,
@@ -5831,6 +5953,7 @@ mod tests {
             wait: false,
             timeout_ms: None,
             cwd: None,
+            parent_task: None,
         }
     }
 
@@ -5865,6 +5988,31 @@ mod tests {
             serde_json::json!(["--effort", "low", "--model", "worker"]),
         );
         assert!(calls[0].1["promptId"].is_null(), "no prompt, no prompt id");
+    }
+
+    #[test]
+    fn new_passes_a_known_parent_task_and_drops_an_unknown_one() {
+        // A live caller task groups the new one under it.
+        let host = StubHost::default();
+        host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1" })));
+        let mut cmd = new_cmd("shiny", Some("web"));
+        if let Command::New { parent_task, .. } = &mut cmd {
+            *parent_task = Some("w2".into());
+        }
+        assert!(handle(&req(cmd, Some("tok")), &host).ok);
+        assert_eq!(host.rpc_calls.lock().unwrap()[0].1["parentTaskId"], "w2");
+
+        // A stale id (another data dir, a guess) is not an error: the create
+        // goes through ungrouped.
+        let host = StubHost::default();
+        host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1" })));
+        let mut cmd = new_cmd("shiny", Some("web"));
+        if let Command::New { parent_task, .. } = &mut cmd {
+            *parent_task = Some("no-such-task".into());
+        }
+        let reply = handle(&req(cmd, Some("tok")), &host);
+        assert!(reply.ok, "{reply:?}");
+        assert!(host.rpc_calls.lock().unwrap()[0].1["parentTaskId"].is_null());
     }
 
     #[test]
@@ -6071,6 +6219,58 @@ mod tests {
         }
         let err = handle(&req(cmd, Some("tok")), &host).error.unwrap();
         assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    // ── new --checkout: an existing branch into a new worktree ───────
+
+    fn checkout_cmd(branch: &str) -> Command {
+        let mut cmd = new_cmd("", Some("web"));
+        if let Command::New { checkout, .. } = &mut cmd {
+            *checkout = Some(branch.into());
+        }
+        cmd
+    }
+
+    #[test]
+    fn new_checkout_forwards_the_branch_and_lets_the_name_be_derived() {
+        let host = StubHost::default();
+        host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1", "spawned": true })));
+        let reply = handle(&req(checkout_cmd(" origin/alice/fix "), Some("tok")), &host);
+        assert!(reply.ok, "{reply:?}");
+        let calls = host.rpc_calls.lock().unwrap();
+        let (_, params) = &calls[0];
+        assert_eq!(params["checkout"], "origin/alice/fix");
+        // Empty name goes through: the webview derives it from the branch.
+        assert_eq!(params["name"], "");
+    }
+
+    #[test]
+    fn new_checkout_shape_guards_fire_before_any_rpc() {
+        let host = StubHost::default();
+        // checkout + the main checkout, checkout + from, and a blank branch.
+        let mut main = checkout_cmd("alice/fix");
+        if let Command::New { mode, .. } = &mut main {
+            *mode = Some("main".into());
+        }
+        let mut from = checkout_cmd("alice/fix");
+        if let Command::New { from, .. } = &mut from {
+            *from = Some("/elsewhere/wt".into());
+        }
+        for cmd in [main, from, checkout_cmd("  ")] {
+            let err = handle(&req(cmd, Some("tok")), &host).error.unwrap();
+            assert_eq!(err.code, ErrorCode::BadRequest, "{}", err.message);
+        }
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_checkout_on_a_non_git_project_is_refused() {
+        let mut host = StubHost::default();
+        host.projects[0].non_git = true;
+        let err = handle(&req(checkout_cmd("alice/fix"), Some("tok")), &host).error.unwrap();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("non-git"), "{}", err.message);
         assert!(host.rpc_calls.lock().unwrap().is_empty());
     }
 
@@ -6534,6 +6734,59 @@ mod tests {
         let err = reply.error.expect("error");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("nope"), "{}", err.message);
+    }
+
+    fn group_cmd(task: &str, name: Option<&str>, color: Option<&str>) -> Command {
+        Command::Group {
+            task: Some(task.into()),
+            project: None,
+            name: name.map(str::to_string),
+            color: color.map(str::to_string),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn group_with_no_change_only_reports_and_resolves_the_label() {
+        let mut host = StubHost::default();
+        // w1 leads an unnamed group w3 is in: the label is w1's live name.
+        for t in host.tasks.iter_mut().filter(|t| t.id == "w1" || t.id == "w3") {
+            t.group = Some(crate::TaskGroup { id: "w1".into(), name: None, color: Some("teal".into()) });
+        }
+        let reply = handle(&req(group_cmd("w3", None, None), Some("tok")), &host);
+        let Some(ReplyData::Group(g)) = reply.data else { panic!("expected group, got {reply:?}") };
+        let info = g.group.expect("w3 is grouped");
+        assert_eq!(info.id, "w1");
+        assert_eq!(info.name, "fix-auth");
+        assert!(!info.named, "an unnamed group follows its lead");
+        assert_eq!(info.color.as_deref(), Some("teal"));
+        assert_eq!(info.members.first().map(String::as_str), Some("web/fix-auth"), "lead first");
+        assert_eq!(info.members.len(), 2);
+        assert!(host.rpc_calls.lock().unwrap().is_empty(), "a report writes nothing");
+    }
+
+    #[test]
+    fn group_sends_only_the_keys_it_was_given() {
+        let host = StubHost::default();
+        host.script_rpc("set_task_group", Ok(serde_json::Value::Null));
+        assert!(handle(&req(group_cmd("w3", Some("  Auth refactor "), None), Some("tok")), &host).ok);
+        host.script_rpc("set_task_group", Ok(serde_json::Value::Null));
+        // An EMPTY name is a real value ("follow the lead"), not an absent one.
+        assert!(handle(&req(group_cmd("w3", Some(""), Some("pink")), Some("tok")), &host).ok);
+        let calls = host.rpc_calls.lock().unwrap();
+        assert_eq!(calls[0].1, serde_json::json!({ "taskId": "w3", "name": "Auth refactor" }));
+        assert_eq!(calls[1].1, serde_json::json!({ "taskId": "w3", "name": "", "color": "pink" }));
+    }
+
+    #[test]
+    fn group_refuses_an_unknown_colour_before_touching_anything() {
+        let host = StubHost::default();
+        let reply = handle(&req(group_cmd("w3", None, Some("mauve")), Some("tok")), &host);
+        assert!(!reply.ok);
+        let e = reply.error.unwrap();
+        assert_eq!(e.code, ErrorCode::BadRequest);
+        assert!(e.message.contains("teal"), "names the choices: {}", e.message);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
     }
 
     fn rename_cmd(task: Option<&str>, project: Option<&str>, name: &str) -> Command {
@@ -7019,7 +7272,7 @@ mod tests {
         let work = cached_work_states(&snap, &["w1".to_string()]).unwrap();
         let projects = vec![project("p1", "web", "/repo/web")];
         let t = task("w1", "fix-auth", "p1", "/tasks/web/fix-auth");
-        let summary = summarize(&t, &projects, Some(&work), None);
+        let summary = summarize(&t, &projects, std::slice::from_ref(&t), Some(&work), None);
         assert_eq!(
             summary.work_state.as_deref(),
             Some("inactive"),

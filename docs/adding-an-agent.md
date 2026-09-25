@@ -228,6 +228,24 @@ Measured on claude 2.1.278: `--resume --name <task>` opens the picker; picking
 fires `SessionStart` with `source: resume`, the chosen id and entrypoint `cli`,
 which the READY hook reports; Esc exits 1 with no `SessionStart`.
 
+Three guards keep the picker from swapping two tasks. The picker lists every
+session in the cwd, and every main-checkout task shares one, so its top row is
+whichever SIBLING task ran last; one reflexive Enter took it (reproduced on
+2.1.280). Stored, the sibling's own resume was then refused ("running in
+another terminal", exit 1), which cleared its id and opened its picker in turn.
+
+- **A fast exit counts as a failed resume only when it is non-zero.** Every
+  refusal measured exits 1 (claude's "No conversation found" and "running in
+  another terminal", `--continue` with nothing to continue, codex's "active
+  writer"). Ctrl+C right after a relaunch exits 0, and used to open the picker.
+- **A reported id another tab already holds is not stored** (`sessionHolder` in
+  `lib/agentHooks.ts`, live tabs and `persisted_tabs` both); a toast names the
+  task that owns it.
+- **The picker spawn carries no `name_args`.** claude applies `--name` to the
+  session PICKED, so a wrong pick renamed the sibling's conversation to this
+  task. A right pick gets the name back on the next relaunch, which resumes it
+  by id with `--name`.
+
 **The id is not always a UUID.** devin's is a slug (`brassy-polish`). The TS
 parser (`hookOscSessionId`) and the hook's charset guard both have to accept
 the agent's real shape, or the report is dropped, and a dropped trusted body

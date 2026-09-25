@@ -294,6 +294,21 @@ Genuinely global topics (`docker-build://`, `termic://windowless`,
 `termic://profiles-changed`) stay broadcasts. Ask "is this true of the machine
 or of one profile" before adding an emit.
 
+**`emit_to` is only half of it: the LISTENER has to be scoped too.** Tauri 2's
+global `listen()` from `@tauri-apps/api/event` registers for target `Any`,
+which receives events `emit_to`'d at ANY window's label, not just broadcasts.
+So `cli-rpc://request` was `emit_to` the right window and still ran in every
+profile's webview: one MCP/CLI `new` created the task in the right window
+while the other re-checked ITS profile's task list, found no clash, ran git
+against the same repo and failed on the branch the first had just made, and
+that fast failure was the reply (reported from a live MCP session; reproduced
+by profiles.e2e.ts "serves a CLI/MCP request in exactly one window" on the
+unfixed build, green after). A listener for an event Rust targets at one
+window uses `getCurrentWebviewWindow().listen(...)`: `cli-rpc://request`
+(src/lib/cliRpc.ts) and `termic://close-requested` (windowlessMode.ts) do.
+Per-task topics (`setup-output://<id>`) are safe with the global listen only
+because a window subscribes to its own tasks' ids alone.
+
 ## `std::mem::take` on a shared queue swallows another window's work (GH #280)
 
 `deep_link_take_pending` drained the whole pending-URL queue for whichever
@@ -588,6 +603,15 @@ resolves, walking every task whose record already holds a PR identity. It is
 bounded rather than cheap, because a refresh is a `gh`/`glab` subprocess: a
 3-minute per-task staleness floor, at most 8 tasks per 60s pass, stalest
 first, awaited one at a time.
+
+That layer only MAINTAINS a known PR; it never discovers one, since it walks
+tasks that already carry an identity. A PR the agent opened itself (`gh pr
+create` in its terminal) therefore stayed badge-less until someone opened
+the task's Git tab. Third layer: `initPrRefreshOnFocus` refreshes the active
+task when it becomes active and when the window regains focus with it in
+front, unforced, so the store's 30s per-task floor caps it however often you
+switch. The first lookup that finds the PR records its identity, and layer 2
+owns it from there.
 
 The general shape: **when a fact is rendered somewhere that is always
 mounted, it cannot be maintained by something that usually is not.** A

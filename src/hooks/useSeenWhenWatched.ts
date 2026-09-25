@@ -35,7 +35,7 @@ export function watchedBadgedTab(s: AppState): string {
   // badges, and a tab can hold either without the other (a keystroke clears
   // unread and leaves the dot).
   const t = tabs.find(t =>
-    (t.unread || (t.type === "terminal" && t.workState === "done"))
+    (t.unread || (t.type === "terminal" && t.workState === "done") || (t.type === "scratch" && t.unseen))
     && isTabOnScreenIn(s, taskId, t.id));
   return t ? `${taskId}:${t.id}` : "";
 }
@@ -76,6 +76,8 @@ export function useSeenWhenWatched() {
     if (tab?.type === "terminal" && tab.workState === "done") {
       app.setWorkState(taskId, tabId, "idle", "seen: on screen in a focused window");
     }
+    // A pad an agent wrote while you were away: on screen now, so seen.
+    if (tab?.type === "scratch" && tab.unseen) app.patchTab(taskId, tabId, { unseen: false });
     // No cleanup: nothing is scheduled. Clearing makes `target` empty, so this
     // re-runs once and returns at the guard.
   }, [target, present]);

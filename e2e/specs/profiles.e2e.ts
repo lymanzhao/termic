@@ -1,8 +1,9 @@
+import { execSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
 import { dataDir } from "../../wdio.conf.js";
 import {
-  clickWhenVisible, dismissOverlays, requireTermicApi, snap,
+  archiveTask, cliRpc, clickWhenVisible, dismissOverlays, requireTermicApi, snap,
   waitForAppShell, waitGone, waitForText, waitVisible,
 } from "../helpers";
 
@@ -318,6 +319,62 @@ describe("profiles", () => {
       { timeout: 20_000, timeoutMsg: "the profile window did not close" },
     );
     await waitForAppShell();
+  });
+
+  // Regression (reported from a live MCP session): with a second profile's
+  // window open, one `new` ran the create in BOTH webviews. Tauri 2's global
+  // `listen()` defaults to target Any, so the other window's handler caught
+  // the request emitted `emit_to` this one; it checked ITS profile's task
+  // list, found no clash, and ran git a second time. The caller got that
+  // second attempt's "branch already exists" for a create that worked.
+  it("serves a CLI/MCP request in exactly one window when two are open", async () => {
+    const main = await browser.getWindowHandle();
+    const before = await browser.getWindowHandles();
+    await browser.execute(async () => { await window.__termic!.invoke("profile_open", { slug: "work" }); });
+    await browser.waitUntil(
+      async () => (await browser.getWindowHandles()).length > before.length,
+      { timeout: 25_000, timeoutMsg: "profile_open did not create a window" },
+    );
+    const extra = (await browser.getWindowHandles()).find(h => !before.includes(h))!;
+    const name = `two-windows-${Date.now()}`;
+    const fixtureRepo = path.join(process.cwd(), ".e2e", "fixture-repo");
+    let createdId: string | undefined;
+    let branch: string | undefined;
+    try {
+      // The second webview must be live (its RPC listener registered) for
+      // the bug to have anything to catch.
+      await browser.switchToWindow(extra);
+      await browser.waitUntil(async () => await browser.execute(() => !!window.__termic), {
+        timeout: 30_000, timeoutMsg: "the profile window never booted",
+      });
+      await browser.switchToWindow(main);
+
+      const r = await cliRpc({
+        cmd: "new", name, project: "fixture-repo", agent: "fakeagent", mode: "worktree",
+      });
+      expect(r.error?.message ?? "").toBe("");
+      expect(r.ok).toBe(true);
+      createdId = r.data.task.id;
+      branch = r.data.task.branch;
+      // Exactly one record, in this profile.
+      const same = await browser.execute(async (n) =>
+        (await window.__termic!.invoke("tasks_list")).filter((t: any) => t.name === n && !t.archived).length, name);
+      expect(same).toBe(1);
+    } finally {
+      await browser.switchToWindow(main);
+      if (createdId) await archiveTask(createdId);
+      // A failed run leaves the branch the first window made; sweep both
+      // spellings so the next run starts clean.
+      for (const b of [branch, name].filter(Boolean)) {
+        try { execSync(`git -C "${fixtureRepo}" branch -D ${JSON.stringify(b)}`, { stdio: "ignore" }); } catch { /* not there */ }
+      }
+      await browser.execute(async () => { await window.__termic!.invoke("profile_close", { slug: "work" }); });
+      await browser.waitUntil(
+        async () => (await browser.getWindowHandles()).length === before.length,
+        { timeout: 20_000, timeoutMsg: "the profile window did not close" },
+      );
+      await waitForAppShell();
+    }
   });
 
   it("opens a profile in its own window", async () => {

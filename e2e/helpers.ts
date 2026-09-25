@@ -1268,10 +1268,22 @@ export function runCli(args: string[], env: Record<string, string>): string {
 
 /** Assert `window.__termic` is present (i.e. the e2e build exposed state). */
 export async function requireTermicApi(): Promise<void> {
-  const ok = await browser.execute(() => !!window.__termic);
-  if (!ok) {
+  // The hook attaches after a burst of dynamic imports, so give it a moment
+  // before calling it missing, and name WHY when it never came: a failed
+  // import (main.tsx records it) is not a stale build, and saying "rebuild"
+  // for it sent this hunt the wrong way twice.
+  const state = await browser
+    .waitUntil(
+      () => browser.execute(() => (window.__termic ? "ok" : (window as any).__termicBootError ?? null)),
+      { timeout: 10_000, interval: 200 },
+    )
+    .catch(() => null);
+  if (state !== "ok") {
+    const where = await browser.execute(() => location.href).catch(() => "?");
     throw new Error(
-      "window.__termic missing — rebuild with `make e2e` (VITE_E2E=1). See the e2e skill.",
+      state
+        ? `window.__termic never attached: a boot import failed (${where}): ${state}`
+        : `window.__termic missing at ${where}. Rebuild with \`make e2e\` (VITE_E2E=1) if the build is stale; see the e2e skill.`,
     );
   }
 }

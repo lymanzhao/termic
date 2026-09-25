@@ -139,6 +139,14 @@ pub struct Project {
     /// Seatbelt fields resolve to off, exactly like an explicit pick.
     #[serde(default)]
     pub default_docker: bool,
+    /// Whether new tasks of this project start with YOLO on. `None` = no
+    /// opinion, inherit the app-wide default (a frontend pref, Settings →
+    /// Sandbox). Read by the FRONTEND only: Rust never falls back to it,
+    /// so a create that omits `yolo` (the CLI, MCP) always gets it off.
+    /// Deliberately not in `.termic.yaml`: a committed repo file must
+    /// never be able to switch approvals off for whoever clones it.
+    #[serde(default)]
+    pub default_yolo: Option<bool>,
     /// Project-level default Docker extra mounts (`host_path:container_path`),
     /// seeded into new tasks ahead of `Settings.docker_default_extra_mounts`.
     /// The global list is the fallback, so a project only states what is
@@ -409,6 +417,19 @@ pub enum DockerRebuildFrequency {
     Weekly,
 }
 
+/// A sidebar task group (see `Task::group`). `name: None` means "follow the
+/// lead task's current name", so renaming the orchestrator renames its group
+/// until someone gives the group a name of its own. `color` is an accent KEY
+/// from src/lib/accents.ts, never a literal colour.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct TaskGroup {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
 /// One frozen extra named port (GH #196): the env var name the user
 /// configured plus the port allocated from this task's block at
 /// creation. Frozen pairs, so editing the repo config later never
@@ -450,6 +471,14 @@ pub struct Task {
     /// backstops anything the migration missed.
     #[serde(default, alias = "is_repo_root")]
     pub is_main_checkout: bool,
+    /// True when the task CHECKED OUT an existing branch (New Task's
+    /// "Existing branch" mode, `termic new --checkout`) instead of cutting
+    /// one from `base_branch`. Restore reads it: a branch deleted at archive
+    /// comes back from the remote through `checkout_existing_branch`, not cut
+    /// fresh from the base, which would put main under a colleague's branch
+    /// name. False on every record written before the mode existed.
+    #[serde(default)]
+    pub checkout_existing: bool,
     /// Total number of times an agent has been spawned for this task
     /// across all sessions (persisted via `task_record_spawn`).
     /// Historical signal — kept for analytics / debug. Resume gating
@@ -624,6 +653,20 @@ pub struct Task {
     /// appends at the bottom instead of jumping to the top.
     #[serde(default)]
     pub order: Option<u32>,
+    /// Task group this task belongs to in the sidebar, or `None`. A group is
+    /// born when an agent running in task A creates task B through the CLI
+    /// or MCP: both join a group whose `id` is A's task id, so the
+    /// orchestrator that started it is always identifiable as the lead. The
+    /// user can drag other tasks in and out afterwards.
+    ///
+    /// Denormalized on purpose: every member carries the same copy, so a
+    /// group needs no registry file, rides the task's own profile for free,
+    /// and disappears with its last member. `task_group_update` rewrites
+    /// every member, which is a handful of files at most. Purely cosmetic:
+    /// nothing may key a permission or a lookup off it, because the caller
+    /// identity that creates one (`$TERMIC_TASK_ID`) is claimed, not proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TaskGroup>,
     /// Per-agent account override for THIS task (GH #278), agent id -> account
     /// name. Written when a running task is switched to another account, and
     /// read at every spawn so the choice survives a relaunch. Absent means
@@ -810,6 +853,12 @@ pub struct CreateTaskArgs {
     pub base_branch: Option<String>,
     /// Explicit branch name. If omitted, defaults to `slugify(name)`.
     pub branch: Option<String>,
+    /// Check out `branch` as it EXISTS (locally, or on the remote, fetched
+    /// and tracked) instead of cutting a new branch from `base_branch`, which
+    /// then only sets what the diff compares against. An unknown branch is
+    /// an error here, never a fresh branch. See `checkout_existing_branch`.
+    #[serde(default)]
+    pub checkout_existing: bool,
     /// Optional client-supplied task ID. Lets the frontend subscribe
     /// to `setup-output://<id>` + `setup-done://<id>` BEFORE invoking
     /// create — without this, the empty-script branch race-emits done
@@ -869,6 +918,12 @@ pub struct CreateTaskArgs {
     /// launch. Empty / unset → default resume logic.
     #[serde(default)]
     pub resume_override: Option<String>,
+    /// Per-task YOLO flag, set at create so the FIRST spawn already
+    /// carries `yolo_args` (no restart to apply it). Unset → off: there
+    /// is deliberately no fallback to `Project.default_yolo` here, the
+    /// frontend resolves the default and sends it.
+    #[serde(default)]
+    pub yolo: Option<bool>,
 }
 
 // ───────────────────────────── paths ─────────────────────────────
@@ -2631,6 +2686,122 @@ fn try_resolve_base_ref(repo: &Path, base: &str) -> Option<String> {
     None
 }
 
+/// Turn the branch a user asked to CHECK OUT (New Task's "Existing branch"
+/// mode, `termic new --checkout`) into a local branch that exists, so the
+/// ordinary `git worktree add <path> <branch>` can take it from there.
+///
+/// `requested` is a local branch (`alice/fix`), a remote-tracking one
+/// (`origin/alice/fix`), or a bare name that so far exists only on the remote
+/// (a colleague's branch, possibly pushed after the last fetch). The last two
+/// become a local branch tracking the remote one, which is what
+/// `git checkout <name>` DWIMs to and what makes push and pull on it work.
+///
+/// NEVER cuts a branch from a base. The new-branch path does exactly that for
+/// a name it cannot find, which is how a colleague's remote-only branch used
+/// to come out as a fresh branch off main wearing their branch's name: the
+/// agent reviewed main and nothing said so. Here an unknown name is an error.
+///
+/// A local branch wins over the remote one even when the two have diverged:
+/// it may hold the user's own commits, and a checkout must not move it.
+///
+/// Split out of `task_create_sync` so it can be tested (that function takes an
+/// `AppHandle`); `progress` is its `emit_create_progress`.
+fn checkout_existing_branch(
+    repo: &Path,
+    requested: &str,
+    fetch: bool,
+    progress: &mut dyn FnMut(String),
+) -> std::result::Result<String, String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err("name the branch to check out.".into());
+    }
+    let invalid = || format!("'{requested}' is not a valid branch name.");
+    // The name reaches `git fetch` and `git branch` as an argument, so a
+    // leading dash would be read as an option. Checked before
+    // check-ref-format, which would otherwise take it as one too.
+    if requested.starts_with('-') || git(&["check-ref-format", "--branch", requested], repo).is_err() {
+        return Err(invalid());
+    }
+    let has = |r: &str| git(&["rev-parse", "--verify", "--quiet", r], repo).is_ok();
+    let is_local = |b: &str| has(&format!("refs/heads/{b}"));
+    if is_local(requested) {
+        progress(format!("Using local branch '{requested}'."));
+        return Ok(requested.to_string());
+    }
+    // `origin/alice/fix` names its remote; a bare `alice/fix` means the
+    // default one. Only a CONFIGURED remote counts as a prefix, so a branch
+    // that merely contains a slash is not split.
+    let remotes: Vec<String> = git(&["remote"], repo)
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    let (remote, name) = match requested.split_once('/') {
+        Some((r, rest)) if !rest.is_empty() && remotes.iter().any(|x| x == r) => {
+            (r.to_string(), rest.to_string())
+        }
+        _ => (detect_default_remote(repo), requested.to_string()),
+    };
+    if name.starts_with('-') {
+        return Err(invalid());
+    }
+    if is_local(&name) {
+        progress(format!("Using local branch '{name}'."));
+        return Ok(name);
+    }
+    let remote_ref = format!("{remote}/{name}");
+    if fetch {
+        progress(format!("Fetching '{remote_ref}'…"));
+        // Not fatal: offline, or a remote that wants credentials, still
+        // leaves whatever this repo fetched last, which may well be enough.
+        if let Err(e) = fetch_ref(repo, &remote_ref) {
+            progress(format!("{e}. Using what this repo already has."));
+        }
+    }
+    let tracking = format!("refs/remotes/{remote_ref}");
+    if has(&format!("{tracking}^{{commit}}")) {
+        git(&["branch", "--track", &name, &tracking], repo).map_err(|e| e.to_string())?;
+        progress(format!("Created local branch '{name}' tracking '{remote_ref}'."));
+        return Ok(name);
+    }
+    Err(format!(
+        "no branch '{requested}' in this repo or on {remote}. Check the name, or push the branch first."
+    ))
+}
+
+/// Make sure the branch a restored single-repo worktree task goes back on
+/// exists, recreating it when archive deleted it ("Delete the branch when
+/// archiving").
+///
+/// A task's OWN branch is cut from its base again, as it always was. A task
+/// that checked out an existing branch gets it back from the remote through
+/// `checkout_existing_branch`, the way create found it: cutting it from the
+/// base would put main under a colleague's branch name, which is the create
+/// bug that mode exists to remove, reached through restore instead. When the
+/// remote no longer has it either, restore fails rather than doing that.
+///
+/// Split out of `task_restore_sync` (which takes an `AppHandle`) so it can be
+/// tested.
+fn ensure_restore_branch(repo: &Path, task: &Task, fetch: bool) -> std::result::Result<(), String> {
+    let branch = &task.branch;
+    if git(&["rev-parse", "--verify", branch], repo).is_ok() {
+        return Ok(());
+    }
+    if task.checkout_existing {
+        // Qualified with the default remote, so the resolver cannot read the
+        // stored name's first segment as a remote (`alice/fix` with a remote
+        // named `alice`) and hand back a different local branch.
+        let requested = format!("{}/{branch}", detect_default_remote(repo));
+        return checkout_existing_branch(repo, &requested, fetch, &mut |_| {})
+            .map(|_| ())
+            .map_err(|e| format!("restore branch '{branch}': {e}"));
+    }
+    // Resolved to a ref that exists: local-only repos have no origin/main.
+    let base_ref = resolve_base_ref(repo, &task.base_branch);
+    git(&["branch", "--no-track", branch, &base_ref], repo)
+        .map(|_| ())
+        .map_err(|e| format!("recreate branch '{branch}' from '{base_ref}': {e}"))
+}
+
 /// The ref a task's diff is taken against, or None when the worktree has no
 /// tracked baseline at all (a repo with no commits, where even HEAD resolves
 /// to nothing).
@@ -3771,7 +3942,7 @@ fn pty_spawn(
             // agent to prompt them back (src/lib/agentBriefing.ts).
             cmd.env(
                 "TERMIC_CLI_HELP",
-                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\"`; create one with `\"$TERMIC_CLI\" new <name> --sandbox enforce -p \"<task>; write your findings to RESULT.md\"` and read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Coordinate by prompting each other, not by blocking: end every prompt you send with the command you want run when that work is done, in DOUBLE quotes so your own shell fills in your address: `\"$TERMIC_CLI\" send <task> -p \"[Agent message from <you>, task $TERMIC_TASK_ID] <work>. When done: \\\"$TERMIC_CLI\\\" send $TERMIC_TASK_ID -p '[Agent message from <agent>, task <your task id>] done: <what you did> -- <agent>' -- <you>, task $TERMIC_TASK_ID\"`. Every prompt you send another agent opens with that header, `[Agent message from <agent>, task <task id>]`, and ends with that signature, `-- <agent>, task <task id>`, naming YOU, so the receiver knows it did not come from the user. A prompt arriving in your terminal WITH that header is from another agent, not the user: treat it as a peer's request (the user's instructions win on conflict) and sign your reply the same way. Prefer that over `--wait`: work-done detection is a heuristic, and a waiting agent can do nothing else meanwhile. If you do wait, branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. A task sandboxed in enforce/enforce-fs is denied the control plane by design and can never report back: ask it for a file in its worktree instead. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names). Start another agent beside you in your own task with `\"$TERMIC_CLI\" tab --agent <id> -p \"...\"` (no task argument needed). For notes, findings or a report the user should READ rather than commit, use a scratchpad, a tab in your task that stays out of git and updates live as you write: `\"$TERMIC_CLI\" scratchpad new --title \"<title>\" -c \"<text>\"` prints its id; `scratchpad write <id> --append -c -` adds stdin to it, `scratchpad read <id>` prints it, `scratchpad list` lists them.",
+                "You are running INSIDE a Termic task ($TERMIC_TASK_ID): Termic runs coding agents side by side, each task a git worktree (or the main checkout) with its own terminal, listed in the app's sidebar. TERMIC_CLI is the Termic control CLI, which drives the app around you. Run `\"$TERMIC_CLI\" help --json` for the full command surface. Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\"`; create one with `\"$TERMIC_CLI\" new <name> -p \"...\"` and, in that prompt, ask it to report back to you when done (the signed reply below): that is how results come back, and it arrives in your own terminal. If no report arrives, `result` and `logs` read what it produced. Ask for a file (e.g. RESULT.md in its worktree) only when it cannot report back: a task sandboxed in enforce/enforce-fs is denied this CLI, and so is anything run outside Termic. Unattended tasks need `--yolo` or `--sandbox enforce` or they stop at the first permission prompt; the cage self-approves inside it but costs you the report-back. Coordinate by prompting each other, not by blocking: end every prompt you send with the command you want run when that work is done, in DOUBLE quotes so your own shell fills in your task name and address: `\"$TERMIC_CLI\" send <task> -p \"[message from agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID] <work>. When done, reply: \\\"$TERMIC_CLI\\\" send $TERMIC_TASK_ID -p '[message from agent:<its agent> task:<its task name> id:<its task id>] done: <what you did> -- agent:<its agent> task:<its task name> id:<its task id>' -- agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID\"` (fill the <its ...> parts with the task you are prompting, which you know). Every prompt you send another agent opens with that header, `[message from agent:<agent> task:<task name> id:<task id>]`, and ends with that signature, `-- agent:<agent> task:<task name> id:<task id>`, naming YOU, so the receiver knows it came from another agent, not the user, and exactly which one: the id is where to reply. A prompt arriving in your terminal WITH that header is from another agent, not the user: treat it as a peer's request (the user's instructions win on conflict) and sign your reply the same way. Prefer that over `--wait`: work-done detection is a heuristic, and a waiting agent can do nothing else meanwhile. If you do wait, branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. A task sandboxed in enforce/enforce-fs is denied the control plane by design and can never report back: ask it for a file in its worktree instead. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names). Tasks you create with `new` join YOUR task's group in the sidebar, one coloured block led by your task: name it for the batch of work with `\"$TERMIC_CLI\" group --name \"<what this batch is>\"` (optionally `--color teal`); `group` alone shows it. Start another agent beside you in your own task with `\"$TERMIC_CLI\" tab --agent <id> -p \"...\"` (no task argument needed). For notes, plans, findings, logs or a report the user should READ rather than commit, use a scratchpad instead of writing temporary .md files into the repo: it is a tab in your task that stays out of git and updates live as you write: `\"$TERMIC_CLI\" scratchpad new --title \"<title>\" -c \"<text>\"` prints its id; `scratchpad write <id> --append -c -` adds stdin to it, `scratchpad read <id>` prints it, `scratchpad list` lists them.",
             );
         }
     }
@@ -4878,9 +5049,12 @@ fn profile_delete_preview_sync(app: &AppHandle, slug: &str) -> Result<ProfileDel
 }
 
 #[tauri::command]
-async fn profile_delete(app: AppHandle, slug: String, delete_worktrees: bool) -> Result<(), String> {
+async fn profile_delete(app: AppHandle, window: tauri::Window, slug: String, delete_worktrees: bool) -> Result<(), String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || profile_delete_sync(&app2, &slug, delete_worktrees))
+    // The CALLING window, from Tauri itself: the label is taken here, before
+    // the blocking hop, because a `Window` is what the command carries.
+    let caller = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || profile_delete_sync(&app2, &slug, delete_worktrees, &caller))
         .await
         .map_err(|e| e.to_string())??;
     forget_task_window(None);
@@ -4889,19 +5063,14 @@ async fn profile_delete(app: AppHandle, slug: String, delete_worktrees: bool) ->
     Ok(())
 }
 
-/// Is `label` the window this request came from?
-///
-/// `profile_delete` runs on a blocking thread and does not carry the calling
-/// `Window`, so the focused window stands in for it: the user just clicked a
-/// button in that dialog, so it is focused by construction.
-fn is_calling_window(app: &AppHandle, label: &str) -> bool {
-    use tauri::Manager;
-    app.webview_windows()
-        .iter()
-        .any(|(l, w)| l == label && w.is_focused().unwrap_or(false))
-}
-
-fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> Result<(), String> {
+/// `caller` is the label of the window that sent the request. It used to be
+/// inferred as "whichever window is focused", on the reasoning that the user
+/// just clicked in it. That holds for a person and fails for anything driving
+/// an unfocused window: the full e2e suite, run while someone uses the
+/// machine, deleted the profile of the very window it was driving, which then
+/// vanished mid-suite. The command receives its window from Tauri, so there
+/// is nothing to infer.
+fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool, caller: &str) -> Result<(), String> {
     use tauri::Manager;
     let g = global_dir().map_err(|e| e.to_string())?;
     let mut reg = profiles::load_registry(&g);
@@ -4925,7 +5094,7 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
     // same rule `profile_close` already enforces.
     let label = id.window_label();
     if let Some(win) = app.get_webview_window(&label) {
-        if win.label() == label && is_calling_window(app, &label) {
+        if win.label() == caller {
             return Err("switch to another profile before deleting this one".into());
         }
         // Its PTYs die with the window, which is what the dialog warned about.
@@ -5123,6 +5292,7 @@ fn project_add(window: tauri::Window, root_path: String, non_git: Option<bool>) 
         default_sandbox: false,
         default_sandbox_mode: None,
         default_docker: false,
+        default_yolo: None,
         docker_extra_mounts: Vec::new(),
         sandbox_rw_paths: Vec::new(),
         sandbox_allowed_hosts: Vec::new(),
@@ -5318,6 +5488,7 @@ fn project_add_multi(window: tauri::Window, root_path: String, name: String, mem
         default_sandbox: false,
         default_sandbox_mode: None,
         default_docker: false,
+        default_yolo: None,
         docker_extra_mounts: Vec::new(),
         sandbox_rw_paths: Vec::new(),
         sandbox_allowed_hosts: Vec::new(),
@@ -5591,6 +5762,10 @@ fn task_open_repo(
     resume_session_id: Option<String>,
     resume_override: Option<String>,
     agent_args: Option<Vec<String>>,
+    // Per-task YOLO, applied from the first spawn. Unset → off, and no
+    // fallback to the project's default, for the same reason the sandbox
+    // args above have none: the CLI passes nothing and must get nothing.
+    yolo: Option<bool>,
 ) -> Result<Task, String> {
     let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
@@ -5746,6 +5921,7 @@ fn task_open_repo(
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
         is_main_checkout: true,
+        checkout_existing: false,
         spawn_count: 0,
         has_resumable_history: false,
         agent_session_ids,
@@ -5755,7 +5931,7 @@ fn task_open_repo(
         // against the main checkout as against a worktree.
         sandbox_enabled,
         sandbox_mode: Some(sandbox_mode),
-        yolo: false,
+        yolo: yolo.unwrap_or(false),
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         docker_sandbox_enabled,
@@ -5778,6 +5954,7 @@ fn task_open_repo(
         // New tasks are unordered: they append below any manually
         // ordered sibling (see sort_tasks).
         order: None,
+        group: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     Ok(task)
@@ -6010,6 +6187,7 @@ fn task_import_worktree(
         archived: false,
         // A real worktree — NOT repo-root, so archive removes it properly.
         is_main_checkout: false,
+        checkout_existing: false,
         spawn_count: 0,
         has_resumable_history: false,
         agent_session_ids,
@@ -6038,6 +6216,7 @@ fn task_import_worktree(
         // New tasks are unordered: they append below any manually
         // ordered sibling (see sort_tasks).
         order: None,
+        group: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     Ok(task)
@@ -6151,8 +6330,8 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
 
     // Reuse existing branch if present, else create new from base. If the
     // branch is already checked out in another worktree (often the main
-    // checkout), git refuses — fall back to checking out the branch
-    // detached so the new worktree still works.
+    // checkout), git refuses, and that surfaces as an error below: git
+    // allows a branch in only one worktree at a time.
     //
     // `--no-track` is critical: creating a new branch directly from a
     // remote-tracking base (e.g. "origin/main") would otherwise set
@@ -6182,6 +6361,41 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         .map(|p| p.join("git-crypt").exists())
         .unwrap_or(false);
 
+    // Checking out an EXISTING branch (New Task's "Existing branch" mode,
+    // `termic new --checkout`): resolve it to a local branch first, fetching
+    // and tracking a remote-only one, so the reuse path below takes it as it
+    // is. It must never reach the new-branch path, which would cut a fresh
+    // branch with that name from the base.
+    let checkout = args.checkout_existing;
+    let branch = if checkout {
+        let fetch = fetch_before_create_enabled();
+        // The base only sets what the diff compares against here, but it
+        // still has to be fresh: a colleague who branched from a newer main
+        // than this repo's last fetch would otherwise have main's commits
+        // mixed into their diff. Same fetch the new-branch path does.
+        if fetch {
+            emit_create_progress(&app, &task_id, format!("Fetching '{base_full}'…"));
+            git_fetch_base(&repo, &base_full);
+        }
+        // A typed base that names nothing would quietly compare against HEAD.
+        // Checked BEFORE the branch resolves, so a refusal leaves no branch
+        // behind.
+        if user_supplied_base {
+            if try_resolve_base_ref(&repo, &base_full).is_none() {
+                return Err(format!(
+                    "compare-against ref '{base_full}' does not resolve in {}. \
+                     Fetch it first (git fetch origin {base_full}), or pass a ref that exists.",
+                    repo.display(),
+                ));
+            }
+        }
+        checkout_existing_branch(&repo, &branch, fetch, &mut |line| {
+            emit_create_progress(&app, &task_id, line)
+        })?
+    } else {
+        branch
+    };
+
     let branch_exists = git(&["rev-parse", "--verify", &branch], &repo).is_ok();
     let wt_arg = wt_path.to_str().unwrap();
     let add_args: Vec<&str> = if has_git_crypt {
@@ -6192,7 +6406,10 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         vec!["worktree", "add", wt_arg, &branch]
     };
     let add_result = if branch_exists {
-        emit_create_progress(&app, &task_id, format!("Branch '{branch}' already exists locally, reusing it."));
+        // A checkout already said which branch it is using and how it got it.
+        if !checkout {
+            emit_create_progress(&app, &task_id, format!("Branch '{branch}' already exists locally, reusing it."));
+        }
         emit_create_progress(&app, &task_id, format!("Adding worktree at {}…", wt_path.display()));
         git(&add_args, &repo)
     } else {
@@ -6242,10 +6459,16 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     };
     if let Err(e) = add_result {
         if e.to_string().contains("already used by worktree") {
-            return Err(format!(
-                "branch '{}' is already checked out elsewhere. Pick a different task name.",
-                branch
-            ));
+            // The branch was the whole point of a checkout, so renaming the
+            // task is no way out: the other worktree has to let go of it.
+            return Err(if checkout {
+                format!(
+                    "branch '{branch}' is already checked out in another worktree, \
+                     and git allows a branch in only one at a time."
+                )
+            } else {
+                format!("branch '{branch}' is already checked out elsewhere. Pick a different task name.")
+            });
         }
         return Err(e.to_string());
     }
@@ -6403,12 +6626,15 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
         is_main_checkout: false,
+        // Remembered so restore can bring a deleted branch back from the
+        // remote instead of cutting it from the base.
+        checkout_existing: checkout,
         spawn_count: 0,
         has_resumable_history: false,
         agent_session_ids,
         sandbox_enabled,
         sandbox_mode: Some(sandbox_mode),
-        yolo: false,
+        yolo: args.yolo.unwrap_or(false),
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         docker_sandbox_enabled,
@@ -6437,6 +6663,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         // New tasks are unordered: they append below any manually
         // ordered sibling (see sort_tasks).
         order: None,
+        group: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     drop(port_guard);
@@ -6494,6 +6721,9 @@ pub struct CreateMultiArgs {
     /// spawn already carries it. Same storage as `task_set_resume_override`.
     #[serde(default)]
     pub resume_override: Option<String>,
+    /// See `CreateTaskArgs::yolo`.
+    #[serde(default)]
+    pub yolo: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6901,12 +7131,13 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
         is_main_checkout: false,
+        checkout_existing: false,
         spawn_count: 0,
         has_resumable_history: false,
         agent_session_ids: std::collections::HashMap::new(),
         sandbox_enabled,
         sandbox_mode: Some(sandbox_mode),
-        yolo: false,
+        yolo: args.yolo.unwrap_or(false),
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         docker_sandbox_enabled,
@@ -6929,6 +7160,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         // New tasks are unordered: they append below any manually
         // ordered sibling (see sort_tasks).
         order: None,
+        group: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     drop(port_guard);
@@ -7125,6 +7357,163 @@ fn task_reorder(ids: Vec<String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ── Task groups ──
+// Pure functions over the loaded list, returning the indices they changed,
+// so the rules are unit-testable without a data dir and the commands below
+// only load, apply and save what moved.
+
+/// Put `task_id` into `target_id`'s group. An ungrouped target founds a new
+/// group with itself as lead (group id = its task id) and `color`; a grouped
+/// one lends its group, so a sub-orchestrator's children land in the ROOT
+/// group and groups stay flat. Both tasks must be in one profile: a window
+/// renders one profile, and a group straddling two would be half-invisible.
+fn apply_group_join(list: &mut [Task], task_id: &str, target_id: &str, color: Option<String>) -> Result<Vec<usize>, String> {
+    if task_id == target_id {
+        return Err("a task cannot join its own group".into());
+    }
+    let ti = list.iter().position(|t| t.id == target_id).ok_or("no such target task")?;
+    let si = list.iter().position(|t| t.id == task_id).ok_or("no such task")?;
+    if list[ti].profile != list[si].profile {
+        return Err("tasks in different profiles cannot share a group".into());
+    }
+    let mut changed = Vec::new();
+    let group = match list[ti].group.clone() {
+        Some(g) => g,
+        None => {
+            let g = TaskGroup { id: list[ti].id.clone(), name: None, color };
+            list[ti].group = Some(g.clone());
+            changed.push(ti);
+            g
+        }
+    };
+    if list[si].group.as_ref() != Some(&group) {
+        list[si].group = Some(group);
+        changed.push(si);
+    }
+    Ok(changed)
+}
+
+/// A new group holding just `task_id` (the sidebar's "Move to group > New
+/// group"). Like a project folder, a group of one is a real group: it exists
+/// while any live task carries it. The id is the task's own when free, so an
+/// unnamed group can follow its lead's name; a task already LEADING another
+/// group (whose members still carry its id) gets a fresh id and is named
+/// after itself instead.
+fn apply_group_new(list: &mut [Task], task_id: &str, color: Option<String>) -> Result<Vec<usize>, String> {
+    let si = list.iter().position(|t| t.id == task_id).ok_or("no such task")?;
+    let taken = list.iter().enumerate().any(|(i, t)| i != si && t.group.as_ref().is_some_and(|g| g.id == task_id));
+    let group = if taken {
+        TaskGroup { id: uuid::Uuid::new_v4().to_string(), name: Some(list[si].name.clone()), color }
+    } else {
+        TaskGroup { id: task_id.to_string(), name: None, color }
+    };
+    list[si].group = Some(group);
+    Ok(vec![si])
+}
+
+/// Leaving never touches the rest of the group: like a project folder, the
+/// group lives on while anyone carries it, including a lone orchestrator
+/// whose workers have all left (Ungroup is the way to clear that).
+fn apply_group_leave(list: &mut [Task], task_id: &str) -> Result<Vec<usize>, String> {
+    let si = list.iter().position(|t| t.id == task_id).ok_or("no such task")?;
+    Ok(if list[si].group.take().is_some() { vec![si] } else { Vec::new() })
+}
+
+/// Rename / recolour a group on every member, archived ones included (they
+/// come back wearing it). An empty or whitespace name means "follow the lead".
+fn apply_group_update(list: &mut [Task], group_id: &str, name: Option<String>, color: Option<String>) -> Vec<usize> {
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let mut changed = Vec::new();
+    for (i, t) in list.iter_mut().enumerate() {
+        if let Some(g) = t.group.as_mut().filter(|g| g.id == group_id) {
+            if g.name != name || g.color != color {
+                g.name = name.clone();
+                g.color = color.clone();
+                changed.push(i);
+            }
+        }
+    }
+    changed
+}
+
+fn apply_group_dissolve(list: &mut [Task], group_id: &str) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for (i, t) in list.iter_mut().enumerate() {
+        if t.group.as_ref().is_some_and(|g| g.id == group_id) {
+            t.group = None;
+            changed.push(i);
+        }
+    }
+    changed
+}
+
+fn save_changed(list: &[Task], mut changed: Vec<usize>) -> Result<(), String> {
+    changed.sort_unstable();
+    changed.dedup();
+    for i in changed {
+        save_task(&list[i]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Join `task_id` to `target_id`'s group, founding one led by the target if
+/// it has none. The CLI / MCP `new` path calls this with the orchestrator as
+/// target; the sidebar drag calls it with any member of the group dropped on.
+#[tauri::command]
+async fn task_group_join(task_id: String, target_id: String, color: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_group_join(&mut list, &task_id, &target_id, color)?;
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_group_new(task_id: String, color: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_group_new(&mut list, &task_id, color)?;
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_group_leave(task_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_group_leave(&mut list, &task_id)?;
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_group_update(group_id: String, name: Option<String>, color: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_group_update(&mut list, &group_id, name, color);
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_group_dissolve(group_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_group_dissolve(&mut list, &group_id);
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -8231,6 +8620,20 @@ fn task_id_in_topic(topic: &str) -> Option<&str> {
 /// Named and split out so the FALLBACK is testable: "no owner means every
 /// window" is a deliberate choice, not an oversight, and a change that made an
 /// unresolvable event reach nobody would otherwise be silent.
+/// The window-state file for THIS build flavour. See the plugin setup in
+/// `run`: release keeps the plugin's default so no install loses its saved
+/// frames; the e2e and dev builds each get their own, because all three
+/// share one bundle identifier and so one Application Support folder.
+fn window_state_filename() -> &'static str {
+    if cfg!(feature = "e2e") {
+        ".window-state-e2e.json"
+    } else if cfg!(debug_assertions) {
+        ".window-state-dev.json"
+    } else {
+        tauri_plugin_window_state::DEFAULT_FILENAME
+    }
+}
+
 fn emit_target(topic: &str) -> Option<String> {
     task_id_in_topic(topic).and_then(window_for_task)
 }
@@ -8345,9 +8748,8 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
     // monitor: its inner_size never trips the minimum, and nudging it
     // to the cursor's monitor would un-zoom it. So the clamp-up and
     // cursor-monitor reposition below apply only to normally-sized
-    // windows. position_on_cursor_monitor itself no-ops when the
-    // restored position is already on the cursor's monitor, so it
-    // cooperates with this restore.
+    // windows. position_on_cursor_monitor preserves a restored position
+    // only when the whole window fits on that monitor.
     if !win.is_maximized().unwrap_or(false) {
         // tauri-plugin-window-state restores prior bounds verbatim — it
         // does NOT enforce minWidth / minHeight. If a previous session
@@ -8368,7 +8770,9 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
                 let _ = win.set_size(tauri::LogicalSize::new(1400.0_f64, 900.0));
             }
         }
-        let _ = position_on_cursor_monitor(&win);
+        if let Err(e) = position_on_cursor_monitor(&win) {
+            dlog(&format!("[window] could not fit {label} on a monitor: {e}"));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -9172,7 +9576,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
             }
 
             let branch = list[idx].branch.clone();
-            let base_branch = list[idx].base_branch.clone();
+            ensure_restore_branch(&repo, &list[idx], fetch_before_create_enabled())?;
 
             // git-crypt detection (mirrors task_create_sync).
             let common_gitdir = git(&["rev-parse", "--git-common-dir"], &repo)
@@ -9195,19 +9599,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
             let mut add_args: Vec<&str> = add_flags.to_vec();
             add_args.push(wt_arg);
             add_args.push(&branch);
-
-            let branch_exists = git(&["rev-parse", "--verify", &branch], &repo).is_ok();
-            if branch_exists {
-                git(&add_args, &repo).map_err(|e| e.to_string())?;
-            } else {
-                // Branch was deleted at archive time — recreate from base
-                // (resolved to a ref that exists; local-only repos have no
-                // origin/main).
-                let base_ref = resolve_base_ref(&repo, &base_branch);
-                git(&["branch", "--no-track", &branch, &base_ref], &repo)
-                    .map_err(|e| format!("recreate branch '{branch}' from '{base_ref}': {e}"))?;
-                git(&add_args, &repo).map_err(|e| e.to_string())?;
-            }
+            git(&add_args, &repo).map_err(|e| e.to_string())?;
 
             // git-crypt: bridge the key dir into the new worktree's gitdir.
             if has_git_crypt {
@@ -13728,9 +14120,17 @@ fn copy_matching(repo: &Path, dst: &Path, pat: &str) {
     // and `repo.join("")` is the repo itself, which exists, which would
     // recursively copy the whole checkout (`.git` included) into the
     // worktree. Drop it here rather than in each of the callers.
-    let pat = pat.trim();
+    let pat = pat.trim().trim_start_matches("./");
     if pat.is_empty() { return; }
-    // Very simple glob: '*' wildcard in the basename only.
+    let rel_pattern = Path::new(pat);
+    if rel_pattern.is_absolute()
+        || rel_pattern.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || rel_pattern.components().all(|c| matches!(c, std::path::Component::CurDir))
+    {
+        eprintln!("copy glob must stay inside the repo: {pat}");
+        return;
+    }
+    // Keep literal paths fast, especially large directories such as node_modules.
     let pat_path = repo.join(pat);
     if pat_path.exists() {
         let rel_dst = dst.join(pat);
@@ -13740,33 +14140,53 @@ fn copy_matching(repo: &Path, dst: &Path, pat: &str) {
         let _ = copy_file_or_dir(&pat_path, &rel_dst);
         return;
     }
-    if pat.contains('*') {
-        // Expand basename glob in pattern's parent dir
-        let pp = PathBuf::from(pat);
-        let parent_rel = pp.parent().unwrap_or_else(|| Path::new(""));
-        let glob = pp.file_name().and_then(|s| s.to_str()).unwrap_or("*");
-        let parent_abs = repo.join(parent_rel);
-        if let Ok(rd) = fs::read_dir(&parent_abs) {
-            for e in rd.flatten() {
-                let name = e.file_name();
-                let n = name.to_string_lossy();
-                if simple_glob_match(glob, &n) {
-                    let dst_path = dst.join(parent_rel).join(&*n);
-                    let _ = copy_file_or_dir(&e.path(), &dst_path);
-                }
+    let pattern = match glob::Pattern::new(pat) {
+        Ok(pattern) => pattern,
+        Err(e) => { eprintln!("invalid copy glob {pat}: {e}"); return; }
+    };
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false, // `.env` must match `*.env*`.
+    };
+
+    // Start at the literal prefix and stop at the pattern's depth unless it
+    // contains `**`. This keeps a root-only `.env*` from walking the repo.
+    let mut prefix = PathBuf::new();
+    for component in rel_pattern.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if name.contains('*') || name.contains('?') || name.contains('[') { break; }
+        prefix.push(component);
+    }
+    let max_depth = if rel_pattern.components().any(|c| c.as_os_str() == "**") {
+        None
+    } else {
+        Some(rel_pattern.components().count())
+    };
+    let mut dirs = vec![repo.join(&prefix)];
+    while let Some(dir) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let src = entry.path();
+            let Ok(rel) = src.strip_prefix(repo) else { continue };
+            if src.starts_with(dst) { continue; }
+            if entry.file_name() == ".git" { continue; }
+            let meta = match fs::symlink_metadata(&src) {
+                Ok(meta) => meta,
+                Err(e) => { eprintln!("copy glob {}: {e}", src.display()); continue; }
+            };
+            if pattern.matches_path_with(rel, options) {
+                let _ = copy_file_or_dir(&src, &dst.join(rel));
+            } else if meta.file_type().is_dir()
+                && max_depth.is_none_or(|depth| rel.components().count() < depth)
+            {
+                // symlink_metadata keeps directory links out of the walk.
+                dirs.push(src);
             }
         }
-    }
-}
-
-fn simple_glob_match(pat: &str, s: &str) -> bool {
-    // Supports leading/trailing '*' and one '*' in the middle.
-    if pat == "*" { return true; }
-    let parts: Vec<&str> = pat.split('*').collect();
-    match parts.len() {
-        1 => s == pat,
-        2 => s.starts_with(parts[0]) && s.ends_with(parts[1]),
-        _ => false,
     }
 }
 
@@ -19739,51 +20159,6 @@ fn default_agents() -> Vec<Agent> {
             kind: "agent".into(),
             post_launch_capture: None,
         },
-        Agent {
-            // axcoding-rlm: the RLM harness half of the axcoding crate, as
-            // its own task CLI. Shares EVERYTHING session-related with the
-            // axcoding entry above by construction - the same auth chain
-            // and auth file (axcoding/src/auth.rs), the same playbook dir
-            // ($AXCODING_HOME, ~/.axcoding) - so the login store, state
-            // dirs and probe rows mirror it exactly. Differences worth
-            // knowing: one task per line of stdin (same PTY interaction
-            // model, no TUI - output is the run trace), and the context
-            // defaults to the task's own directory walked automatically
-            // (caps inside ctxbuild); --context-file overrides it via
-            // the agent's args in Settings.
-            id: "axcoding-rlm".into(),
-            display_name: "axcoding-rlm".into(),
-            command: "axcoding-rlm".into(),
-            args: vec![],
-            icon_id: "axcoding-rlm".into(),
-            color: "#0d9488".into(),
-            builtin: true,
-            disabled: false,
-            capabilities: AgentCapabilities {
-                yolo_args: vec![],
-                runtime_yolo_command: String::new(),
-                runtime_default_command: String::new(),
-                resume_args: vec![],
-                session_id_args: vec![],
-                resume_id_args: vec![],
-                resume_picker_args: vec![],
-                name_args: vec![],
-                signals: AgentSignals::default(),
-                match_output: false,
-            },
-            env: std::collections::HashMap::new(),
-            docker_env: std::collections::HashMap::new(),
-            sandbox_allowed_paths: vec![],
-            sandbox_allowed_hosts: vec![],
-            work_done: true,
-            accounts: Vec::new(),
-            default_account: None,
-            adopted_account: None,
-            auto_switch_account: false,
-            extends: None,
-            kind: "agent".into(),
-            post_launch_capture: None,
-        },
     ]
 }
 
@@ -22139,7 +22514,22 @@ pub fn run() {
         // deterministic order (restore → clamp-up → position → show)
         // instead of letting the plugin's on_window_ready hook race the
         // setup code. The plugin still SAVES bounds on move/resize/close.
-        .plugin(tauri_plugin_window_state::Builder::default().skip_initial_state("main").skip_initial_state(PROCMON_WINDOW).build())
+        //
+        // with_filename: the plugin keys its file by the bundle IDENTIFIER,
+        // and debug and e2e builds share the release one (they build from
+        // tauri.conf.json). So they shared ONE window-state file with the
+        // installed app: the e2e suite restored whatever size and position
+        // the user's real Termic last had (a main window on a monitor no
+        // longer connected broke 7 spec files at once), and wrote its own
+        // back (a 188x90 profile window). Release keeps the default name, so
+        // existing installs find their saved frames exactly where they were.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_filename(window_state_filename())
+                .skip_initial_state("main")
+                .skip_initial_state(PROCMON_WINDOW)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -22455,6 +22845,11 @@ pub fn run() {
             repo_config_load, repo_config_load_at, repo_config_save, repo_config_scaffold, repo_config_add_allowed_host, repo_config_add_allowed_path,
 
             task_reorder,
+            task_group_join,
+            task_group_new,
+            task_group_leave,
+            task_group_update,
+            task_group_dissolve,
             task_restore, task_delete, task_run_script, task_run_script_stream, task_ensure_extra_ports, task_stop_script, task_record_spawn, task_set_has_history, task_set_agent_session_id,
             task_set_tabs, task_set_tab_session_id, task_set_tab_scheduled,
             task_set_split_layout,
@@ -22764,34 +23159,53 @@ fn round_window_corners_for_tahoe(win: &tauri::WebviewWindow) {
     }
 }
 
-/// Center the window on whichever monitor the OS cursor is currently on.
-/// Skips the nudge when the window is already on the cursor's monitor (so we
-/// don't fight the window-state plugin's restore on subsequent launches).
+/// Whether every edge of a restored window stays inside one monitor.
+fn window_fits_monitor(
+    win_pos: tauri::PhysicalPosition<i32>,
+    win_size: tauri::PhysicalSize<u32>,
+    monitor_pos: tauri::PhysicalPosition<i32>,
+    monitor_size: tauri::PhysicalSize<u32>,
+) -> bool {
+    let left = i64::from(win_pos.x);
+    let top = i64::from(win_pos.y);
+    let mon_left = i64::from(monitor_pos.x);
+    let mon_top = i64::from(monitor_pos.y);
+    left >= mon_left
+        && top >= mon_top
+        && left + i64::from(win_size.width) <= mon_left + i64::from(monitor_size.width)
+        && top + i64::from(win_size.height) <= mon_top + i64::from(monitor_size.height)
+}
+
+fn point_on_monitor(x: i64, y: i64, monitor: &tauri::Monitor) -> bool {
+    let pos = monitor.position();
+    let size = monitor.size();
+    x >= i64::from(pos.x)
+        && x < i64::from(pos.x) + i64::from(size.width)
+        && y >= i64::from(pos.y)
+        && y < i64::from(pos.y) + i64::from(size.height)
+}
+
+/// Center on the cursor's monitor, falling back to the saved window's monitor.
+/// Keep the restored position only if the whole window fits there.
 fn position_on_cursor_monitor(win: &tauri::WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = win.cursor_position()?;
     let monitors = win.available_monitors()?;
-    let on_monitor = monitors.iter().find(|m| {
-        let pos = m.position();
-        let size = m.size();
-        let in_x = (cursor.x as i32) >= pos.x && (cursor.x as i32) < pos.x + size.width as i32;
-        let in_y = (cursor.y as i32) >= pos.y && (cursor.y as i32) < pos.y + size.height as i32;
-        in_x && in_y
-    });
-    let target = match on_monitor { Some(m) => m, None => return Ok(()) };
+    let cursor = win.cursor_position().ok();
+    let saved_pos = win.outer_position().ok();
+    // Cursor lookup can fail at launch (or land outside the monitor list
+    // while Spaces are changing). Never let that skip the size clamp: use
+    // the monitor containing the restored top-left, then the first display.
+    let target = cursor.as_ref()
+        .and_then(|pos| monitors.iter().find(|m| point_on_monitor(pos.x as i64, pos.y as i64, m)))
+        .or_else(|| saved_pos.as_ref().and_then(|pos| {
+            monitors.iter().find(|m| point_on_monitor(i64::from(pos.x), i64::from(pos.y), m))
+        }))
+        .or_else(|| monitors.first());
+    let target = match target { Some(m) => m, None => return Ok(()) };
 
-    // Skip if the window is already on the right monitor — don't override a
-    // saved position that the user explicitly chose.
-    if let Ok(cur_pos) = win.outer_position() {
-        let p = target.position();
-        let s = target.size();
-        if cur_pos.x >= p.x && cur_pos.x < p.x + s.width as i32
-            && cur_pos.y >= p.y && cur_pos.y < p.y + s.height as i32
-        {
-            return Ok(());
-        }
-    }
-
-    // Clamp the window to the target monitor before positioning.
+    // Clamp the window to the target monitor before deciding whether its
+    // saved position can be kept. A saved top-left corner may be on-screen
+    // while the window is many screens wide (including the beta's old saved
+    // bounds), leaving the centered Settings content outside the viewport.
     // tauri-plugin-window-state may have restored a size that's
     // larger than the CURRENT monitor (saved on a 4K, now on a
     // laptop screen; saved fullscreen on a different display;
@@ -22808,8 +23222,21 @@ fn position_on_cursor_monitor(win: &tauri::WebviewWindow) -> Result<(), Box<dyn 
     if win_size.width > max_w || win_size.height > max_h {
         let new_w = win_size.width.min(max_w);
         let new_h = win_size.height.min(max_h);
-        let _ = win.set_size(tauri::PhysicalSize::new(new_w, new_h));
+        win.set_size(tauri::PhysicalSize::new(new_w, new_h))?;
+        dlog(&format!(
+            "[window] clamped restored size {}x{} to {}x{}",
+            win_size.width, win_size.height, new_w, new_h,
+        ));
         win_size = win.outer_size()?;
+    }
+
+    // Keep an explicitly chosen position when the entire restored window is
+    // visible. A corner alone is insufficient: the window may still extend
+    // past the edge even after its size has been clamped.
+    if let Ok(cur_pos) = win.outer_position() {
+        if window_fits_monitor(cur_pos, win_size, *p, *s) {
+            return Ok(());
+        }
     }
 
     let x = p.x + (s.width as i32 - win_size.width as i32) / 2;
@@ -22820,6 +23247,23 @@ fn position_on_cursor_monitor(win: &tauri::WebviewWindow) -> Result<(), Box<dyn 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restored_window_must_fit_entirely_on_monitor() {
+        use tauri::{PhysicalPosition as Pos, PhysicalSize as Size};
+
+        let monitor = Pos::new(0, 0);
+        let display = Size::new(3440, 2160);
+        assert!(!super::window_fits_monitor(
+            Pos::new(0, 66), Size::new(13824, 2168), monitor, display,
+        ));
+        assert!(!super::window_fits_monitor(
+            Pos::new(3300, 100), Size::new(500, 600), monitor, display,
+        ));
+        assert!(super::window_fits_monitor(
+            Pos::new(100, 100), Size::new(1920, 1000), monitor, display,
+        ));
+    }
 
     // ───────── profiles: the data layer (docs/plans/profiles.md) ─────────
     //
@@ -26279,16 +26723,6 @@ mod tests {
         assert!(ax.sandbox_allowed_paths.is_empty());
         assert_eq!(ax.command, "axcoding-agent");
         assert_eq!(ax.icon_id, "axcoding");
-
-        // The harness CLI is the same registration story with a different
-        // binary: one RLM run per stdin line, same empties, same store.
-        let rl = agents.iter().find(|a| a.id == "axcoding-rlm").expect("axcoding-rlm seeded");
-        assert!(rl.capabilities.yolo_args.is_empty());
-        assert!(rl.capabilities.resume_args.is_empty());
-        assert!(rl.capabilities.session_id_args.is_empty());
-        assert!(rl.capabilities.name_args.is_empty());
-        assert_eq!(rl.command, "axcoding-rlm");
-        assert_eq!(rl.icon_id, "axcoding-rlm");
     }
 
     // Muse Code 1.0.2, measured against a live binary via its offline
@@ -28285,6 +28719,206 @@ mod tests {
         assert_eq!(resolve_base_ref(repo, "this-ref-does-not-exist"), "HEAD");
     }
 
+    // ──────────────── checkout_existing_branch ────────────────
+
+    /// A bare `origin`, a `colleague` repo that pushes to it, and a `work`
+    /// clone taken after the colleague pushed `alice/fix`. So `work` has
+    /// `refs/remotes/origin/alice/fix` and no local `alice/fix`: the shape of
+    /// "review someone else's branch". Returns (tempdir, work, colleague).
+    fn checkout_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        let colleague = dir.path().join("colleague");
+        let work = dir.path().join("work");
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&colleague).unwrap();
+        git_run(&origin, &["init", "--bare", "-b", "main"]);
+        git_init_with_commit(&colleague);
+        git_set_identity(&colleague);
+        git_run(&colleague, &["remote", "add", "origin", &origin.to_string_lossy()]);
+        git_run(&colleague, &["push", "origin", "main"]);
+        git_run(&colleague, &["checkout", "-b", "alice/fix"]);
+        git_commit_file(&colleague, "fix.txt", "the fix\n", "fix");
+        git_run(&colleague, &["push", "origin", "alice/fix"]);
+        git_run(dir.path(), &["clone", "-q", &origin.to_string_lossy(), &work.to_string_lossy()]);
+        git_set_identity(&work);
+        (dir, work, colleague)
+    }
+
+    fn local_branches(repo: &Path) -> String {
+        git(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"], repo).unwrap()
+    }
+
+    #[test]
+    fn checkout_uses_a_local_branch_as_it_is() {
+        let (_dir, work, _colleague) = checkout_fixture();
+        git_run(&work, &["branch", "mine"]);
+        let before = local_branches(&work);
+        let got = checkout_existing_branch(&work, "mine", true, &mut |_| {}).unwrap();
+        assert_eq!(got, "mine");
+        assert_eq!(local_branches(&work), before, "a local branch must not be recreated or moved");
+    }
+
+    #[test]
+    fn checkout_tracks_a_branch_that_only_exists_on_the_remote() {
+        // Both spellings a user reaches for: the bare name the colleague said,
+        // and the `origin/...` ref the picker lists.
+        for requested in ["alice/fix", "origin/alice/fix"] {
+            let (_dir, work, colleague) = checkout_fixture();
+            let mut lines = Vec::new();
+            let got = checkout_existing_branch(&work, requested, false, &mut |l| lines.push(l)).unwrap();
+            assert_eq!(got, "alice/fix", "{requested}");
+            assert_eq!(
+                git_rev(&work, "refs/heads/alice/fix"),
+                git_rev(&colleague, "alice/fix"),
+                "{requested}: the local branch must sit on the COLLEAGUE's commit, not on main",
+            );
+            assert_eq!(
+                git(&["rev-parse", "--abbrev-ref", "alice/fix@{upstream}"], &work).unwrap().trim(),
+                "origin/alice/fix",
+                "{requested}: push and pull on it have to reach their branch",
+            );
+            assert!(lines.iter().any(|l| l.contains("tracking 'origin/alice/fix'")), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn checkout_fetches_a_branch_pushed_after_the_last_fetch() {
+        let (_dir, work, colleague) = checkout_fixture();
+        git_run(&colleague, &["checkout", "-b", "bob/late"]);
+        git_commit_file(&colleague, "late.txt", "late\n", "late");
+        git_run(&colleague, &["push", "origin", "bob/late"]);
+
+        // Without the fetch, this repo has never heard of it.
+        assert!(checkout_existing_branch(&work, "bob/late", false, &mut |_| {}).is_err());
+        assert!(git(&["rev-parse", "--verify", "--quiet", "refs/heads/bob/late"], &work).is_err());
+
+        let got = checkout_existing_branch(&work, "bob/late", true, &mut |_| {}).unwrap();
+        assert_eq!(got, "bob/late");
+        assert_eq!(git_rev(&work, "refs/heads/bob/late"), git_rev(&colleague, "bob/late"));
+    }
+
+    #[test]
+    fn checkout_of_an_unknown_branch_is_an_error_and_creates_nothing() {
+        // The bug this exists for: the new-branch path turns an unknown name
+        // into a fresh branch off the base, and an agent then reviews main
+        // under the colleague's branch name.
+        let (_dir, work, _colleague) = checkout_fixture();
+        let before = local_branches(&work);
+        let err = checkout_existing_branch(&work, "nobody/has-this", true, &mut |_| {}).unwrap_err();
+        assert!(err.contains("no branch 'nobody/has-this'") && err.contains("origin"), "{err}");
+        assert_eq!(local_branches(&work), before, "a refused checkout must leave no branch behind");
+    }
+
+    #[test]
+    fn checkout_in_a_repo_with_no_remote_is_a_clean_error() {
+        // detect_default_remote answers "origin" even when there is none, and
+        // fetch_ref no-ops for it, so this has to fall through to the error.
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        let err = checkout_existing_branch(repo, "feature/x", true, &mut |_| {}).unwrap_err();
+        assert!(err.contains("no branch 'feature/x'"), "{err}");
+        git_run(repo, &["branch", "feature/x"]);
+        assert_eq!(checkout_existing_branch(repo, "feature/x", true, &mut |_| {}).unwrap(), "feature/x");
+    }
+
+    #[test]
+    fn checkout_refuses_names_git_would_read_as_options_or_reject() {
+        let (_dir, work, _colleague) = checkout_fixture();
+        assert!(checkout_existing_branch(&work, "  ", true, &mut |_| {}).unwrap_err().contains("name the branch"));
+        for bad in ["--upload-pack=touch pwned", "-x", "origin/-x", "a..b", "has space", "ends.lock"] {
+            let err = checkout_existing_branch(&work, bad, true, &mut |_| {}).unwrap_err();
+            assert!(err.contains("not a valid branch name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn checkout_prefers_the_local_branch_over_a_diverged_remote_one() {
+        // The local copy may hold the user's own review commits: checking the
+        // branch out again must not move it to wherever the remote went.
+        let (_dir, work, colleague) = checkout_fixture();
+        git_run(&work, &["checkout", "-q", "alice/fix"]);
+        git_commit_file(&work, "mine.txt", "mine\n", "my note");
+        git_run(&work, &["checkout", "-q", "main"]);
+        let mine = git_rev(&work, "refs/heads/alice/fix");
+        git_run(&colleague, &["checkout", "-q", "alice/fix"]);
+        git_commit_file(&colleague, "more.txt", "more\n", "more");
+        git_run(&colleague, &["push", "origin", "alice/fix"]);
+
+        let got = checkout_existing_branch(&work, "origin/alice/fix", true, &mut |_| {}).unwrap();
+        assert_eq!(got, "alice/fix");
+        assert_eq!(git_rev(&work, "refs/heads/alice/fix"), mine);
+        assert_ne!(git_rev(&work, "refs/remotes/origin/alice/fix"), mine, "the fetch did move the remote ref");
+    }
+
+    // ensure_restore_branch: "Delete the branch when archiving" removed the
+    // local branch, and restore has to put the worktree back on the RIGHT one.
+
+    fn archived_task(branch: &str, checkout_existing: bool) -> Task {
+        Task {
+            branch: branch.into(),
+            base_branch: "origin/main".into(),
+            checkout_existing,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn restore_brings_a_deleted_checkout_branch_back_from_the_remote() {
+        let (_dir, work, colleague) = checkout_fixture();
+        // Create checked it out, archive deleted the local copy.
+        checkout_existing_branch(&work, "alice/fix", false, &mut |_| {}).unwrap();
+        git_run(&work, &["branch", "-D", "alice/fix"]);
+
+        ensure_restore_branch(&work, &archived_task("alice/fix", true), true).unwrap();
+        assert_eq!(
+            git_rev(&work, "refs/heads/alice/fix"),
+            git_rev(&colleague, "alice/fix"),
+            "the colleague's commit, not main under their branch's name",
+        );
+        assert_ne!(git_rev(&work, "refs/heads/alice/fix"), git_rev(&work, "main"));
+        assert_eq!(
+            git(&["rev-parse", "--abbrev-ref", "alice/fix@{upstream}"], &work).unwrap().trim(),
+            "origin/alice/fix",
+        );
+    }
+
+    #[test]
+    fn restore_still_cuts_a_tasks_own_deleted_branch_from_its_base() {
+        // The flag is what separates the two: an ordinary task's branch was
+        // cut from the base in the first place, so that is where it goes back.
+        let (_dir, work, _colleague) = checkout_fixture();
+        ensure_restore_branch(&work, &archived_task("feature/mine", false), true).unwrap();
+        assert_eq!(git_rev(&work, "refs/heads/feature/mine"), git_rev(&work, "origin/main"));
+        // Even when the name also exists on the remote: without the flag it
+        // is not someone else's branch.
+        ensure_restore_branch(&work, &archived_task("alice/fix", false), true).unwrap();
+        assert_eq!(git_rev(&work, "refs/heads/alice/fix"), git_rev(&work, "origin/main"));
+    }
+
+    #[test]
+    fn restore_fails_a_checkout_whose_branch_is_gone_everywhere() {
+        // Gone locally AND on the remote: an error, never main in its place.
+        let (_dir, work, colleague) = checkout_fixture();
+        git_run(&colleague, &["push", "origin", "--delete", "alice/fix"]);
+        git_run(&work, &["fetch", "-q", "--prune", "origin"]);
+        let before = local_branches(&work);
+        let err = ensure_restore_branch(&work, &archived_task("alice/fix", true), true).unwrap_err();
+        assert!(err.contains("restore branch 'alice/fix'") && err.contains("no branch"), "{err}");
+        assert_eq!(local_branches(&work), before);
+    }
+
+    #[test]
+    fn restore_leaves_a_branch_that_still_exists_alone() {
+        let (_dir, work, _colleague) = checkout_fixture();
+        git_run(&work, &["branch", "kept"]);
+        let before = local_branches(&work);
+        ensure_restore_branch(&work, &archived_task("kept", true), true).unwrap();
+        ensure_restore_branch(&work, &archived_task("kept", false), true).unwrap();
+        assert_eq!(local_branches(&work), before);
+    }
+
     #[test]
     fn a_ref_that_is_not_a_commit_is_refused_here_rather_than_by_git_branch() {
         let dir = tempdir().unwrap();
@@ -29955,6 +30589,109 @@ filename f.rs
 
     // ── Sidebar task order (drag-to-reorder) ────────────────────────────
 
+    fn gt(id: &str) -> Task {
+        Task { id: id.into(), name: id.into(), project_id: "p".into(), ..Default::default() }
+    }
+    fn gid(list: &[Task], id: &str) -> Option<String> {
+        list.iter().find(|t| t.id == id).unwrap().group.as_ref().map(|g| g.id.clone())
+    }
+
+    #[test]
+    fn group_join_founds_a_group_led_by_the_orchestrator() {
+        let mut l = vec![gt("orch"), gt("child")];
+        let changed = apply_group_join(&mut l, "child", "orch", Some("teal".into())).unwrap();
+        assert_eq!(changed.len(), 2, "the lead is written too");
+        assert_eq!(gid(&l, "orch").as_deref(), Some("orch"));
+        assert_eq!(gid(&l, "child").as_deref(), Some("orch"));
+        let g = l[0].group.as_ref().unwrap();
+        assert_eq!(g.name, None, "an unnamed group follows the lead's name");
+        assert_eq!(g.color.as_deref(), Some("teal"));
+        // A second child reuses it and does not rewrite the lead.
+        l.push(gt("child2"));
+        let changed = apply_group_join(&mut l, "child2", "orch", Some("red".into())).unwrap();
+        assert_eq!(changed, vec![2]);
+        assert_eq!(l[2].group.as_ref().unwrap().color.as_deref(), Some("teal"), "the founding colour wins");
+    }
+
+    #[test]
+    fn group_join_from_a_member_stays_flat() {
+        // A sub-orchestrator's children land in the ROOT group.
+        let mut l = vec![gt("orch"), gt("sub"), gt("leaf")];
+        apply_group_join(&mut l, "sub", "orch", None).unwrap();
+        apply_group_join(&mut l, "leaf", "sub", None).unwrap();
+        assert_eq!(gid(&l, "leaf").as_deref(), Some("orch"));
+    }
+
+    #[test]
+    fn group_join_refuses_self_unknown_and_cross_profile() {
+        let mut l = vec![gt("a"), gt("b")];
+        assert!(apply_group_join(&mut l, "a", "a", None).is_err());
+        assert!(apply_group_join(&mut l, "a", "nope", None).is_err());
+        assert!(apply_group_join(&mut l, "nope", "a", None).is_err());
+        l[1].profile = ProfileId::Slug("other".into());
+        assert!(apply_group_join(&mut l, "a", "b", None).is_err());
+        assert!(l.iter().all(|t| t.group.is_none()), "a refusal writes nothing");
+    }
+
+    #[test]
+    fn group_leave_keeps_the_rest_even_a_group_of_one() {
+        let mut l = vec![gt("orch"), gt("c1"), gt("c2")];
+        apply_group_join(&mut l, "c1", "orch", None).unwrap();
+        apply_group_join(&mut l, "c2", "orch", None).unwrap();
+        assert_eq!(apply_group_leave(&mut l, "c1").unwrap(), vec![1]);
+        assert_eq!(apply_group_leave(&mut l, "c2").unwrap(), vec![2]);
+        assert_eq!(gid(&l, "orch").as_deref(), Some("orch"), "a lone lead is still a group, like a project folder");
+        assert!(apply_group_leave(&mut l, "c2").unwrap().is_empty(), "leaving no group is a no-op");
+    }
+
+    #[test]
+    fn group_join_elsewhere_moves_just_that_task() {
+        let mut l = vec![gt("a"), gt("a1"), gt("b"), gt("b1")];
+        apply_group_join(&mut l, "a1", "a", None).unwrap();
+        apply_group_join(&mut l, "b1", "b", None).unwrap();
+        apply_group_join(&mut l, "a1", "b", None).unwrap();
+        assert_eq!(gid(&l, "a1").as_deref(), Some("b"));
+        assert_eq!(gid(&l, "a").as_deref(), Some("a"), "a keeps its group of one");
+    }
+
+    #[test]
+    fn group_new_uses_the_task_id_unless_it_already_leads_one() {
+        let mut l = vec![gt("a"), gt("b")];
+        apply_group_new(&mut l, "a", Some("teal".into())).unwrap();
+        assert_eq!(l[0].group, Some(TaskGroup { id: "a".into(), name: None, color: Some("teal".into()) }));
+        // "a" leads a group b is in; a NEW group from a must not collide with it.
+        apply_group_join(&mut l, "b", "a", None).unwrap();
+        apply_group_new(&mut l, "a", None).unwrap();
+        let g = l[0].group.clone().unwrap();
+        assert_ne!(g.id, "a");
+        assert_eq!(g.name.as_deref(), Some("a"), "named after its lead, which it cannot follow by id");
+        assert_eq!(gid(&l, "b").as_deref(), Some("a"), "b stays in the old group");
+        assert!(apply_group_new(&mut l, "nope", None).is_err());
+    }
+
+    #[test]
+    fn group_update_rewrites_every_member_and_blank_name_follows_the_lead() {
+        let mut l = vec![gt("orch"), gt("c1"), gt("x")];
+        apply_group_join(&mut l, "c1", "orch", None).unwrap();
+        l[1].archived = true;
+        let changed = apply_group_update(&mut l, "orch", Some("  Auth refactor ".into()), Some("pink".into()));
+        assert_eq!(changed, vec![0, 1], "archived members included, outsiders untouched");
+        assert_eq!(l[1].group.as_ref().unwrap().name.as_deref(), Some("Auth refactor"));
+        assert!(apply_group_update(&mut l, "orch", Some("Auth refactor".into()), Some("pink".into())).is_empty(), "unchanged writes nothing");
+        apply_group_update(&mut l, "orch", Some("   ".into()), Some("pink".into()));
+        assert_eq!(l[0].group.as_ref().unwrap().name, None);
+        assert_eq!(apply_group_dissolve(&mut l, "orch").len(), 2);
+        assert!(l.iter().all(|t| t.group.is_none()));
+    }
+
+    #[test]
+    fn group_is_absent_from_json_when_unset() {
+        let t = gt("a");
+        assert!(!serde_json::to_string(&t).unwrap().contains("\"group\""));
+        let back: Task = serde_json::from_str(r#"{"id":"a","group":{"id":"o","color":"teal"}}"#).unwrap();
+        assert_eq!(back.group, Some(TaskGroup { id: "o".into(), name: None, color: Some("teal".into()) }));
+    }
+
     fn ordered(id: &str, created: &str, order: Option<u32>) -> Task {
         Task { id: id.into(), created: created.into(), order, ..Default::default() }
     }
@@ -30640,6 +31377,43 @@ filename f.rs
     }
 
     #[test]
+    fn project_yolo_default_keeps_no_opinion_apart_from_off() {
+        // Three answers, not two: `None` inherits the app-wide pref, and
+        // `Some(false)` is a project that keeps asking even when the app
+        // says YOLO. A record from before the field existed must read as
+        // `None`, or upgrading would pin every project to "off".
+        let legacy: Project = serde_json::from_str(
+            r#"{"id":"p1","name":"proj","root_path":"/r"}"#,
+        ).unwrap();
+        assert_eq!(legacy.default_yolo, None);
+
+        for v in [Some(true), Some(false), None] {
+            let p = Project { id: "p2".into(), default_yolo: v, ..Default::default() };
+            let back: Project = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+            assert_eq!(back.default_yolo, v);
+        }
+    }
+
+    #[test]
+    fn create_args_without_yolo_leave_it_unset() {
+        // The CLI and MCP never send `yolo` unless asked (`--yolo`), and
+        // the create paths read unset as off. Pinned because a default
+        // here would reach every agent-driven create.
+        let args: CreateTaskArgs = serde_json::from_str(
+            r#"{"project_id":"p","name":"n"}"#,
+        ).unwrap();
+        assert_eq!(args.yolo, None);
+        let args: CreateTaskArgs = serde_json::from_str(
+            r#"{"project_id":"p","name":"n","yolo":true}"#,
+        ).unwrap();
+        assert_eq!(args.yolo, Some(true));
+        let multi: CreateMultiArgs = serde_json::from_str(
+            r#"{"project_id":"p","name":"n","members":[],"yolo":true}"#,
+        ).unwrap();
+        assert_eq!(multi.yolo, Some(true));
+    }
+
+    #[test]
     fn builtin_flag_is_derived_from_the_current_default_list() {
         // `builtin` is persisted in settings.json AND used by the UI as the
         // delete guard. When an agent is dropped from `default_agents()`
@@ -30782,6 +31556,63 @@ filename f.rs
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(landed.is_empty(), "a blank glob copied {landed:?}");
+    }
+
+    #[test]
+    fn copy_matching_supports_multiple_stars_and_recursive_env_files() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join(".env"), "ROOT=1").unwrap();
+        fs::write(repo.path().join(".env.local"), "ROOT=2").unwrap();
+        fs::create_dir_all(repo.path().join("evals/deep")).unwrap();
+        fs::write(repo.path().join("evals/.env"), "EVALS=1").unwrap();
+        fs::write(repo.path().join("evals/deep/.env.test"), "DEEP=1").unwrap();
+        fs::write(repo.path().join("evals/other.txt"), "skip").unwrap();
+
+        let wt = tempdir().unwrap();
+        copy_matching(repo.path(), wt.path(), "**/.env*");
+        for (rel, content) in [
+            (".env", "ROOT=1"),
+            (".env.local", "ROOT=2"),
+            ("evals/.env", "EVALS=1"),
+            ("evals/deep/.env.test", "DEEP=1"),
+        ] {
+            assert_eq!(fs::read_to_string(wt.path().join(rel)).unwrap(), content, "{rel}");
+        }
+        assert!(!wt.path().join("evals/other.txt").exists());
+
+        let wt = tempdir().unwrap();
+        copy_matching(repo.path(), wt.path(), "*.env*");
+        assert_eq!(fs::read_to_string(wt.path().join(".env")).unwrap(), "ROOT=1");
+        assert_eq!(fs::read_to_string(wt.path().join(".env.local")).unwrap(), "ROOT=2");
+        assert!(!wt.path().join("evals/.env").exists(), "a root glob must not recurse");
+    }
+
+    #[test]
+    fn copy_matching_preserves_literal_paths_and_directory_copies() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("secrets/nested")).unwrap();
+        fs::write(repo.path().join("secrets/nested/key.pem"), "KEY").unwrap();
+        fs::write(repo.path().join("exact.env"), "EXACT").unwrap();
+
+        let wt = tempdir().unwrap();
+        copy_matching(repo.path(), wt.path(), "exact.env");
+        copy_matching(repo.path(), wt.path(), "secrets");
+        assert_eq!(fs::read_to_string(wt.path().join("exact.env")).unwrap(), "EXACT");
+        assert_eq!(fs::read_to_string(wt.path().join("secrets/nested/key.pem")).unwrap(), "KEY");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_glob_does_not_follow_directory_symlinks() {
+        let repo = tempdir().unwrap();
+        fs::create_dir(repo.path().join("evals")).unwrap();
+        fs::write(repo.path().join("evals/.env"), "EVALS=1").unwrap();
+        std::os::unix::fs::symlink("..", repo.path().join("evals/loop")).unwrap();
+
+        let wt = tempdir().unwrap();
+        copy_matching(repo.path(), wt.path(), "**/.env*");
+        assert_eq!(fs::read_to_string(wt.path().join("evals/.env")).unwrap(), "EVALS=1");
+        assert!(!wt.path().join("evals/loop").exists());
     }
 
     #[test]

@@ -82,6 +82,11 @@ before it exists, you cannot replay it, and the agent decides how wide
 to fan out. The trust question moves from "is this code correct" to
 "did it fan out the way I meant".
 
+Part of that is answered now: a task an agent creates joins the agent's
+sidebar task group automatically (docs/ui.md "Task groups"), so the
+fan-out is visible once it has happened. Seeing it before, replaying it,
+and bounding its width are still open.
+
 ## Questions this research has to answer
 
 1. **Does injection actually work?** Put termic's CLI surface into

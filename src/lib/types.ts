@@ -107,6 +107,11 @@ export interface Project {
   /** New tasks default to Docker rather than Seatbelt. Mutually exclusive
    *  with the two Seatbelt defaults in effect. */
   default_docker?: boolean;
+  /** Whether new tasks of this project start with YOLO on. `null` /
+   *  undefined = no opinion, inherit the app-wide `defaultYolo` pref;
+   *  `false` keeps this project asking even when the app says YOLO.
+   *  Resolved by `projectYoloDefault`, never by Rust. */
+  default_yolo?: boolean | null;
   /** Project-level default Docker extra mounts, seeded into new tasks ahead
    *  of the global `Settings.docker_default_extra_mounts`. */
   docker_extra_mounts?: string[];
@@ -271,6 +276,16 @@ export interface NamedPort {
   port: number;
 }
 
+/** A sidebar task group. Founded when an agent in one task creates another
+ *  through the CLI or MCP, so `id` is the orchestrator's (the lead's) task id.
+ *  Every member carries the same copy. `name` absent = follow the lead's
+ *  current name; `color` is an accent KEY (src/lib/accents.ts). */
+export interface TaskGroup {
+  id: string;
+  name?: string;
+  color?: string;
+}
+
 export interface Task {
   id: string;
   project_id: string;
@@ -291,10 +306,17 @@ export interface Task {
    *  sort AFTER any ordered sibling — so untouched projects stay in creation
    *  order and a newly created task appends at the bottom. */
   order?: number;
+  /** Sidebar task group (see `TaskGroup`). Absent on ungrouped tasks. */
+  group?: TaskGroup;
   /** True when this task points at the project's main repo checkout
    *  (no git worktree). The UI shows a distinct icon and archive only
    *  removes the entry — the repo on disk is untouched. */
   is_main_checkout?: boolean;
+  /** True when the task checked out an EXISTING branch (New Task's
+   *  "Existing branch" mode, `termic new --checkout`) instead of cutting
+   *  one. Restore brings a branch deleted at archive back from the remote
+   *  instead of cutting it from `base_branch`. */
+  checkout_existing?: boolean;
   /** Total agent spawns ever recorded for this worktree. Historical
    *  metric only — resume gating uses `has_resumable_history` now. */
   spawn_count?: number;
@@ -464,6 +486,8 @@ export interface CreateMultiArgs {
   /** Resume-args override for the host task, applied from the first spawn.
    *  Same field as the task menu's "Resume override". */
   resume_override?: string;
+  /** See `CreateTaskArgs.yolo`. */
+  yolo?: boolean;
 }
 
 export interface CreateTaskArgs {
@@ -474,6 +498,12 @@ export interface CreateTaskArgs {
   agent_args?: string[];
   base_branch?: string | null;
   branch?: string | null;
+  /** Check out `branch` as it EXISTS (locally, or on the remote, fetched
+   *  and tracked) instead of cutting a new branch from `base_branch`, which
+   *  then only sets what the diff compares against. An unknown branch is an
+   *  error, never a fresh branch. The dialog's "Existing branch" mode and
+   *  `termic new --checkout`. */
+  checkout_existing?: boolean;
   /** Pre-generated task UUID. Pass this if you want to subscribe to
    *  `setup-output://<id>` / `setup-done://<id>` events BEFORE invoking — the
    *  alternative (using server-generated ID returned from the call) has a
@@ -514,6 +544,10 @@ export interface CreateTaskArgs {
    *  replaces termic's default resume block, placeholders expanded per
    *  launch. Empty / unset leaves the default logic in place. */
   resume_override?: string;
+  /** Per-task YOLO, set at create so the FIRST spawn already carries the
+   *  agent's `yolo_args`. Unset = off: Rust never applies a default, the
+   *  caller resolves it (`projectYoloDefault`) and sends the answer. */
+  yolo?: boolean;
 }
 
 export interface Agent {
@@ -1345,6 +1379,15 @@ export interface TerminalTab extends BaseTab {
    *  detached-work grace can be measured without a timer per tab. Cleared with
    *  it. */
   delegatedSince?: number;
+  /** The agent's OWN loop has stopped with delegated work outstanding (the
+   *  delegated / partially-done states), so it can take input: another
+   *  agent's message (`termic send`, MCP task_send) is delivered at once
+   *  instead of queueing until all of that work finishes. The user's message
+   *  queue ignores it. Set by the hook that reports the held work, cleared by
+   *  ANY sign the agent is working again (one being a subagent's report
+   *  making it resume). Not the same as `delegatedWork`, which stays on the
+   *  tab while the model works. Session-only. */
+  delegatedIdle?: boolean;
   /** Set while a library prompt (target "new-agent") is waiting for this
    *  freshly spawned agent to come up before its prompt is injected. Drives
    *  the "starting agent" loader overlay in TerminalPane; cleared once the
@@ -1553,6 +1596,13 @@ export interface ScratchTab extends BaseTab {
   /** Per-document remote-image unblock for the rendered preview, as on
    *  EditTab (issue #69). Session-only. */
   remoteImagesUnblocked?: boolean;
+  /** Someone else (an agent, over the CLI or MCP) created or wrote this pad
+   *  while it was not on screen in a focused window, and the user has not
+   *  looked since. Draws a ring on the tab in place of the dirty dot; cleared
+   *  by showing the tab. Deliberately NOT `unread`: that field is agent news,
+   *  read by the OS notifier and the sidebar's work badges, and a pad edit is
+   *  neither. Session-only. */
+  unseen?: boolean;
 }
 
 /** A file OUTSIDE the task, opened READ-ONLY from a cmd+clicked absolute

@@ -861,6 +861,71 @@ describe("termic new --base resolves or refuses (GH report, 1.3.2)", () => {
   });
 });
 
+describe("termic new --checkout: an existing branch into a new worktree", () => {
+  const gitIn = (cwd: string, args: string) =>
+    execSync(`git ${args}`, { cwd, encoding: "utf8" }).trim();
+  const BRANCH = "e2e-cli-colleague/fix";
+
+  let fixture = "";
+  let tip = "";
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    fixture = await browser.execute(() =>
+      (window.__termic!.useApp.getState().projects
+        .find((p: any) => p.name === "fixture-repo") as any).root_path);
+    // A commit of its own, pushed straight to the remote without ever being
+    // a local branch or touching the main checkout: exactly a colleague's
+    // branch, as far as this repo can tell.
+    tip = gitIn(fixture, `-c user.email=e2e@termic.dev -c user.name=e2e commit-tree "HEAD^{tree}" -p HEAD -m "colleague work"`);
+    gitIn(fixture, `push -q origin ${tip}:refs/heads/${BRANCH}`);
+  });
+  after(async () => {
+    await browser.execute(async (name) => {
+      const t = window.__termic!;
+      for (const task of t.useApp.getState().tasks) {
+        if (task.name === name && !task.archived) await t.ipc.taskArchive(task.id, true);
+      }
+      await t.useApp.getState().loadAll();
+    }, BRANCH);
+    for (const args of [
+      "worktree prune",
+      `branch -q -D ${BRANCH}`,
+      `update-ref -d refs/remotes/origin/${BRANCH}`,
+      `push -q origin --delete ${BRANCH}`,
+    ]) {
+      try { gitIn(fixture, args); } catch { /* already gone */ }
+    }
+  });
+
+  it("checks out a remote-only branch, naming the task after it", async () => {
+    const r = await rpc({
+      cmd: "new", name: "", checkout: `origin/${BRANCH}`,
+      agent: "fakeagent", project: "fixture-repo",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.data.task.name).toBe(BRANCH);
+    expect(r.data.task.branch).toBe(BRANCH);
+    // On the colleague's commit, not the main checkout's: asserting only that
+    // the create succeeded would pass with a fresh branch cut from main.
+    expect(gitIn(r.data.task.path, "rev-parse HEAD")).toBe(tip);
+    expect(tip).not.toBe(gitIn(fixture, "rev-parse HEAD"));
+    expect(gitIn(fixture, `rev-parse --abbrev-ref ${BRANCH}@{upstream}`)).toBe(`origin/${BRANCH}`);
+  });
+
+  it("refuses a checkout into the main checkout, and creates nothing", async () => {
+    const r = await rpc({
+      cmd: "new", name: "checkout-main", checkout: BRANCH, mode: "main",
+      agent: "fakeagent", project: "fixture-repo",
+    });
+    expect(r.ok).toBe(false);
+    expect(String(r.error?.message ?? "")).toContain("checkout");
+    const tasks = await browser.execute(() =>
+      window.__termic!.useApp.getState().tasks.map((t: any) => t.name));
+    expect(tasks).not.toContain("checkout-main");
+  });
+});
+
 describe("termic new task parameters (GH #287)", () => {
   let taskId = "";
 

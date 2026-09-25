@@ -239,10 +239,6 @@ pub fn login_store(base_id: &str) -> Option<LoginStore> {
         // keyring agents there is no second store hiding behind the dir:
         // the credential is a plain file IN it.
         "axcoding" => Some(ConfigDir { env: "AXCODING_HOME" }),
-        // axcoding-rlm shares the exact auth chain and auth file with the
-        // axcoding agent (they are two binaries over one crate), so the
-        // store - and therefore the account switcher - is the same dir.
-        "axcoding-rlm" => Some(ConfigDir { env: "AXCODING_HOME" }),
         // NOT SUPPORTED, and this is a correction rather than an omission.
         //
         // copilot keeps its credential in the OS keyring under a FIXED service
@@ -511,14 +507,11 @@ pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
         // Docker — see assets/Dockerfile.default.
         "muse" => &[".config/muse", ".local/share/muse"],
         // axcoding (this repo's own agent): the only HOME state is the
-        // playbook dir the RLM harness writes by default
-        // (`$HOME/.axcoding/playbook.json`, axcoding::default_data_dir).
-        // Auth is env-only, so this is state rather than login - but it is
-        // real WRITE state, which is exactly what a cage or a Docker mount
-        // must not silently deny.
+        // auth file `axcoding-agent auth import` writes
+        // (`$HOME/.axcoding/auth.json`). Auth resolves env-first, so this
+        // is state rather than login - but it is real WRITE state, which
+        // is exactly what a cage or a Docker mount must not silently deny.
         "axcoding" => &[".axcoding"],
-        // axcoding-rlm shares the dir: playbook + auth file, same as above.
-        "axcoding-rlm" => &[".axcoding"],
         // grok: binary, bundled skills, and config all live under `.grok`
         // with no clean relocation env. Listed here for Seatbelt (which
         // allows the real path regardless); `docker::agent_config` still

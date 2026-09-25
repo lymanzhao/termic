@@ -2,7 +2,8 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, clickMenuItem, clickWhenVisible, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
+import { archiveTask, waitForAgentReady, clickByText, clickMenuItem, clickWhenVisible, cliRpc, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, runCli, snap, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
+import { dataDir } from "../../wdio.conf.js";
 
 // Click a button by its exact text inside the NewTaskDialog specifically
 // (scoped via the name input's dialog — there can be more than one
@@ -242,6 +243,239 @@ describe("create task wizard", () => {
     } catch {
       /* already gone */
     }
+  });
+});
+
+// Default YOLO for new tasks (Settings → Sandbox, overridable per project).
+//
+// A default must never be a silent auto-approve on an uncaged task, so all it
+// does is SEED the New Task dialog's checkbox, which the user reads before
+// Create. Driven through the real dialog, and checked where it shows: the
+// checkbox, the red ⚡ on the new row, and the FIRST spawn's argv. That last
+// one is the point of setting it at create: a flag set after the tab mounts
+// only reaches the agent through a restart.
+describe("YOLO default for new tasks", () => {
+  const NAME_INPUT = 'input[placeholder="fix login bug"]';
+  const created: string[] = [];
+  let projectId!: string;
+  let saved: { pref: boolean; project: boolean | null } | null = null;
+
+  const setAppDefault = (on: boolean) =>
+    browser.execute((v) => window.__termic!.usePrefs.getState().setDefaultYolo(v), on);
+
+  /** Set the project's own answer through the same IPC Settings uses. */
+  const setProjectDefault = (v: boolean | null) =>
+    browser.execute(async (pid, val) => {
+      const t = window.__termic!;
+      const p = t.useApp.getState().projects.find((x: any) => x.id === pid);
+      await t.ipc.projectUpdate({ ...p, default_yolo: val });
+      await t.useApp.getState().loadAll();
+    }, projectId, v);
+
+  /** Open the dialog on Main checkout with FakeAgent picked, so every case
+   *  starts from the same shape whatever the last one left remembered. */
+  const openDialog = async () => {
+    await browser.execute((pid) => window.__termic!.useUI.getState().openNewTask(pid), projectId);
+    await waitVisible(`[role="dialog"] ${NAME_INPUT}`, 8_000);
+    await clickDialogButton("Main checkout");
+    await clickDialogButton("FakeAgent");
+  };
+
+  const closeDialog = async () => {
+    await browser.execute(() => window.__termic!.useUI.getState().closeNewTask());
+    await waitGone(`[role="dialog"] ${NAME_INPUT}`);
+  };
+
+  /** What the dialog's YOLO control shows, or null when it is not rendered. */
+  const yoloControl = () =>
+    browser.execute((sel) => {
+      const dlg = document.querySelector(sel)?.closest('[role="dialog"]');
+      const el = dlg?.querySelector('[data-testid="new-task-yolo"]');
+      if (!el) return null;
+      const box = el.querySelector('input[type="checkbox"]') as HTMLInputElement;
+      return { state: el.getAttribute("data-yolo-state"), checked: box.checked, disabled: box.disabled };
+    }, NAME_INPUT);
+
+  const clickYolo = () =>
+    browser.execute((sel) => {
+      const dlg = document.querySelector(sel)?.closest('[role="dialog"]');
+      (dlg?.querySelector('[data-testid="new-task-yolo"] input') as HTMLElement).click();
+    }, NAME_INPUT);
+
+  /** Click one of the sandbox picker's cards by its heading. */
+  const pickSandbox = (heading: string) =>
+    browser.execute((sel, h) => {
+      const dlg = document.querySelector(sel)?.closest('[role="dialog"]');
+      const btn = [...(dlg?.querySelectorAll("button") ?? [])].find(
+        (b) => b.querySelector("span")?.textContent?.trim() === h,
+      );
+      (btn as HTMLElement).click();
+    }, NAME_INPUT, heading);
+
+  /** Name the task, Create, and return the created task once it lands. */
+  const createNamed = async (name: string) => {
+    await browser.execute((sel, n) => {
+      const input = document.querySelector(`[role="dialog"] ${sel}`) as HTMLInputElement;
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!
+        .set!.call(input, n);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, NAME_INPUT, name);
+    await clickDialogButton("Create");
+    await browser.waitUntil(
+      () => browser.execute((n) =>
+        window.__termic!.useApp.getState().tasks.some((t: any) => t.name === n && !t.archived), name),
+      { timeout: 15_000, timeoutMsg: `the dialog did not create ${name}` },
+    );
+    const task = await browser.execute((n) =>
+      window.__termic!.useApp.getState().tasks.find((t: any) => t.name === n && !t.archived), name) as any;
+    created.push(task.id);
+    return task;
+  };
+
+  /** Argv of every spawn a task has made, oldest first (the fixture logs it:
+   *  terminal output is a canvas, so this is the only way to read it). */
+  const spawnArgv = (id: string): string[] => {
+    const log = path.join(dataDir, "e2e-agent-argv.log");
+    if (!existsSync(log)) return [];
+    return readFileSync(log, "utf8").split("\n")
+      .filter((l) => l.startsWith(id + "\t"))
+      .map((l) => l.slice(id.length + 1));
+  };
+
+  const firstSpawnArgv = async (id: string) => {
+    await browser.waitUntil(async () => spawnArgv(id).length > 0, {
+      timeout: 20_000, timeoutMsg: "the agent never spawned",
+    });
+    return spawnArgv(id)[0];
+  };
+
+  /** The red ⚡ on the task's sidebar row: YOLO without a cage. */
+  const rowBadge = (id: string) =>
+    browser.execute((i) =>
+      !!document.querySelector(`[data-sidebar-task-row="${i}"] [data-testid="task-yolo-badge"]`), id);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    const info = await browser.execute(() => {
+      const t = window.__termic!;
+      const p = t.useApp.getState().projects.find((x: any) => x.name === "fixture-repo");
+      return { id: p.id as string, project: (p.default_yolo ?? null) as boolean | null,
+        pref: !!t.usePrefs.getState().defaultYolo };
+    });
+    projectId = info.id;
+    saved = { pref: info.pref, project: info.project };
+    await setAppDefault(false);
+    await setProjectDefault(null);
+  });
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useUI.getState().closeNewTask()).catch(() => {});
+    for (const id of created) await archiveTask(id).catch(() => {});
+    if (saved) {
+      await setAppDefault(saved.pref);
+      await setProjectDefault(saved.project);
+    }
+  });
+
+  it("leaves YOLO unticked, and the agent asking, when nothing sets a default", async () => {
+    await openDialog();
+    expect(await yoloControl()).toEqual({ state: "off", checked: false, disabled: false });
+    const task = await createNamed(`e2e-yolo-off-${Date.now()}`);
+    expect(task.yolo).toBe(false);
+    expect(await firstSpawnArgv(task.id)).not.toContain("--dangerously-skip-permissions");
+    expect(await rowBadge(task.id)).toBe(false);
+  });
+
+  it("starts ticked from the app-wide default, and the FIRST spawn already skips prompts", async () => {
+    await setAppDefault(true);
+    await openDialog();
+    await snap("new-task-yolo-default-on.png");
+    expect(await yoloControl()).toEqual({ state: "on", checked: true, disabled: false });
+    const task = await createNamed(`e2e-yolo-on-${Date.now()}`);
+    expect(task.yolo).toBe(true);
+    // No restart involved: the flag is on the command line of spawn #1.
+    expect(await firstSpawnArgv(task.id)).toContain("--dangerously-skip-permissions");
+    await browser.waitUntil(() => rowBadge(task.id), {
+      timeout: 5_000, timeoutMsg: "no red YOLO badge on the new task's row",
+    });
+  });
+
+  it("lets the user untick the default for one task", async () => {
+    await setAppDefault(true);
+    await openDialog();
+    await clickYolo();
+    expect(await yoloControl()).toEqual({ state: "off", checked: false, disabled: false });
+    const task = await createNamed(`e2e-yolo-unticked-${Date.now()}`);
+    expect(task.yolo).toBe(false);
+    expect(await firstSpawnArgv(task.id)).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("lets the project's own Off beat the app-wide On", async () => {
+    await setAppDefault(true);
+    await setProjectDefault(false);
+    await openDialog();
+    expect(await yoloControl()).toEqual({ state: "off", checked: false, disabled: false });
+    await closeDialog();
+    // ...and the project's On beats the app-wide Off.
+    await setAppDefault(false);
+    await setProjectDefault(true);
+    await openDialog();
+    expect((await yoloControl())?.state).toBe("on");
+    await closeDialog();
+    await setProjectDefault(null);
+  });
+
+  it("reads auto-on and cannot be unticked while the sandbox cages the task", async () => {
+    await setAppDefault(false);
+    await openDialog();
+    await pickSandbox("ENFORCING (filesystem + network)");
+    await browser.waitUntil(async () => (await yoloControl())?.state === "auto", {
+      timeout: 5_000, timeoutMsg: "the YOLO control never switched to auto under Enforcing",
+    });
+    expect(await yoloControl()).toEqual({ state: "auto", checked: true, disabled: true });
+    // Monitoring blocks nothing, so it is not a cage: the choice is live again.
+    await pickSandbox("MONITORING");
+    await browser.waitUntil(async () => (await yoloControl())?.state === "off", {
+      timeout: 5_000, timeoutMsg: "the YOLO control stayed on auto under Monitoring",
+    });
+    await pickSandbox("OFF");
+    await closeDialog();
+  });
+
+  it("hides for a task whose default tab is not an agent", async () => {
+    await setAppDefault(true);
+    await openDialog();
+    expect(await yoloControl()).not.toBeNull();
+    await clickDialogButton("Terminal");
+    await browser.waitUntil(async () => (await yoloControl()) === null, {
+      timeout: 5_000, timeoutMsg: "the YOLO control is still up for a Terminal task",
+    });
+    await closeDialog();
+  });
+
+  it("seeds the Race dialog's YOLO from the same default", async () => {
+    const raceYolo = () =>
+      browser.execute(() => {
+        const box = document.querySelector('[data-testid="race-yolo"] input') as HTMLInputElement | null;
+        return box ? box.checked : null;
+      });
+    const openRace = async () => {
+      await browser.execute((pid) => window.__termic!.useUI.getState().openRace(pid), projectId);
+      await browser.waitUntil(async () => (await raceYolo()) !== null, {
+        timeout: 8_000, timeoutMsg: "race dialog never appeared",
+      });
+    };
+    const closeRace = () => browser.execute(() => window.__termic!.useUI.getState().closeRace());
+
+    await setAppDefault(true);
+    await openRace();
+    expect(await raceYolo()).toBe(true);
+    await closeRace();
+    await setAppDefault(false);
+    await openRace();
+    expect(await raceYolo()).toBe(false);
+    await closeRace();
   });
 });
 
@@ -1301,6 +1535,250 @@ describe("worktree task", () => {
   });
 });
 
+// Checking out an EXISTING branch (a colleague's, to review it) into its own
+// worktree, through the real New Task dialog. The branches live on the
+// fixture's origin and NOT locally, which is the case that used to go wrong:
+// typed into the ordinary Branch name field, a remote-only name missed
+// `rev-parse --verify` and came out as a fresh branch off main.
+describe("check out an existing branch", () => {
+  const origin = `${fixture}-origin.git`;
+  // Pushed, then fetched: a remote-tracking ref with no local branch.
+  const LISTED = "e2e-colleague/listed";
+  // Pushed AFTER the fixture's last fetch: this repo has never heard of it.
+  const UNFETCHED = "e2e-colleague/unfetched";
+  const UNKNOWN = "e2e-colleague/nobody-pushed-this";
+  const TYPED_NAME = "e2e-review-unfetched";
+  const TITLE = "Check out an existing branch";
+  let scratch: string | undefined;
+  const sha: Record<string, string> = {};
+
+  const git = (cwd: string, args: string) =>
+    execSync(`git -C "${cwd}" -c user.name=e2e -c user.email=e2e@termic.dev ${args}`, { stdio: "pipe" })
+      .toString()
+      .trim();
+
+  before(() => {
+    scratch = mkdtempSync(path.join(os.tmpdir(), "termic-e2e-colleague-"));
+    const colleague = path.join(scratch, "colleague");
+    execSync(`git clone -q "${origin}" "${colleague}"`);
+    for (const b of [LISTED, UNFETCHED]) {
+      git(colleague, `checkout -q -b ${b} origin/main`);
+      git(colleague, `commit -q --allow-empty -m "${b}"`);
+      sha[b] = git(colleague, "rev-parse HEAD");
+      git(colleague, `push -q origin ${b}`);
+      // Fetch after the first push only, so the second stays unfetched.
+      if (b === LISTED) git(fixture, "fetch -q origin");
+    }
+  });
+
+  // By NAME as well as by id: a case that throws between Create and reading
+  // the id back still leaves its task, and the branch it made, behind.
+  after(async () => {
+    await browser.execute(async (names) => {
+      const t = window.__termic!;
+      for (const task of t.useApp.getState().tasks) {
+        if (names.includes(task.name) && !task.archived) await t.ipc.taskArchive(task.id, true);
+      }
+      await t.useApp.getState().loadAll();
+    }, [LISTED, TYPED_NAME]);
+    const quiet = (cwd: string, args: string) => {
+      try {
+        git(cwd, args);
+      } catch {
+        /* already gone */
+      }
+    };
+    quiet(fixture, "worktree prune");
+    for (const b of [LISTED, UNFETCHED, UNKNOWN]) {
+      quiet(fixture, `branch -D ${b}`);
+      quiet(fixture, `update-ref -d refs/remotes/origin/${b}`);
+      quiet(origin, `branch -D ${b}`);
+    }
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  });
+
+  /** Open New Task for fixture-repo in worktree mode, then flip to the
+   *  existing-branch mode through its title-line switch. */
+  async function openCheckoutMode(): Promise<void> {
+    await waitForAppShell();
+    await requireTermicApi();
+    await browser.execute(() => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      window.__termic!.useUI.getState().openNewTask(proj.id);
+    });
+    await clickDialogButton("Worktree");
+    await clickWhenVisible('[data-testid="checkout-branch-toggle"]');
+    await waitForText(TITLE);
+  }
+
+  /** Click a button by exact text inside THIS dialog, found by its title. */
+  async function clickInCheckout(text: string): Promise<void> {
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (title, t) => {
+            const dlg = [...document.querySelectorAll('[role="dialog"]')].find(
+              (d) => d.getAttribute("data-state") !== "closed" && d.textContent?.includes(title),
+            );
+            const btn = [...(dlg?.querySelectorAll("button") ?? [])].find(
+              (b) => b.textContent?.trim() === t,
+            ) as HTMLButtonElement | undefined;
+            if (!btn || btn.disabled) return false;
+            btn.click();
+            return true;
+          },
+          TITLE,
+          text,
+        ),
+      { timeout: 8_000, timeoutMsg: `no enabled "${text}" in the checkout dialog` },
+    );
+  }
+
+  async function typeInto(selector: string, value: string): Promise<void> {
+    await waitVisible(selector);
+    await browser.execute(
+      (sel, v) => {
+        const input = document.querySelector(sel) as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+        setter.call(input, v);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+      selector,
+      value,
+    );
+  }
+
+  const liveTask = (name: string) =>
+    browser.execute(
+      (n) => window.__termic!.useApp.getState().tasks.find((t: any) => t.name === n && !t.archived) ?? null,
+      name,
+    ) as Promise<{ id: string; branch: string; path: string } | null>;
+
+  it("swaps the branch field for a picker, and New branch instead swaps it back", async () => {
+    await openCheckoutMode();
+    const shape = () =>
+      browser.execute(() => {
+        const dlg = document.querySelector('[data-testid="new-task-name"]')?.closest('[role="dialog"]');
+        const labels = [...(dlg?.querySelectorAll("label") ?? [])].map((l) => l.textContent?.trim());
+        return {
+          labels,
+          taskTypeToggle: [...(dlg?.querySelectorAll("button") ?? [])].some(
+            (b) => b.textContent?.trim() === "Main checkout",
+          ),
+        };
+      });
+
+    const inMode = await shape();
+    expect(inMode.labels).toContain("Branch");
+    expect(inMode.labels).toContain("Compare against");
+    expect(inMode.labels).not.toContain("Branch name");
+    // The answer is always a worktree, so the task-type toggle goes.
+    expect(inMode.taskTypeToggle).toBe(false);
+    await snap("checkout-branch-mode.png");
+
+    await clickWhenVisible('[data-testid="checkout-branch-exit"]');
+    await waitForText("New task in a worktree");
+    const back = await shape();
+    expect(back.labels).toContain("Branch name");
+    expect(back.labels).toContain("Branch from");
+    expect(back.labels).not.toContain("Compare against");
+    expect(back.taskTypeToggle).toBe(true);
+    await clickDialogButton("Cancel");
+    await waitGone('[data-testid="new-task-name"]', 5_000);
+  });
+
+  it("checks out a listed remote-only branch on a local branch that tracks it", async () => {
+    await openCheckoutMode();
+    const row = `[data-testid="checkout-branch-list"] [data-branch-ref="origin/${LISTED}"]`;
+    await clickWhenVisible(row);
+    // The pick fills the branch; Name stays blank and shows its default.
+    const picked = await browser.execute(() => ({
+      branch: (document.querySelector('[data-testid="checkout-branch-input"]') as HTMLInputElement).value,
+      namePlaceholder: (document.querySelector('[data-testid="new-task-name"]') as HTMLInputElement).placeholder,
+    }));
+    expect(picked).toEqual({ branch: `origin/${LISTED}`, namePlaceholder: LISTED });
+    await clickInCheckout("Terminal");
+    await clickInCheckout("Create");
+
+    await browser.waitUntil(async () => !!(await liveTask(LISTED)), {
+      timeout: 30_000,
+      timeoutMsg: "the checkout task never landed",
+    });
+    const task = (await liveTask(LISTED))!;
+    expect(task.branch).toBe(LISTED);
+    // On the COLLEAGUE's commit, not on main: the whole point.
+    expect(git(task.path, "rev-parse HEAD")).toBe(sha[LISTED]);
+    expect(git(task.path, "rev-parse --abbrev-ref HEAD")).toBe(LISTED);
+    expect(git(fixture, `rev-parse --abbrev-ref ${LISTED}@{upstream}`)).toBe(`origin/${LISTED}`);
+  });
+
+  it("restores that task on the colleague's branch after archive deleted it", async () => {
+    // Archive WITH delete-branch, the one setting that removes the local
+    // copy, then restore: the branch has to come back from the remote. Cut
+    // from the base it would be main under the colleague's branch name.
+    const before = (await liveTask(LISTED))!;
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskArchive(id, true); // deleteBranch
+      await window.__termic!.useApp.getState().loadAll();
+    }, before.id);
+    let localLeft = true;
+    try {
+      git(fixture, `rev-parse --verify -q refs/heads/${LISTED}`);
+    } catch {
+      localLeft = false;
+    }
+    expect(localLeft).toBe(false);
+
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskRestore(id);
+      await window.__termic!.useApp.getState().loadAll();
+    }, before.id);
+    const task = (await liveTask(LISTED))!;
+    expect(task.id).toBe(before.id);
+    expect(git(task.path, "rev-parse HEAD")).toBe(sha[LISTED]);
+    expect(git(fixture, `rev-parse --abbrev-ref ${LISTED}@{upstream}`)).toBe(`origin/${LISTED}`);
+  });
+
+  it("fetches a typed branch this repo has never fetched", async () => {
+    await openCheckoutMode();
+    await typeInto('[data-testid="checkout-branch-input"]', UNFETCHED);
+    // Said before Create, so a typo is not a surprise several seconds later.
+    await waitVisible('[data-testid="checkout-branch-unfetched"]');
+    await typeInto('[data-testid="new-task-name"]', TYPED_NAME);
+    await clickInCheckout("Terminal");
+    await clickInCheckout("Create");
+
+    await browser.waitUntil(async () => !!(await liveTask(TYPED_NAME)), {
+      timeout: 30_000,
+      timeoutMsg: "the typed checkout never landed",
+    });
+    const task = (await liveTask(TYPED_NAME))!;
+    expect(task.branch).toBe(UNFETCHED);
+    expect(git(task.path, "rev-parse HEAD")).toBe(sha[UNFETCHED]);
+  });
+
+  it("fails an unknown branch and leaves no branch behind", async () => {
+    await openCheckoutMode();
+    await typeInto('[data-testid="checkout-branch-input"]', UNKNOWN);
+    await clickInCheckout("Terminal");
+    await clickInCheckout("Create");
+
+    // The pending task turns into the error, in the main pane.
+    await waitForText(`no branch '${UNKNOWN}'`, 30_000);
+    let created = true;
+    try {
+      git(fixture, `rev-parse --verify -q refs/heads/${UNKNOWN}`);
+    } catch {
+      created = false;
+    }
+    expect(created).toBe(false);
+    await clickByText("Dismiss");
+    await waitForTextGone(`no branch '${UNKNOWN}'`);
+  });
+});
+
 // GH #242: while a task is mid-creation it's represented as a "pending" entry
 // (no real Task exists yet — see src/store/pendingTasks.ts), which the
 // sidebar and main pane render specially (PendingTaskRow / CreatingTaskPane).
@@ -2159,6 +2637,740 @@ describe("sidebar task drag", () => {
   });
 });
 
+// Task groups: an agent that creates tasks through the CLI gets them drawn
+// as one block in the sidebar, led by its own task. The whole chain runs for
+// real: the `termic` sidecar reads $TERMIC_TASK_ID, the server checks it and
+// hands it to the webview's create handler, which joins the group before the
+// row first renders. Then every way a user edits a group, through the real
+// menus and the real drag handlers. Each state is snapped for a human pass.
+describe("task groups", () => {
+  let fixtureProjectId: string;
+  let orch: string;
+  let child1: string;
+  let child2: string;
+  let grandchild: string;
+  let loose: string;
+  const created: string[] = [];
+
+  // The sidebar row and the drawn block. Rows are `data-sidebar-task-id`
+  // (MainArea owns `data-task-id`, see "sidebar task drag").
+  const row = (id: string) => `[data-sidebar-task-id="${id}"]`;
+  const block = (gid: string) => `[data-task-group-id="${gid}"]`;
+  /** Ids of the rows drawn INSIDE a group's block, in display order. */
+  const blockRows = (gid: string) =>
+    browser.execute(
+      (sel) => [...document.querySelectorAll<HTMLElement>(`${sel} [data-sidebar-task-id]`)]
+        .map(el => el.dataset.sidebarTaskId!),
+      block(gid),
+    ) as Promise<string[]>;
+  /** Each task's group as the task FILE says, via the cold-start loader. */
+  const diskGroups = () =>
+    browser.execute(async () => {
+      const all: any[] = await window.__termic!.ipc.tasksList();
+      return Object.fromEntries(all.map(t => [t.id, t.group ?? null]));
+    }) as unknown as Promise<Record<string, { id: string; name?: string; color?: string } | null>>;
+  /** The rail's painted colour against the palette token it should resolve
+   *  to, both read as computed rgb so a theme change cannot fake a match. */
+  const railMatches = (gid: string, key: string) =>
+    browser.execute((sel, k) => {
+      const rail = document.querySelector(`${sel} [data-task-group-rail]`) as HTMLElement | null;
+      if (!rail) return false;
+      const probe = document.createElement("span");
+      probe.style.backgroundColor = `var(--color-palette-${k})`;
+      document.body.appendChild(probe);
+      const want = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return getComputedStyle(rail).borderLeftColor === want;
+    }, block(gid), key) as Promise<boolean>;
+  const label = (gid: string) =>
+    browser.execute(
+      (g) => document.querySelector(`[data-testid="task-group-label-${g}"]`)?.textContent ?? null,
+      gid,
+    ) as Promise<string | null>;
+  // A WebDriver right-click does not reach Radix's onContextMenu in this
+  // WKWebView (files.e2e.ts measured it); the dispatched event goes through
+  // the real trigger.
+  const rightClick = (sel: string) =>
+    browser.execute((s) => {
+      const el = document.querySelector(s) as HTMLElement;
+      if (!el) throw new Error(`nothing at ${s}`);
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true, cancelable: true, button: 2, clientX: r.left + 20, clientY: r.top + 5,
+      }));
+    }, sel);
+  /** Click a menu entry by its visible label or aria-label, in whichever
+   *  menu is open (ContextMenuItem has no menuitem role for plain items). */
+  const clickInMenu = (text: string) =>
+    browser.waitUntil(() => browser.execute((t) => {
+      const menus = [...document.querySelectorAll<HTMLElement>('[role="menu"]')];
+      for (const m of menus) {
+        // aria-label for the swatches; otherwise the DEEPEST element whose
+        // text is exactly the label (an item is an icon plus a text node).
+        const hit = [...m.querySelectorAll<HTMLElement>("*")].reverse().find(
+          el => el.getAttribute("aria-label") === t || el.textContent?.trim() === t,
+        );
+        if (hit) { (hit.closest('[role="menuitem"], [role="menuitemcheckbox"], [data-radix-collection-item]') as HTMLElement ?? hit).click(); return true; }
+      }
+      return false;
+    }, text), { timeout: 8_000, timeoutMsg: `no open menu offered "${text}"` });
+  /** `termic new` exactly as an agent inside `parent` would run it. */
+  const cliNew = (name: string, parent: string | null, extra: string[] = []) => {
+    const env: Record<string, string> = { TERMIC_DATA_DIR: dataDir, TERMIC_TASK_ID: parent ?? "" };
+    const out = JSON.parse(runCli([
+      "--no-launch", "--json", "new", name,
+      "--agent", "fakeagent", "--project", "fixture-repo", "--main", ...extra,
+    ], env));
+    created.push(out.task.id);
+    return out.task.id as string;
+  };
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    orch = await openTask("grp-orchestrator", false);
+    loose = await openTask("grp-loose", false);
+    fixtureProjectId = await browser.execute(
+      (id) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === id)!.project_id as string,
+      orch,
+    );
+    await browser.execute(
+      (p) => window.__termic!.useApp.getState().setProjectCollapsed(p, false),
+      fixtureProjectId,
+    );
+    await dismissOverlays();
+  });
+
+  after(async () => {
+    for (const id of [...created, orch, loose].filter(Boolean)) await archiveTask(id);
+  });
+
+  it("a task the orchestrator's agent creates founds a group led by the orchestrator", async () => {
+    await waitVisible(row(orch));
+    await snap("task-groups-01-before.png");
+    child1 = cliNew("grp-worker-1", orch);
+
+    await waitVisible(block(orch));
+    await browser.waitUntil(async () => (await blockRows(orch)).join() === [orch, child1].join(), {
+      timeout: 8_000, timeoutMsg: "the new task and its orchestrator were not drawn as one block",
+    });
+    // The group has no name of its own: it shows the orchestrator's.
+    expect(await label(orch)).toBe("grp-orchestrator");
+    const disk = await diskGroups();
+    expect(disk[orch]?.id).toBe(orch);
+    expect(disk[child1]).toEqual(disk[orch]);
+    expect(disk[orch]?.name).toBeUndefined();
+    // A colour was picked at founding, and the rail paints it.
+    expect(disk[orch]?.color).toBeTruthy();
+    expect(await railMatches(orch, disk[orch]!.color!)).toBe(true);
+    // An unrelated task stays outside the block.
+    expect(await blockRows(orch)).not.toContain(loose);
+    await snap("task-groups-02-founded-by-cli.png");
+  });
+
+  it("more tasks join the same group, and a worker's own tasks join it too (flat)", async () => {
+    child2 = cliNew("grp-worker-2", orch);
+    // The worker orchestrating in turn: its task lands in the ROOT group.
+    grandchild = cliNew("grp-sub-worker", child1);
+    await browser.waitUntil(async () => (await blockRows(orch)).length === 4, {
+      timeout: 8_000, timeoutMsg: "the second worker and the sub-worker did not join the block",
+    });
+    expect(await blockRows(orch)).toEqual([orch, child1, child2, grandchild]);
+    const disk = await diskGroups();
+    expect(disk[grandchild]?.id).toBe(orch);
+    expect(disk[child2]?.color).toBe(disk[orch]?.color);
+    await snap("task-groups-03-four-members.png");
+  });
+
+  it("keeps the block, as a coloured rail alone, in the compact sidebar", async () => {
+    const color = (await diskGroups())[orch]!.color!;
+    // The real toggle, not a store write: it is what suppresses the 220ms
+    // column transition, and a snap taken mid-transition shows a rail
+    // stranded at the old width's left edge.
+    await browser.execute(() => window.__termic!.useApp.getState().toggleCompactSidebar());
+    try {
+      await waitVisible(block(orch));
+      await browser.waitUntil(() => browser.execute(
+        (sel) => (document.querySelector(sel)?.getBoundingClientRect().width ?? 999) < 100, block(orch),
+      ), { timeout: 8_000, timeoutMsg: "the sidebar never narrowed to the icon rail" });
+      // No caption on the icon rail, the rail itself carries the colour.
+      expect(await browser.execute(
+        (g) => !!document.querySelector(`[data-testid="task-group-header-${g}"]`), orch,
+      )).toBe(false);
+      const matches = await browser.execute((sel, k) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (!el) return false;
+        const probe = document.createElement("span");
+        probe.style.backgroundColor = `var(--color-palette-${k})`;
+        document.body.appendChild(probe);
+        const want = getComputedStyle(probe).backgroundColor;
+        probe.remove();
+        return getComputedStyle(el).borderLeftColor === want;
+      }, block(orch), color);
+      expect(matches).toBe(true);
+      // Compact rows are icon tiles keyed `data-rail-task-id`, not the full
+      // row's `data-sidebar-task-id`.
+      const tiles = await browser.execute(
+        (sel) => [...document.querySelectorAll<HTMLElement>(`${sel} [data-rail-task-id]`)].map(el => el.dataset.railTaskId!),
+        block(orch),
+      );
+      expect(tiles).toEqual([orch, child1, child2, grandchild]);
+      // The rail hugs the tiles: a rail stranded far left of them reads as
+      // a stray line, not as a bracket around these tasks.
+      const gap = await browser.execute((sel) => {
+        const b = document.querySelector(sel)!.getBoundingClientRect();
+        const t = document.querySelector(`${sel} [data-rail-task-id]`)!.getBoundingClientRect();
+        return t.left - b.left;
+      }, block(orch));
+      expect(gap).toBeGreaterThanOrEqual(0);
+      expect(gap).toBeLessThan(16);
+      await snap("task-groups-03b-compact.png");
+    } finally {
+      await browser.execute(() => {
+        const s = window.__termic!.useApp.getState();
+        if (s.compactSidebar) s.toggleCompactSidebar();
+      });
+    }
+  });
+
+  it("collapses to one of each mark its members carry, and navigating opens it", async () => {
+    const toggle = `[data-testid="task-group-toggle-${orch}"]`;
+    const badges = () => browser.execute(
+      (g) => document.querySelector(`[data-testid="task-group-badges-${g}"]`)?.getAttribute("data-kinds") ?? null,
+      orch,
+    ) as Promise<string | null>;
+    // Setup, not assertion: give two members a work state the way an agent's
+    // hooks would, on their REAL agent tabs. Wait for each agent to be ready
+    // first: these tasks are live (created by `new`), and an agent still
+    // booting reports idle over whatever was set.
+    await waitForAgentReady(child1);
+    await waitForAgentReady(child2);
+    await browser.execute((done, needs) => {
+      const t = window.__termic!;
+      const s = t.useApp.getState();
+      s.patchTab(done, s.tabs[done][0].id, { workState: "done" });
+      s.patchTab(needs, s.tabs[needs][0].id, { unread: { reason: "attention" } });
+      t.useApp.setState({ activeTaskId: null });
+    }, child1, child2);
+    try {
+      await $(toggle).click();
+      // Collapsed: no member rows, and the caption carries one of each mark
+      // present, attention first.
+      await browser.waitUntil(async () => (await blockRows(orch)).length === 0, {
+        timeout: 5_000, timeoutMsg: "collapsing did not hide the members",
+      });
+      await browser.waitUntil(async () => (await badges()) === "attention,done", {
+        timeout: 5_000,
+      }).catch(async () => {
+        const why = await browser.execute((id) => {
+          const t = window.__termic!;
+          return JSON.stringify({ tabs: t.useApp.getState().tabs[id], settled: t.usePrefs.getState().settledHighlight });
+        }, child1);
+        throw new Error(`collapsed caption showed ${await badges()} instead of attention,done; done member: ${why}`);
+      });
+      // Every mark sits on one centre line. Measured, since a bell riding the
+      // text baseline a pixel or two above the dot is exactly the kind of
+      // thing a screenshot shows and cannot quantify.
+      const centres = await browser.execute((g) => {
+        const box = document.querySelector(`[data-testid="task-group-badges-${g}"]`)!;
+        return [...box.children].filter((c) => !(c as HTMLElement).dataset.testid?.startsWith("task-group-count")).map((c) => {
+          const glyph = (c.querySelector("svg, span") ?? c) as Element;
+          const r = glyph.getBoundingClientRect();
+          return r.top + r.height / 2;
+        });
+      }, orch) as number[];
+      expect(centres.length).toBe(2);
+      expect(Math.abs(centres[0] - centres[1])).toBeLessThanOrEqual(1);
+      // ...and the member count stays, so a collapsed group still says how
+      // many tasks it holds rather than looking emptied.
+      expect(await browser.execute(
+        (g) => document.querySelector(`[data-testid="task-group-count-${g}"]`)?.textContent?.trim() ?? null, orch,
+      )).toBe("4");
+      await snap("task-groups-19-collapsed-marks.png");
+
+      // Navigating to a member (the path every "go to task" takes) opens it.
+      await browser.execute((id) => window.__termic!.useApp.getState().setActiveTask(id), child2);
+      await browser.waitUntil(async () => (await blockRows(orch)).length === 4, {
+        timeout: 5_000, timeoutMsg: "navigating to a member did not expand its group",
+      });
+      // Collapse again while on that member: its row stays in view.
+      await $(toggle).click();
+      await browser.waitUntil(async () => (await blockRows(orch)).join() === child2, {
+        timeout: 5_000, timeoutMsg: "a collapsed group hid the task you are on",
+      });
+      await snap("task-groups-20-collapsed-keeps-active.png");
+    } finally {
+      await browser.execute((ids) => {
+        const t = window.__termic!;
+        const s = t.useApp.getState();
+        for (const id of ids.slice(0, 2)) {
+          const tab = (s.tabs[id] ?? [])[0];
+          if (tab) s.patchTab(id, tab.id, { workState: "idle", unread: null });
+        }
+        t.useApp.setState({ activeTaskId: null });
+        s.setTaskGroupCollapsed(ids[2], false);
+      }, [child1, child2, orch]);
+    }
+  });
+
+  it("a click on the caption toggles it, and a double-click renames without toggling", async () => {
+    const header = `[data-testid="task-group-header-${orch}"]`;
+    const collapsed = () => browser.execute(
+      (g) => !!window.__termic!.useApp.getState().collapsedTaskGroups[g], orch,
+    ) as Promise<boolean>;
+    // What the browser really sends: a single click, then for a double-click
+    // click(detail 1), click(detail 2), dblclick. WebDriver's own double-click
+    // does not reach React here (files.e2e.ts), so the sequence is dispatched.
+    const fire = (types: [string, number][]) => browser.execute((sel, seq) => {
+      const el = document.querySelector(`${sel} [data-testid^="task-group-label-"]`) as HTMLElement;
+      const r = el.getBoundingClientRect();
+      for (const [type, detail] of seq) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, detail, clientX: r.left + 4, clientY: r.top + 4 }));
+      }
+    }, header, types);
+    await browser.execute(() => window.__termic!.useApp.setState({ activeTaskId: null }));
+    expect(await collapsed()).toBe(false);
+
+    await fire([["click", 1]]);
+    await browser.waitUntil(async () => (await blockRows(orch)).length === 0, {
+      timeout: 5_000, timeoutMsg: "a click on the caption did not collapse the group",
+    });
+    await fire([["click", 1]]);
+    await browser.waitUntil(async () => (await blockRows(orch)).length === 4, {
+      timeout: 5_000, timeoutMsg: "a second click on the caption did not expand it again",
+    });
+
+    await fire([["click", 1], ["click", 2], ["dblclick", 2]]);
+    const input = `[data-testid="task-group-rename-${orch}"]`;
+    await waitVisible(input);
+    expect(await collapsed()).toBe(false); // the rename left it as it was
+    await browser.keys("Escape");
+    await waitGone(input);
+    expect((await blockRows(orch)).length).toBe(4);
+  });
+
+  it("a filter shows its matches inside a collapsed group, and hides groups with none", async () => {
+    const input = `[data-testid="project-filter-input-${fixtureProjectId}"]`;
+    const typeFilter = async (v: string) => {
+      if (!(await browser.execute((sel) => !!document.querySelector(sel), input))) {
+        await $(`[data-testid="project-filter-toggle-${fixtureProjectId}"]`).click();
+        await waitVisible(input);
+      }
+      await browser.execute((sel, val) => {
+        const el = document.querySelector(sel) as HTMLInputElement;
+        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(el, val);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      }, input, v);
+    };
+    await browser.execute(() => window.__termic!.useApp.setState({ activeTaskId: null }));
+    await browser.execute((g) => window.__termic!.useApp.getState().setTaskGroupCollapsed(g, true), orch);
+    await browser.waitUntil(async () => (await blockRows(orch)).length === 0, { timeout: 5_000 });
+    try {
+      // A match inside the collapsed group is shown, the rest of it is not,
+      // and the caption stays so you can see which group it is in.
+      await typeFilter("grp-worker-2");
+      await browser.waitUntil(async () => (await blockRows(orch)).join() === child2, {
+        timeout: 5_000, timeoutMsg: "a filter match inside a collapsed group stayed hidden",
+      });
+      // The chevron still says collapsed while the filter shows the match,
+      // so it cannot be clicked into a state you do not see.
+      const expanded = () => browser.execute(
+        (g) => document.querySelector(`[data-testid="task-group-toggle-${g}"]`)?.getAttribute("aria-expanded") ?? null, orch,
+      );
+      expect(await expanded()).toBe("false");
+      await snap("task-groups-21-filter-in-collapsed.png");
+      // Nothing in the group matches: no caption for an empty group.
+      await typeFilter("grp-loose");
+      await waitGone(block(orch));
+      expect(await browser.execute((sel) => !!document.querySelector(sel), row(loose))).toBe(true);
+    } finally {
+      await browser.execute(() => window.__termic!.useUI.setState({ taskFilters: {} }));
+      await browser.execute((g) => window.__termic!.useApp.getState().setTaskGroupCollapsed(g, false), orch);
+    }
+    // Clearing the filter restores the whole group.
+    await browser.waitUntil(async () => (await blockRows(orch)).length === 4, { timeout: 5_000 });
+  });
+
+  it("--no-group, no $TERMIC_TASK_ID, or a stale id all create an ungrouped task", async () => {
+    const optedOut = cliNew("grp-opted-out", orch, ["--no-group"]);
+    const noEnv = cliNew("grp-no-env", null);
+    const r = await cliRpc({
+      cmd: "new", name: "grp-stale-parent", project: "fixture-repo", agent: "fakeagent",
+      mode: "main", parent_task: "not-a-task",
+    });
+    expect(r.ok).toBe(true);
+    created.push(r.data.task.id);
+    await waitVisible(row(r.data.task.id));
+    const disk = await diskGroups();
+    for (const id of [optedOut, noEnv, r.data.task.id]) expect(disk[id]).toBeNull();
+    expect(await blockRows(orch)).toHaveLength(4);
+    await snap("task-groups-04-ungrouped-siblings.png");
+  });
+
+  it("lines the caption up with the loose rows, and indents members one folder step", async () => {
+    // Measured, not eyeballed: a caption that sits a few px off its sibling
+    // rows reads as misaligned long before anyone can say by how much.
+    const loose = created[created.length - 1];
+    await waitVisible(row(loose));
+    const g = await browser.execute((orchId, c1, looseId) => {
+      const box = (el: Element | null) => el ? el.getBoundingClientRect() : null;
+      const centre = (el: Element | null) => { const r = box(el); return r ? r.left + r.width / 2 : NaN; };
+      const rowOf = (id: string) => document.querySelector(`[data-sidebar-task-id="${id}"]`)!;
+      const nameOf = (id: string) => [...rowOf(id).querySelectorAll("span")].find(s => s.textContent?.startsWith("grp-"))!;
+      const cap = document.querySelector(`[data-testid="task-group-header-${orchId}"]`)!;
+      const rail = document.querySelector(`[data-task-group-id="${orchId}"] [data-task-group-rail]`)!;
+      return {
+        looseChevron: centre(rowOf(looseId).querySelector("svg")),
+        capIcon: centre(cap.querySelector("svg")),
+        looseName: box(nameOf(looseId))!.left,
+        capLabel: box(document.querySelector(`[data-testid="task-group-label-${orchId}"]`))!.left,
+        rail: box(rail)!.left + parseFloat(getComputedStyle(rail).borderLeftWidth) / 2,
+        looseRow: box(rowOf(looseId))!.left,
+        memberRow: box(rowOf(c1))!.left,
+      };
+    }, orch, child1, loose);
+    expect(Math.abs(g.capIcon - g.looseChevron)).toBeLessThanOrEqual(1);
+    expect(Math.abs(g.capLabel - g.looseName)).toBeLessThanOrEqual(1);
+    expect(Math.abs(g.rail - g.capIcon)).toBeLessThanOrEqual(1);
+    expect(Math.round(g.memberRow - g.looseRow)).toBe(18);
+    // And the rail is left of the members' rows, never under them.
+    expect(g.rail).toBeLessThan(g.memberRow);
+  });
+
+  it("an unnamed group follows its lead's rename", async () => {
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskRename(id, "grp-lead-renamed");
+      await window.__termic!.useApp.getState().loadAll();
+    }, orch);
+    await browser.waitUntil(async () => (await label(orch)) === "grp-lead-renamed", {
+      timeout: 8_000, timeoutMsg: "the group label did not follow the lead task's new name",
+    });
+  });
+
+  it("renames the group from its header menu", async () => {
+    await rightClick(`[data-testid="task-group-header-${orch}"]`);
+    await clickInMenu("Rename group");
+    const input = `[data-testid="task-group-rename-${orch}"]`;
+    await waitVisible(input);
+    // Rename looks like the caption it replaces: same font and weight, and
+    // the text starts where the label's did (no padding pushes it right).
+    const look = await browser.execute((sel, capSel) => {
+      const i = document.querySelector(sel) as HTMLInputElement;
+      const cap = document.querySelector(capSel)!;
+      const cs = getComputedStyle(i), capCs = getComputedStyle(cap);
+      return {
+        size: [cs.fontSize, capCs.fontSize], weight: [cs.fontWeight, capCs.fontWeight],
+        padLeft: cs.paddingLeft, border: cs.borderLeftWidth,
+        capHeight: cap.getBoundingClientRect().height,
+      };
+    }, input, `[data-testid="task-group-header-${orch}"]`);
+    expect(look.size[0]).toBe(look.size[1]);
+    expect(look.weight[0]).toBe(look.weight[1]);
+    expect(look.padLeft).toBe("0px");
+    expect(look.border).toBe("0px");
+    await snap("task-groups-05-renaming.png");
+    await $(input).setValue("Auth refactor");
+    await browser.keys("Enter");
+    await browser.waitUntil(async () => (await label(orch)) === "Auth refactor", {
+      timeout: 8_000, timeoutMsg: "the header never showed the new group name",
+    });
+    const disk = await diskGroups();
+    for (const id of [orch, child1, child2, grandchild]) expect(disk[id]?.name).toBe("Auth refactor");
+    // Renaming the lead no longer moves a NAMED group.
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskRename(id, "grp-orchestrator");
+      await window.__termic!.useApp.getState().loadAll();
+    }, orch);
+    expect(await label(orch)).toBe("Auth refactor");
+    await snap("task-groups-06-renamed.png");
+  });
+
+  it("recolours the group from the swatch row", async () => {
+    const before = (await diskGroups())[orch]?.color;
+    const pick = before === "teal" ? "purple" : "teal";
+    await rightClick(`[data-testid="task-group-header-${orch}"]`);
+    await snap("task-groups-07-header-menu.png");
+    await clickInMenu(pick === "teal" ? "Teal" : "Purple");
+    await browser.waitUntil(() => railMatches(orch, pick), {
+      timeout: 8_000, timeoutMsg: `the rail never repainted ${pick}`,
+    });
+    const disk = await diskGroups();
+    for (const id of [orch, child1, child2, grandchild]) expect(disk[id]?.color).toBe(pick);
+    await dismissOverlays();
+    await snap("task-groups-08-recoloured.png");
+  });
+
+  it("the orchestrator's agent names its group with `termic group`", async () => {
+    // Run exactly as the agent inside the orchestrator would: no task
+    // argument, $TERMIC_TASK_ID says whose group.
+    const env = { TERMIC_DATA_DIR: dataDir, TERMIC_TASK_ID: orch };
+    // The CLI tells the agent where it is and that this exists, before it
+    // ever runs the verb: `help --json` overview and the top of `--help`.
+    const surface = JSON.parse(runCli(["help", "--json"], env));
+    expect(surface.overview).toContain("INSIDE a Termic task");
+    expect(surface.overview).toContain("group --name");
+    expect(runCli(["--help"], env)).toContain("group --name");
+    const shown = JSON.parse(runCli(["--no-launch", "--json", "group"], env));
+    expect(shown.group.id).toBe(orch);
+    expect(shown.group.name).toBe("Auth refactor");
+    expect(shown.group.members.length).toBe(4);
+
+    runCli(["--no-launch", "group", "--name", "Named by the agent"], env);
+    await browser.waitUntil(async () => (await label(orch)) === "Named by the agent", {
+      timeout: 8_000, timeoutMsg: "the caption never showed the name the agent set",
+    });
+    // "" goes back to following the lead's name.
+    const followed = JSON.parse(runCli(["--no-launch", "--json", "group", "--name", ""], env));
+    expect(followed.group.named).toBe(false);
+    expect(followed.group.name).toBe("grp-orchestrator");
+    await browser.waitUntil(async () => (await label(orch)) === "grp-orchestrator", { timeout: 8_000 });
+    // A typo is refused naming the choices, and changes nothing.
+    expect(() => runCli(["--no-launch", "group", "--color", "mauve"], env)).toThrow(/teal/);
+    // Put the name back for the cases below.
+    runCli(["--no-launch", "group", "--name", "Auth refactor"], env);
+    await browser.waitUntil(async () => (await label(orch)) === "Auth refactor", { timeout: 8_000 });
+
+    // `new` tells the agent which group the task joined, in plain text too.
+    const out = runCli([
+      "--no-launch", "new", "grp-told", "--agent", "fakeagent", "--project", "fixture-repo", "--main",
+    ], env);
+    expect(out).toMatch(/group:\s+Auth refactor/);
+    const told = await browser.execute(
+      () => window.__termic!.useApp.getState().tasks.find((t: any) => t.name === "grp-told")?.id as string,
+    );
+    await archiveTask(told);
+  });
+
+  it("dragging an outside task into the block joins it", async () => {
+    await waitVisible(row(loose));
+    await pointerDrag(row(loose), row(child2), { land: "center" });
+    await browser.waitUntil(async () => (await blockRows(orch)).includes(loose), {
+      timeout: 8_000, timeoutMsg: "the dropped task was not drawn inside the block",
+    });
+    await browser.waitUntil(async () => (await diskGroups())[loose]?.id === orch, {
+      timeout: 8_000, timeoutMsg: "the join never reached the task file",
+    });
+    const disk = await diskGroups();
+    expect(disk[loose]?.name).toBe("Auth refactor");
+    await snap("task-groups-09-dragged-in.png");
+  });
+
+  it("dragging a member out of the block leaves the group", async () => {
+    // The stale-parent task sits below the block; land on it.
+    const outside = created[created.length - 1];
+    await waitVisible(row(outside));
+    await pointerDrag(row(loose), row(outside), { land: "bottom" });
+    await browser.waitUntil(async () => !(await blockRows(orch)).includes(loose), {
+      timeout: 8_000, timeoutMsg: "the dragged-out task was still drawn inside the block",
+    });
+    await browser.waitUntil(async () => (await diskGroups())[loose] === null, {
+      timeout: 8_000, timeoutMsg: "the leave never reached the task file",
+    });
+    // The rest of the group is untouched.
+    expect(await blockRows(orch)).toEqual([orch, child1, child2, grandchild]);
+    await snap("task-groups-10-dragged-out.png");
+  });
+
+  /** Open a task row's menu, then its Move to group submenu. */
+  const openMoveToGroup = async (id: string) => {
+    await rightClick(row(id));
+    await clickWhenVisible(`[data-testid="task-move-to-group-${id}"]`);
+    await waitVisible(`[data-testid="task-new-group-${id}"]`);
+  };
+
+  it("Remove from group takes one task out, and a lone lead keeps its group", async () => {
+    for (const id of [grandchild, child2, child1]) {
+      await openMoveToGroup(id);
+      if (id === child1) await snap("task-groups-11-move-to-group-menu.png");
+      await clickWhenVisible(`[data-testid="task-leave-group-${id}"]`);
+      await browser.waitUntil(async () => !(await blockRows(orch)).includes(id), {
+        timeout: 8_000, timeoutMsg: `${id} was still drawn in the block after Remove from group`,
+      });
+    }
+    // Like a project folder of one: the orchestrator alone is still a group.
+    expect(await blockRows(orch)).toEqual([orch]);
+    const disk = await diskGroups();
+    expect(disk[orch]?.id).toBe(orch);
+    for (const id of [child1, child2, grandchild]) expect(disk[id]).toBeNull();
+    await snap("task-groups-12-lone-lead.png");
+  });
+
+  let manualGid: string;
+  it("New group makes a group of one and asks for its name", async () => {
+    await openMoveToGroup(child1);
+    await clickWhenVisible(`[data-testid="task-new-group-${child1}"]`);
+    // The caption opens its rename straight away, like a new project folder.
+    manualGid = child1;
+    const input = `[data-testid="task-group-rename-${manualGid}"]`;
+    await waitVisible(input);
+    // The whole name is selected, so typing replaces it.
+    await browser.waitUntil(() => browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLInputElement | null;
+      return !!el && el.value.length > 0 && el.selectionStart === 0 && el.selectionEnd === el.value.length;
+    }, input), { timeout: 5_000, timeoutMsg: "a new group's name was not selected for renaming" });
+    await $(input).setValue("Hand-made");
+    await browser.keys("Enter");
+    await browser.waitUntil(async () => (await label(manualGid)) === "Hand-made", {
+      timeout: 8_000, timeoutMsg: "the new group never showed its typed name",
+    });
+    expect(await blockRows(manualGid)).toEqual([child1]);
+    const disk = await diskGroups();
+    expect(disk[child1]).toMatchObject({ id: child1, name: "Hand-made" });
+    // It took a colour no other live group wears.
+    expect(disk[child1]?.color).toBeTruthy();
+    expect(disk[child1]?.color).not.toBe(disk[orch]?.color);
+    await snap("task-groups-13-new-group.png");
+  });
+
+  it("Move to group lists both groups and moves a task into the chosen one", async () => {
+    await openMoveToGroup(child2);
+    for (const g of [orch, manualGid]) await waitVisible(`[data-testid="task-move-to-group-${child2}-${g}"]`);
+    await snap("task-groups-14-move-menu-two-groups.png");
+    await clickWhenVisible(`[data-testid="task-move-to-group-${child2}-${manualGid}"]`);
+    await browser.waitUntil(async () => (await blockRows(manualGid)).join() === [child1, child2].join(), {
+      timeout: 8_000, timeoutMsg: "the task was not drawn inside the group it was moved to",
+    });
+    const disk = await diskGroups();
+    expect(disk[child2]).toEqual(disk[child1]);
+    // Moving it again, into the orchestrator's group, leaves the hand-made
+    // one with its first member.
+    await openMoveToGroup(child2);
+    await clickWhenVisible(`[data-testid="task-move-to-group-${child2}-${orch}"]`);
+    await browser.waitUntil(async () => (await blockRows(orch)).includes(child2), {
+      timeout: 8_000, timeoutMsg: "the second move never landed",
+    });
+    expect(await blockRows(manualGid)).toEqual([child1]);
+    await dismissOverlays();
+    await snap("task-groups-15-moved.png");
+  });
+
+  /** The project's top-level rows as the sidebar DRAWS them: a group block
+   *  collapses to `[member,member]`, a loose row is its id. */
+  const drawnTopLevel = () =>
+    browser.execute((p) => {
+      const out: string[] = [];
+      for (const el of document.querySelectorAll<HTMLElement>("[data-task-group-id], [data-sidebar-task-id]")) {
+        if (el.dataset.taskGroupId !== undefined) {
+          if (el.dataset.taskGroupProjectId !== p) continue;
+          const ids = [...el.querySelectorAll<HTMLElement>("[data-sidebar-task-id]")].map(r => r.dataset.sidebarTaskId);
+          out.push(`[${ids.join(",")}]`);
+        } else if (el.dataset.sidebarTaskProjectId === p && !el.closest("[data-task-group-id]")) {
+          out.push(el.dataset.sidebarTaskId!);
+        }
+      }
+      return out;
+    }, fixtureProjectId) as Promise<string[]>;
+  const diskOrder = () =>
+    browser.execute(async (p) => {
+      const all: any[] = await window.__termic!.ipc.tasksList();
+      return all.filter(t => t.project_id === p && !t.archived).map(t => t.id as string);
+    }, fixtureProjectId) as unknown as Promise<string[]>;
+
+  it("dragging a group's caption moves the whole block", async () => {
+    const hand = `[${child1}]`, auth = `[${orch},${child2}]`;
+    let top = await drawnTopLevel();
+    expect(top.indexOf(auth)).toBeLessThan(top.indexOf(hand));
+
+    // Hand-made above Auth refactor: land on the top half of its caption.
+    await pointerDrag(`[data-testid="task-group-header-${manualGid}"]`, `[data-testid="task-group-header-${orch}"]`, { land: "top" });
+    await browser.waitUntil(async () => {
+      const o = await drawnTopLevel();
+      return o.indexOf(hand) >= 0 && o.indexOf(hand) < o.indexOf(auth);
+    }, { timeout: 8_000, timeoutMsg: "the dragged block never moved above the other group" });
+    // Both blocks are still whole: the drag moved members as one run.
+    top = await drawnTopLevel();
+    expect(top).toContain(auth);
+    expect(top).toContain(hand);
+    await snap("task-groups-16-block-dragged.png");
+
+    // Persisted in the order the user sees, members adjacent.
+    await browser.waitUntil(async () => {
+      const d = await diskOrder();
+      return d.indexOf(child1) < d.indexOf(orch) && d.indexOf(child2) === d.indexOf(orch) + 1;
+    }, { timeout: 8_000, timeoutMsg: "the block order never reached the task files" });
+
+    // And past a loose row: drop Auth refactor below the last ungrouped task.
+    const lastLoose = top.filter(x => !x.startsWith("[")).pop()!;
+    await pointerDrag(`[data-testid="task-group-header-${orch}"]`, `[data-sidebar-task-id="${lastLoose}"]`, { land: "bottom" });
+    await browser.waitUntil(async () => {
+      const o = await drawnTopLevel();
+      return o.indexOf(auth) > o.indexOf(lastLoose);
+    }, { timeout: 8_000, timeoutMsg: "the block never moved below the loose row" });
+    // Grouping itself is untouched by moving the block.
+    const disk = await diskGroups();
+    expect(disk[orch]?.id).toBe(orch);
+    expect(disk[child2]?.id).toBe(orch);
+    expect(disk[child1]?.id).toBe(manualGid);
+    await snap("task-groups-17-block-below-loose.png");
+  });
+
+  it("Ungroup tasks clears every member at once", async () => {
+    await rightClick(`[data-testid="task-group-header-${orch}"]`);
+    await clickInMenu("Ungroup tasks");
+    await waitGone(block(orch));
+    await rightClick(`[data-testid="task-group-header-${manualGid}"]`);
+    await clickInMenu("Ungroup tasks");
+    await waitGone(block(manualGid));
+    const disk = await diskGroups();
+    for (const id of [orch, child1, child2]) expect(disk[id]).toBeNull();
+    await dismissOverlays();
+    await snap("task-groups-18-ungrouped.png");
+  });
+});
+
+// Focusing a task looks up its PR (store/pr.ts initPrRefreshOnFocus), which
+// is what discovers a PR its agent opened from the terminal. The fixture's
+// remote is a local bare repo, so the lookup answers "not a forge" rather
+// than finding a PR; the case asserts the LOOKUP ran on focus, the thing that
+// was missing. The other triggers (agent spawn, the Git tab's card) are kept
+// out of the way first, or they would pass this without the fix.
+describe("PR lookup on task focus", () => {
+  let wt: string | undefined;
+  let main: string | undefined;
+  after(async () => {
+    for (const id of [wt, main].filter(Boolean) as string[]) await archiveTask(id);
+  });
+
+  const fetchedAt = (id: string) =>
+    browser.execute((t) => window.__termic!.usePr.getState().byTask[t]?.fetchedAt ?? 0, id) as Promise<number>;
+
+  it("runs a lookup when a worktree task becomes active, and never for a main checkout", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    const r = await cliRpc({ cmd: "new", name: `pr-focus-${Date.now()}`, project: "fixture-repo", agent: "fakeagent", mode: "worktree" });
+    expect(r.ok).toBe(true);
+    wt = r.data.task.id;
+    main = await openTask("pr-focus-main", false);
+    // Let the spawn-time lookup land, then forget it: what follows must come
+    // from the focus alone.
+    await waitForAgentReady(wt!);
+    await browser.waitUntil(async () => !(await browser.execute(
+      (t) => !!window.__termic!.usePr.getState().byTask[t]?.loading, wt!)), { timeout: 15_000 });
+    await browser.execute((ids) => {
+      const t = window.__termic!;
+      const by = { ...t.usePr.getState().byTask };
+      for (const id of ids) delete by[id];
+      t.usePr.setState({ byTask: by });
+      t.useApp.setState({ activeTaskId: null });
+    }, [wt!, main]);
+
+    await browser.execute((id) => window.__termic!.useApp.getState().setActiveTask(id), wt!);
+    await browser.waitUntil(async () => (await fetchedAt(wt!)) > 0, {
+      timeout: 15_000, timeoutMsg: "focusing a worktree task did not look up its PR",
+    });
+    // The Git tab was never on screen, so this was the focus trigger.
+    expect(await browser.execute(
+      () => document.querySelector('[data-testid="right-tab"][data-tab="Git"][aria-selected="true"]') !== null,
+    )).toBe(false);
+
+    await browser.execute((id) => window.__termic!.useApp.getState().setActiveTask(id), main);
+    // Give a wrongly-fired lookup the time the one above took, then check.
+    await browser.waitUntil(async () => (await browser.execute(
+      (id) => window.__termic!.useApp.getState().activeTaskId === id, main)), { timeout: 5_000 });
+    expect(await fetchedAt(main)).toBe(0);
+  });
+});
+
 // Extra named ports (GH #196): tasks created after the project declares
 // port names freeze consecutive name→port pairs from their own block, and
 // two live tasks' blocks never overlap. Asserted on the task records:
@@ -2333,6 +3545,12 @@ describe("copy agent briefing", () => {
     await clearToasts();
     await clickMenuItem("Copy agent CLI briefing");
     await waitForCopyToast("task menu");
+    // What the user actually pastes: one block, tagged with THIS task, the
+    // command addressing it by id and signed with its identity.
+    const pasted = execSync("pbpaste", { encoding: "utf8" });
+    expect(pasted.startsWith(`<termic-task id="${taskId}" `)).toBe(true);
+    expect(pasted.trimEnd().endsWith("</termic-task>")).toBe(true);
+    expect(pasted).toContain(` send ${taskId} -p "[message from agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID]`);
     await dismissOverlays();
     await clearToasts();
   });

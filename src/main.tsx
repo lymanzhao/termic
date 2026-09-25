@@ -171,7 +171,15 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       // way the next page does: reap everything NOT stamped with this.
       lspPageId: pageSession.LSP_PAGE_ID,
     };
-  })();
+  })().catch((e: unknown) => {
+    // Without this a single failed dynamic import above left the hook
+    // silently unset: the app rendered normally and every e2e spec then
+    // failed with "window.__termic missing", pointing at the build. Record
+    // WHY, where requireTermicApi can print it, and in the debug log.
+    const msg = String((e as Error)?.stack ?? e);
+    (window as unknown as Record<string, unknown>).__termicBootError = msg;
+    logLine(`[termic] e2e hook failed to attach: ${msg}`).catch(() => {});
+  });
 }
 
 // Track Cmd/Ctrl held → `termic-mod-held` on <html>, so terminal links show

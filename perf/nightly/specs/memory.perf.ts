@@ -141,19 +141,59 @@ describe("memory", () => {
     // is flat: "neither side moved" is the reading that makes a flat total
     // trustworthy, and two rows that disagree in sign (one growing while the
     // other is reclaimed) is a thing a total actively hides.
+    let appSlope: number | null = null;
     for (const [name, samples, what] of [
       ["memory.growth.slopeAppMiBPerCycle", perCycleApp, "Tauri/Rust process"],
       ["memory.growth.slopeHelpersMiBPerCycle", perCycleHelpers, "WebKit helpers, mostly WebContent"],
     ] as const) {
       const m = samples.slice(WARMUP);
       const st = trend(m);
+      const value = m.length >= 2 ? Math.round(st.slope * 100) / 100 : null;
+      if (name === "memory.growth.slopeAppMiBPerCycle") appSlope = value;
       record({
         metric: name,
-        value: m.length >= 2 ? Math.round(st.slope * 100) / 100 : null,
+        value,
         unit: "MiB/cycle",
         note: `${what}; r2 ${st.r2.toFixed(2)} over ${st.n} cycles. Splits the total slope by process, so a growing side names itself`,
         samples: m,
       });
+    }
+
+    // The ONE thing in this suite that fails the run rather than reporting.
+    //
+    // Everything else here is a duration or an RSS figure on a 3-core
+    // virtualised runner, where the spread between two runs of identical code
+    // is wider than most regressions worth catching: boot-to-first-paint has
+    // ranged 2876ms to 6934ms across 37 nights with no trend, and a threshold
+    // on that is either useless or a false-alarm generator. That is why this
+    // job reports (docs/perf-ci.md).
+    //
+    // This row is different, and the difference is measured rather than
+    // assumed. The Rust side does not grow under view churn: across 36
+    // nights the fitted slope stayed between -0.01 and +0.01 MiB/cycle, never
+    // once above 0.15. The webview's own growth is a separate, stable row
+    // (1.1 to 2.2 MiB/cycle) and is deliberately NOT asserted, because it is
+    // real, understood as standing behaviour, and not what this guards.
+    //
+    // So the guard is "the Tauri process does not leak per view", with a 15x
+    // margin over the widest reading a month produced. Over the 25 fitted
+    // cycles, 0.15 is under 4 MiB: a genuine Rust-side leak clears it easily
+    // and noise never has.
+    //
+    // Skipped, not failed, when the fit had nothing to work with: a partial
+    // report from a run that lost a spec is still worth uploading, which is
+    // why the workflow's upload step is `if: always()`.
+    // Thrown rather than `expect`ed: wdio's expect takes no message argument,
+    // and the number on its own ("0.4 is not <= 0.15") does not tell the next
+    // person which process grew or how far outside normal that is.
+    const APP_SLOPE_CEILING = 0.15;
+    if (appSlope !== null && Math.abs(appSlope) > APP_SLOPE_CEILING) {
+      throw new Error(
+        `the Tauri process grew ${appSlope} MiB per view-churn cycle, over the `
+          + `${APP_SLOPE_CEILING} ceiling. Every night for a month it stayed within `
+          + `+/-0.01, so this is a Rust-side leak, not runner noise. The webview's `
+          + `own growth is the separate slopeHelpers row and is not what failed here.`,
+      );
     }
 
     // Kept, demoted: still the honest answer to "did it end heavier than it

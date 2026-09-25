@@ -82,7 +82,7 @@ export function TaskWorkBadge(
       <span
         data-testid="work-badge"
         data-work-state="working"
-        className="shrink-0 text-[var(--color-fg-faint)]"
+        className="shrink-0 flex items-center justify-center text-[var(--color-fg-faint)]"
         title={t("taskWorkBadge.working")}
         aria-label={t("taskWorkBadge.workingAria")}
       >
@@ -95,7 +95,10 @@ export function TaskWorkBadge(
       <span
         data-testid="work-badge"
         data-work-state="attention"
-        className="shrink-0 text-[var(--color-warn)]"
+        // Flex like every other mark: an inline span leaves the icon on the
+        // text baseline, off the centre line the dot and rings sit on, which
+        // shows the moment two marks share a row (a collapsed task group).
+        className="shrink-0 flex items-center justify-center text-[var(--color-warn)]"
         title={t("taskWorkBadge.attention")}
       >
         <Bell className="h-3 w-3" strokeWidth={2.5} />

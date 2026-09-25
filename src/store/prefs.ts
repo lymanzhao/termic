@@ -72,6 +72,7 @@ const LS_ATTENTION_INDICATOR = "attentionIndicator";
 const LS_DEFAULT_SANDBOX = "globalDefaultSandbox";
 const LS_DEFAULT_SANDBOX_KIND = "globalDefaultSandboxKind";
 const LS_SANDBOX_BYPASS  = "sandboxBypassPermissions";
+const LS_DEFAULT_YOLO    = "defaultYolo";
 const LS_ALLOW_SCOPE     = "sandboxAllowScope";
 const LS_TERMINAL_LETTERSPACING = "terminalLetterSpacing";
 const LS_TERMINAL_SCROLLBACK   = "terminalScrollback";
@@ -593,6 +594,14 @@ interface PrefsState {
    *  the agent's own permission prompts are just friction. Users who
    *  still want the agent to ask inside a sandbox can turn this off. */
   sandboxBypassPermissions: boolean;
+  /** New tasks start with YOLO on, unless their project says otherwise
+   *  (`Project.default_yolo`). OFF by default. For a machine that is
+   *  itself the sandbox (a dedicated Mac mini, a VM), where the agent's
+   *  prompts are friction and a second cage is not wanted. It only SEEDS
+   *  `Task.yolo` in the New Task dialog, the Race dialog and the sidebar
+   *  quick-create; the CLI and MCP still need an explicit `--yolo`.
+   *  Machine-level, so an unscoped key like the sandbox default above. */
+  defaultYolo: boolean;
   /** Where the "Allow" button in the sandbox activity/blocked popover
    *  writes. `null` until the user picks once (the radio is mandatory
    *  on first use); their choice then becomes the app-wide default.
@@ -891,6 +900,7 @@ interface PrefsState {
   setFindInFilesMatchCase: (v: boolean) => void;
   setGlobalDefaultSandboxKind: (v: SandboxSelection) => void;
   setSandboxBypassPermissions: (v: boolean) => void;
+  setDefaultYolo: (v: boolean) => void;
   setAllowScope: (s: "agent" | "project" | "repo") => void;
   setTaskExpandMode: (m: "chevron" | "click" | "always") => void;
   setHideInactiveProjects: (v: boolean) => void;
@@ -1099,6 +1109,7 @@ const initialDefaultSandboxKind = readInitialDefaultSandboxKind();
 // ON by default — sandboxed agents bypass their own permission prompts
 // because the seatbelt is the real boundary. Users can opt out.
 const initialSandboxBypass = lsGetBool(LS_SANDBOX_BYPASS, true);
+const initialDefaultYolo = lsGetBool(LS_DEFAULT_YOLO, false);
 const initialAllowScope: "agent" | "project" | "repo" | null = (() => {
   const raw = lsGet(LS_ALLOW_SCOPE, "");
   return raw === "agent" || raw === "project" || raw === "repo" ? raw : null;
@@ -1158,6 +1169,7 @@ export const usePrefs = create<PrefsState>(set => ({
   findInFilesMatchCase: initialFindInFilesMatchCase,
   globalDefaultSandboxKind: initialDefaultSandboxKind,
   sandboxBypassPermissions: initialSandboxBypass,
+  defaultYolo: initialDefaultYolo,
   allowScope: initialAllowScope,
   editorFontId: initialEditorFont,
   editorThemeIdDark: initialEditorThemeDark,
@@ -1486,6 +1498,10 @@ export const usePrefs = create<PrefsState>(set => ({
   setSandboxBypassPermissions: (v) => {
     try { localStorage.setItem(LS_SANDBOX_BYPASS, v ? "1" : "0"); } catch {}
     set({ sandboxBypassPermissions: v });
+  },
+  setDefaultYolo: (v) => {
+    try { localStorage.setItem(LS_DEFAULT_YOLO, v ? "1" : "0"); } catch {}
+    set({ defaultYolo: v });
   },
   setAllowScope: (s) => {
     try { localStorage.setItem(LS_ALLOW_SCOPE, s); } catch {}

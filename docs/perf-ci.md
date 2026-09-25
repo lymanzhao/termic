@@ -17,7 +17,7 @@ What exists now, and where the argument for each lives below:
 |---|---|---|
 | 0 — counts, PR-gating | yes | `src/store/selectorFanout.test.ts` |
 | 1 — e2e invariants, PR-gating | no | still proposal |
-| 2 — nightly, ungated | yes | `perf/`, `.github/workflows/perf.yml` |
+| 2 — nightly, one gated row | yes | `perf/`, `.github/workflows/perf.yml` |
 | 3 — local only | yes | `perf/local/`, section 2 of `make perf` |
 
 Idle CPU was deliberately left out of the nightly, per the Tier 3
@@ -387,6 +387,42 @@ them are worth copying deliberately rather than by accident:
 
 The near-term value is a timestamped series, so "feels slower lately"
 becomes a chart with a bisect range. A gate can come later, from data.
+
+### The one nightly metric that gates (2026-09-22)
+
+That data now exists: 38 nightly artifacts, and it splits the rows into two
+groups rather than one.
+
+The timings confirm the doc's own argument, emphatically. `bootToFirstPaintMs`
+ranges 2876ms to 6934ms across the series with no trend in it, a 2.4x spread
+between two nights running the same code. Any threshold you could set there
+either sits above 6934 and catches nothing, or sits below it and fires on a
+quiet runner. They stay ungated, and a six-point sample of that series is
+enough to convince you of a 3s-to-5s "regression" that is not there, which is
+worth knowing before reading one.
+
+`memory.growth.slopeAppMiBPerCycle` behaves nothing like them. Across 36
+nights with a value, the fitted slope of the Tauri process's RSS under view
+churn stayed between **-0.01 and +0.01 MiB/cycle**. Not a tight distribution
+around a machine-dependent number: it is zero, every night, because "the Rust
+side does not retain anything per view" is a property of the code and not of
+the hardware it ran on. That is the count-and-invariant class this doc says to
+gate, arriving in the nightly rather than the PR job only because measuring it
+needs a real app to churn.
+
+So `memory.perf.ts` now throws when it exceeds **0.15 MiB/cycle**, a 15x
+margin on the widest reading in a month, and the nightly is report-only except
+for that one row. Replaying the predicate over all 36 historical values fails
+none of them. Over the 25 fitted cycles, the ceiling is under 4 MiB total,
+which a genuine Rust-side leak clears without trying.
+
+Two deliberate exclusions. `slopeHelpersMiBPerCycle` is NOT gated even though
+it is the larger number (1.1 to 2.2 MiB/cycle, r2 >= 0.86 every night): it is
+consistent, it is the webview's behaviour rather than ours, and gating a
+number we have decided to live with only teaches people to raise the ceiling.
+And a null slope (too few samples, a run that lost a spec) skips the check
+instead of failing it, because a partial report is still worth having, which
+is also why the upload step is `if: always()`.
 
 ### Tier 3: local only, real hardware
 

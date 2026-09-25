@@ -202,19 +202,6 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       name_args: [],
     },
   },
-  "axcoding-rlm": {
-    // Same crate, same auth file, same playbook dir; the harness CLI runs
-    // one RLM task per stdin line.
-    command: "axcoding-rlm", args: [],
-    capabilities: {
-      yolo_args: [],
-      runtime_yolo_command: "",
-      resume_args: [],
-      session_id_args: [],
-      resume_id_args: [],
-      name_args: [],
-    },
-  },
   opencode: {
     command: "opencode", args: [],
     capabilities: {
@@ -502,7 +489,6 @@ export const BUILTIN_TITLE_SIGNALS: Record<string, Required<SignalPatterns>> = {
   // axcoding never emits OSC 0 at all (by construction - the binary sets no
   // titles and writes plain text), so there is nothing to capture.
   axcoding: { attention: [], busy: [], idle: [], pending: [] },
-  "axcoding-rlm": { attention: [], busy: [], idle: [], pending: [] },
 };
 
 /** How many rows up from the bottom of the viewport `pending` patterns are
@@ -1143,7 +1129,9 @@ export function spawnResumeShape(opts: {
  *       - Appended on every primary-tab spawn (worktree or repo-root,
  *         mint or resume) so the task name is always visible.
  *       - Skipped for secondary "+" tabs (`isPrimary=false`), no-task
- *         spawns (`task` absent), and whenever `resumeOverride` is set
+ *         spawns (`task` absent), the agent's session picker (it would name
+ *         whichever session is picked, a sibling's included), and whenever
+ *         `resumeOverride` is set
  *         (renaming on every relaunch would reassign the session's
  *         display name out from under the override's `--resume` target).
  *
@@ -1258,8 +1246,12 @@ export function spawnArgsForCli(
     // by the composed.map below. Skips minting / --continue entirely.
     resumeBlock = tokenizeArgs(override);
   } else if (opts.picker?.length) {
-    // The agent's picker replaces the resume block. name_args still follow
-    // (below), so the session picked there keeps the task's name.
+    // The agent's picker replaces the resume block, WITHOUT name_args
+    // (below). The picker lists every session in the cwd, a main checkout's
+    // sibling tasks included, and claude applies `--name` to whichever one is
+    // picked: a wrong pick renamed the sibling's conversation to this task,
+    // which then read as this task's in every later picker. A right pick
+    // gets the name back on the next relaunch, which resumes it by id.
     resumeBlock = opts.picker;
   } else if (hasIdResume && opts.sessionUuid) {
     if (opts.resumeKnown) {
@@ -1291,7 +1283,7 @@ export function spawnArgsForCli(
     //
     // For an agent that only names a NEW session (NAME_ONLY_ON_NEW_SESSION),
     // only the spawn that creates one: the id mint, or no resume at all.
-    ...(opts.isPrimary && opts.task && !override
+    ...(opts.isPrimary && opts.task && !override && !opts.picker?.length
         && (!nameOnlyOnNew || isFirstIdSpawn || resumeBlock.length === 0)
       ? (caps.name_args ?? []) : []),
     ...(opts.yolo ? (caps.yolo_args ?? []) : []),

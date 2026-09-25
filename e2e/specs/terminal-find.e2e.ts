@@ -141,6 +141,14 @@ describe("find in terminal", () => {
   });
 
   it("Enter and Shift+Enter move the current match, the rest stay lit", async () => {
+    // Wait for PTY output to settle before asserting keyboard navigation.
+    // lastOutputAt includes a trailing update for output bursts, and the
+    // search addon may refresh its matches after parsed output.
+    await browser.waitUntil(async () => browser.execute((id, tabId) => {
+      const tab = (window.__termic!.useApp.getState().tabs[id] ?? [])
+        .find((t: { id: string; lastOutputAt?: number | null }) => t.id === tabId);
+      return !!tab?.lastOutputAt && Date.now() - tab.lastOutputAt > 750;
+    }, taskId, MAIN), { timeout: 10_000, timeoutMsg: "terminal output did not settle before find navigation" });
     const start = await currentIndex(mainScope());
     const next = (start % 3) + 1;
     await findKey(mainScope(), { key: "Enter" });

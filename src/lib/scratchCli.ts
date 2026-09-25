@@ -6,7 +6,7 @@
 // open pad goes into that buffer, so it shows the moment it lands and Cmd+Z
 // takes it back; a closed pad is plain scratch IPC.
 
-import { useApp } from "@/store/app";
+import { isUserWatchingIn, useApp } from "@/store/app";
 import * as ipc from "@/lib/ipc";
 import { livePad, padDiskSettled, trackPadDiskWrite } from "@/lib/scratchLive";
 import { scratchTab } from "@/lib/scratchTabs";
@@ -66,6 +66,21 @@ export async function resolvePad(taskId: string, selector: string): Promise<PadI
   throw new Error(`no pad "${selector}" in this task (see \`termic scratchpad list\`)`);
 }
 
+/** Mark a pad changed-but-unseen after a write that did not come from the
+ *  user: unless its tab is on screen in a focused window, which is the same
+ *  "is the user looking" rule the agent badges use. A pad with no open tab
+ *  has nowhere to show it. Bails when already marked (a store write per
+ *  append would re-run every mounted selector for nothing). */
+function markPadUnseen(taskId: string, scratchId: string) {
+  const s = useApp.getState();
+  const tab = (s.tabs[taskId] ?? []).find(
+    (t): t is ScratchTab => t.type === "scratch" && t.scratchId === scratchId,
+  );
+  if (!tab || tab.unseen) return;
+  if (isUserWatchingIn(s, taskId, tab.id)) return;
+  s.patchTab(taskId, tab.id, { unseen: true });
+}
+
 async function createPad(taskId: string, title: string | null, content: string): Promise<PadInfo> {
   const id = crypto.randomUUID();
   const fixed = title?.trim() || "";
@@ -84,6 +99,7 @@ async function createPad(taskId: string, title: string | null, content: string):
       // Never steal focus from the human, or from the agent's own terminal.
       { focus: false },
     );
+    markPadUnseen(taskId, id);
   }
   return { id, title: shown, open: tabsLoaded };
 }
@@ -132,7 +148,9 @@ export async function padHandler(raw: unknown): Promise<{ pads: PadInfo[]; conte
         throw new Error("pad write requires a pad and content");
       }
       const info = await resolvePad(p.taskId, p.pad);
-      return { pads: [await writePad(p.taskId, info, p.content, !!p.append)] };
+      const written = await writePad(p.taskId, info, p.content, !!p.append);
+      markPadUnseen(p.taskId, info.id);
+      return { pads: [written] };
     }
     case "read": {
       if (typeof p.pad !== "string") throw new Error("pad read requires a pad");

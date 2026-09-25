@@ -233,6 +233,53 @@ icons: ## Regenerate every icon size + format from src-tauri/icons/icon.svg.
 	@./scripts/gen-icon.sh
 .PHONY: icons
 
+# ─── relaunch: keep the profile windows that were open ────────────────
+#
+# `make install` / `make beta` quit the running app and launch the new bundle.
+# With MORE THAN ONE profile window open (GH #280) the wrong set of windows
+# comes back: usually the root window stays hidden and a second profile comes
+# up alone.
+#
+# An AppleScript `quit` reaches each window's CloseRequested handler
+# (`build_profile_window`, src-tauri/src/lib.rs), and while another profile
+# window is still up that handler reads the close as DELIBERATE: it clears
+# `open_at_quit` and prevents the close. Whichever window is handled last sees
+# only itself left, so it keeps its flag, and the registry that survives says
+# "one window was open" naming an arbitrary one of them. Launch restore then
+# does exactly what it was told.
+#
+# So: read the flags while the app is still up, quit it, and write them back
+# with nothing alive to touch profiles.json. install-app.sh then finds a dead
+# app (its own quit is a no-op) and launches into the registry we restored.
+#
+# The quit has to happen HERE rather than in install-app.sh, because the
+# repair only holds if it lands between the quit and the launch, and the
+# script does both. The script's own socket wait still covers the gap after.
+#
+# A dormant install has no profiles.json and skips the whole thing; so does a
+# single-profile one, where nothing was ever cleared.
+REGISTRY := $(HOME)/Library/Application Support/termic/profiles.json
+
+# $(call quit_keeping_profiles,<app name>,<bundle id>)
+define quit_keeping_profiles
+@REG="$(REGISTRY)"; PAT="/$(1).app/Contents/MacOS/"; \
+	if [ -f "$$REG" ]; then \
+	  OPEN="$$(node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write((r.profiles||[]).filter(p=>p.open_at_quit).map(p=>p.slug).join(" "))' "$$REG" 2>/dev/null || true)"; \
+	  echo "→ Quitting $(1) (profile windows open: $${OPEN:-none})"; \
+	  osascript -e 'tell application id "$(2)" to quit' 2>/dev/null || true; \
+	  for _ in $$(seq 1 40); do pgrep -f "$$PAT" >/dev/null || break; sleep 0.25; done; \
+	  if pgrep -f "$$PAT" >/dev/null; then \
+	    echo "  · quit didn't take (it never does with two windows up), killing it"; \
+	    pkill -f "$$PAT" 2>/dev/null || true; \
+	    for _ in $$(seq 1 20); do pgrep -f "$$PAT" >/dev/null || break; sleep 0.25; done; \
+	  fi; \
+	  if [ -n "$$OPEN" ] && ! pgrep -f "$$PAT" >/dev/null; then \
+	    node -e 'const fs=require("fs"),f=process.argv[1],want=new Set(process.argv.slice(2));const r=JSON.parse(fs.readFileSync(f,"utf8"));let n=0;for(const p of r.profiles||[]){const v=want.has(p.slug);if(p.open_at_quit!==v){p.open_at_quit=v;n++;}}if(n)fs.writeFileSync(f,JSON.stringify(r,null,2)+"\n");process.stdout.write(String(n));' -- "$$REG" $$OPEN >/dev/null; \
+	    echo "  · will relaunch with: $$OPEN"; \
+	  fi; \
+	fi
+endef
+
 # ─── build / install / run ────────────────────────────────────────────
 
 build: ## Build a release .app + .dmg bundle. Output in src-tauri/target/release/bundle/.
@@ -240,6 +287,7 @@ build: ## Build a release .app + .dmg bundle. Output in src-tauri/target/release
 .PHONY: build
 
 install: build ## Build a release .app, copy it to /Applications (replacing any prior copy), and launch.
+	$(call quit_keeping_profiles,Termic,com.simion.termic)
 	@./scripts/install-app.sh
 .PHONY: install
 
@@ -282,6 +330,7 @@ beta: ## Build the CURRENT BRANCH as `Termic Beta.app` (parallel install, shared
 	echo "→ Building Termic Beta from $$BRANCH@$$SHA$$DIRTY"; \
 	VITE_BETA=1 VITE_BETA_INFO="$$BRANCH@$$SHA$$DIRTY" \
 	    npm run tauri build -- --config src-tauri/tauri.beta.conf.json --bundles app
+	$(call quit_keeping_profiles,Termic Beta,com.simion.termic.beta)
 	@./scripts/install-app.sh "Termic Beta" com.simion.termic.beta
 .PHONY: beta
 

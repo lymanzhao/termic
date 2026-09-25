@@ -2,7 +2,9 @@
 // Termic task to another agent, so the two can hand each other work.
 //
 // It is a FRAGMENT, not a document: the user pastes it INSIDE a larger prompt
-// they are writing for agent B, to point B at task A. So it carries only what
+// they are writing for agent B, to point B at task A. It is wrapped in a
+// <termic-task> tag carrying A's id, name, project, agent and path, so the
+// paste stays one clearly attributed block inside whatever surrounds it. So it carries only what
 // B cannot derive - A's id, its directory, and the command shape - and leaves
 // the protocol to the CLI's own help. `$TERMIC_CLI_HELP` is injected into
 // every task PTY (lib.rs) and `termic send --help` carries the long version,
@@ -73,14 +75,28 @@ export function buildAgentBriefing(opts: {
   // a cage. docs/sandbox.md ("Settled") has the argument, including why the
   // narrow versions of the idea fail too.
   const caged = isSandboxEnforced(effectiveSandboxMode(task))
-    ? `\n\nIt is sandboxed (enforcing), so it cannot run the CLI to reply: ask it to write a file under dir and read that yourself.`
+    ? `\nIt is sandboxed (enforcing), so it cannot run the CLI to reply: ask it to write a file under its path and read that yourself.`
     : "";
+  // The receiving task's identity, as its reply signs it. Literal: the
+  // reader knows exactly which task this block is about.
+  const them = `agent:${agent} task:${task.name} id:${task.id}`;
+  // The sender's, filled in by the SENDER's shell (hence the double quotes).
+  const you = "agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID";
 
-  return `You can talk to another coding agent working alongside you: the Termic task "${task.name}" (project ${project}, ${agent}), id ${task.id}, working in ${task.path}. Prompt it, and it prompts you back when it is done:
+  // Wrapped in a tag carrying the task's identity, so a paste reads as one
+  // self-contained block about ONE task, however much prompt surrounds it,
+  // and two pasted briefings can never blur together.
+  return `<termic-task id="${attr(task.id)}" name="${attr(task.name)}" project="${attr(project)}" agent="${attr(agent)}" path="${attr(task.path)}">
+Another coding agent working alongside you in Termic. Prompt it, and it prompts you back when done:
+  ${cli} send ${task.id} -p "[message from ${you}] <your prompt here: what you want it to do>. When done, reply: ${cli} send $TERMIC_TASK_ID -p '[message from ${them}] done: <what you did> -- ${them}' -- ${you}"
+Keep the outer double quotes and the $TERMIC_ variables as written (your shell fills in your own task name and address), and replace <you> with your agent name.${caged}
+</termic-task>`;
+}
 
-  ${cli} send ${task.id} -p "[Agent message from <you>, task $TERMIC_TASK_ID] <your prompt here: what you want it to do>. When done: ${cli} send $TERMIC_TASK_ID -p '[Agent message from ${agent}, task ${task.id}] done: <what you did> -- ${agent}' -- <you>, task $TERMIC_TASK_ID"
-
-Keep the outer double quotes and leave $TERMIC_TASK_ID as written: your shell fills in your own address, which is how it knows where to reply. Replace <you> with your agent name: the header and signature tell the other agent the prompt came from you, not from the user.${caged}`;
+/** Escape a value for a double-quoted XML attribute. Task names are free
+ *  text, and an unescaped quote would end the attribute early. */
+function attr(v: string): string {
+  return v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
 /** Copy the briefing for `task` to the clipboard, resolving the CLI command

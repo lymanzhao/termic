@@ -69,13 +69,14 @@ const META = {
 };
 
 /** An authenticated JSON-RPC call; returns the parsed frame. */
-async function rpc(method: string, params?: Record<string, unknown>): Promise<any> {
+async function rpc(method: string, params?: Record<string, unknown>, extraHeaders: Record<string, string> = {}): Promise<any> {
   const merged: Record<string, unknown> = { ...(params ?? {}) };
   if (!("_meta" in merged)) merged._meta = META;
   const headers: Record<string, string> = {
     authorization: `Bearer ${token()}`,
     "mcp-method": method,
     "mcp-protocol-version": REVISION,
+    ...extraHeaders,
   };
   // Mcp-Name mirrors params.name, and tools/call is the only method
   // here that has one.
@@ -138,6 +139,10 @@ describe("MCP endpoint: files, discovery, and the Phase A boundary", () => {
     expect(frame.result.resultType).toBe("complete");
     expect(frame.result.serverInfo).toBeUndefined();
     expect(frame.result._meta["io.modelcontextprotocol/serverInfo"].name).toBe("termic");
+    // DiscoverResult.instructions: the one place this server can tell a
+    // model that it may itself be running INSIDE a Termic task.
+    expect(frame.result.instructions).toContain("TERMIC_TASK_ID");
+    expect(frame.result.instructions).toContain("task_group");
   });
 
   it("refuses a handshake client with a version error naming the revision", async () => {
@@ -304,7 +309,8 @@ describe("MCP endpoint: files, discovery, and the Phase A boundary", () => {
     const names = a.result.tools.map((t: any) => t.name);
     expect(names).toEqual([
       "task_list", "task_status", "task_new", "task_send", "task_wait",
-      "task_result", "task_log", "task_diff", "task_open", "task_rename",
+      "task_result", "task_log", "task_diff", "task_open", "task_rename", "task_group",
+      "scratchpad_new", "scratchpad_write", "scratchpad_read", "scratchpad_list",
       "task_apply", "task_archive", "task_tab", "task_tab_close", "task_agents",
       "prompts", "project_list", "project_add", "project_remove",
     ]);
@@ -350,6 +356,92 @@ describe("MCP tools/call: a real task round-trip through the live webview", () =
       taskId,
     );
     expect(inStore).toBe(true);
+  });
+
+  it("task_new from inside a task joins that task's group, with no argument", async () => {
+    // The agent passes NOTHING: the headers helper Termic installs sends the
+    // agent's own $TERMIC_TASK_ID as X-Termic-Task, the way the CLI reads it
+    // from its env (task.e2e.ts). Same behaviour, both surfaces.
+    const frame = await rpc(
+      "tools/call",
+      { name: "task_new", arguments: { name: "mcp-grouped-child", project: "fixture-repo", agent: "fakeagent" } },
+      { "x-termic-task": taskId! },
+    );
+    const r = frame.result;
+    expect(r.isError).toBe(false);
+    const childId = r.structuredContent.task.id;
+    try {
+      await browser.waitUntil(
+        () => browser.execute(
+          (sel) => !!document.querySelector(sel),
+          `[data-task-group-id="${taskId}"] [data-sidebar-task-id="${childId}"]`,
+        ),
+        { timeout: 8_000, timeoutMsg: "the MCP-created task was not drawn inside its caller's group" },
+      );
+      const groups = await browser.execute(async (a, b) => {
+        const all: any[] = await window.__termic!.ipc.tasksList();
+        return [a, b].map(id => all.find(t => t.id === id)?.group?.id ?? null);
+      }, taskId!, childId) as unknown as (string | null)[];
+      expect(groups).toEqual([taskId, taskId]);
+      // task_group names it, as the CLI's `group` does.
+      // task_group with no `task` targets the caller's own, as `termic group` does.
+      const named = (await rpc(
+        "tools/call",
+        { name: "task_group", arguments: { name: "MCP batch", color: "pink" } },
+        { "x-termic-task": taskId! },
+      )).result;
+      expect(named.isError).toBe(false);
+      expect(named.structuredContent.group).toMatchObject({ id: taskId, name: "MCP batch", named: true, color: "pink" });
+      await browser.waitUntil(
+        () => browser.execute(
+          (g) => document.querySelector(`[data-testid="task-group-label-${g}"]`)?.textContent === "MCP batch",
+          taskId!,
+        ),
+        { timeout: 8_000, timeoutMsg: "the caption never showed the name set over MCP" },
+      );
+      const bad = await call("task_group", { task: "mcp-task", color: "mauve" });
+      expect(bad.isError).toBe(true);
+      // noGroup beats the caller header, as --no-group beats $TERMIC_TASK_ID.
+      const out = (await rpc(
+        "tools/call",
+        { name: "task_new", arguments: { name: "mcp-ungrouped", project: "fixture-repo", agent: "fakeagent", noGroup: true } },
+        { "x-termic-task": taskId! },
+      )).result;
+      expect(out.isError).toBe(false);
+      const outId = out.structuredContent.task.id;
+      try {
+        const g = await browser.execute(async (id) =>
+          ((await window.__termic!.ipc.tasksList()) as any[]).find(t => t.id === id)?.group ?? null, outId);
+        expect(g).toBeNull();
+      } finally {
+        await archiveTask(outId);
+      }
+    } finally {
+      await archiveTask(childId);
+    }
+  });
+
+  it("scratchpads round-trip over MCP, defaulting to the caller's own task", async () => {
+    // No `task` anywhere: the X-Termic-Task header says whose, as `termic
+    // scratchpad` reads $TERMIC_TASK_ID. The pad is a note for the user,
+    // never a file in the worktree.
+    const self = { "x-termic-task": taskId! };
+    const tool = async (name: string, args: Record<string, unknown>) =>
+      (await rpc("tools/call", { name, arguments: args }, self)).result;
+    const made = await tool("scratchpad_new", { title: "mcp findings", content: "first line" });
+    expect(made.isError).toBe(false);
+    const padId = made.structuredContent.pads[0].id;
+    expect(made.structuredContent.task_id).toBe(taskId);
+    expect((await tool("scratchpad_write", { pad: padId, content: "\nsecond line", append: true })).isError).toBe(false);
+    const read = await tool("scratchpad_read", { pad: "mcp findings" });
+    expect(read.structuredContent.content).toBe("first line\nsecond line");
+    const listed = await tool("scratchpad_list", {});
+    expect(listed.structuredContent.pads.map((p: any) => p.id)).toContain(padId);
+    // Nothing landed in git.
+    const wt = await browser.execute(
+      (id) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === id)?.path, taskId,
+    ) as string;
+    expect(execSync(`git -C "${wt}" status --porcelain`, { encoding: "utf8" })).not.toContain("mcp findings");
   });
 
   it("task_send delivers and task_log reads the echo back", async () => {
