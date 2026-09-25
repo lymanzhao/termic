@@ -9,6 +9,7 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::style::{Modifier, Style};
 use ratatui::{TerminalOptions, Viewport};
+use std::future::Future;
 
 // ── LineEditor: a pure state machine, no I/O, fully unit-tested ─────────
 
@@ -420,6 +421,131 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         ratatui::restore();
+    }
+}
+
+// ── TuiSession: the reusable front-end loop ─────────────────────────────
+// prompt → run_task, with the event thread, the spinner tick and the
+// Ctrl-C cancel wiring in ONE place. Both binaries drive their own work
+// future through it and only decide how events render.
+
+/// How a busy phase ended. Failed and Cancelled are deliberately distinct:
+/// a cancel rewinds the session state, a failure does not (the transcript
+/// up to the failure is real history).
+pub enum BusyOutcome<R> {
+    Done(R),
+    Failed(anyhow::Error),
+    Cancelled,
+}
+
+/// Owns the Tui, the blocking crossterm reader thread, and the event
+/// channel they feed.
+pub struct TuiSession {
+    pub tui: Tui,
+    ev_rx: tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
+}
+
+impl TuiSession {
+    pub fn new() -> Result<Self> {
+        let tui = Tui::new()?;
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || loop {
+            match Tui::read_event() {
+                Ok(ev) => {
+                    let _ = ev_tx.send(ev);
+                }
+                Err(_) => return,
+            }
+        });
+        let mut sess = Self { tui, ev_rx };
+        sess.tui.draw();
+        Ok(sess)
+    }
+
+    /// Channel a task future pushes its events through.
+    pub fn event_channel<E>() -> (
+        tokio::sync::mpsc::UnboundedSender<E>,
+        tokio::sync::mpsc::UnboundedReceiver<E>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
+    /// Prompt phase. Returns the submitted line, or None when the user
+    /// quit (Ctrl-D, or Ctrl-C on an empty line).
+    pub async fn prompt(&mut self) -> Option<String> {
+        self.tui.set_busy(false);
+        loop {
+            tokio::select! {
+                ev = self.ev_rx.recv() => match ev {
+                    Some(TuiEvent::Key(k)) => {
+                        if let Some(line) = self.tui.prompt_key(k) {
+                            if line.is_empty() {
+                                return None;
+                            }
+                            return Some(line);
+                        }
+                    }
+                    Some(TuiEvent::Resize) => self.tui.draw(),
+                    Some(_) => {}
+                    None => return None,
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => self.tui.tick(),
+            }
+        }
+    }
+
+    /// Busy phase: drive `fut` to completion, relaying the task's events
+    /// to `apply` (which touches the Tui), ticking the spinner. Only
+    /// Ctrl-C acts on the input channel; it DROPS the future mid-flight
+    /// and returns None — the caller owns any rollback.
+    pub async fn run_busy<E, F, R>(
+        &mut self,
+        fut: F,
+        work_ev: &mut tokio::sync::mpsc::UnboundedReceiver<E>,
+        mut apply: impl FnMut(&mut Tui, E),
+    ) -> anyhow::Result<BusyOutcome<R>>
+    where
+        F: Future<Output = anyhow::Result<R>>,
+        E: Send + 'static,
+    {
+        self.tui.set_busy(true);
+        tokio::pin!(fut);
+        let outcome = loop {
+            tokio::select! {
+                r = &mut fut => {
+                    // Drain whatever the finished task still queued so the
+                    // final event paints before the status flips.
+                    while let Ok(e) = work_ev.try_recv() {
+                        apply(&mut self.tui, e);
+                    }
+                    break Some(r);
+                }
+                ev = work_ev.recv() => match ev {
+                    Some(e) => apply(&mut self.tui, e),
+                    None => {}
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => self.tui.tick(),
+                ev = self.ev_rx.recv() => {
+                    if let Some(TuiEvent::Key(k)) = ev {
+                        if k.kind != crossterm::event::KeyEventKind::Release
+                            && k.modifiers.contains(KeyModifiers::CONTROL)
+                            && k.code == KeyCode::Char('c')
+                        {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        self.tui.set_busy(false);
+        Ok(match outcome {
+            Some(Ok(r)) => BusyOutcome::Done(r),
+            Some(Err(e)) => {
+                self.tui.commit(&format!("error: {e}"));
+                BusyOutcome::Failed(e)
+            }
+            None => BusyOutcome::Cancelled,
+        })
     }
 }
 

@@ -16,12 +16,16 @@ use rig_core::providers::{anthropic, openai};
 use axcoding::harness::{Harness, HarnessCfg};
 use axcoding::llm_fake::ScriptedLlm;
 use axcoding::llm_rig::RigLlm;
+use axcoding::tui::{Tui, TuiSession};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut fake = false;
+    let mut no_tui = std::env::var("AXCODING_NO_TUI")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut provider_check: Option<String> = None;
     let mut data_dir = axcoding::default_data_dir();
     let mut task: Option<String> = None;
@@ -31,6 +35,7 @@ async fn main() -> Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fake" => fake = true,
+            "--no-tui" => no_tui = true,
             "--provider" => provider_check = Some(args.next().expect("--provider needs a value")),
             "--model" => model = Some(args.next().expect("--model needs a value")),
             "--data" => {
@@ -94,7 +99,8 @@ async fn main() -> Result<()> {
             let llm = RigLlm::new(b.build()?.completion_model(
                 model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
             ));
-            dispatch(Arc::new(llm), task, context_file, data_dir).await
+            let use_tui = interactive_tty(no_tui);
+            dispatch(Arc::new(llm), task, context_file, data_dir, use_tui).await
         }
         axcoding::auth::Provider::OpenAi => {
             let mut b = openai::Client::builder().api_key(auth.key.clone());
@@ -103,9 +109,16 @@ async fn main() -> Result<()> {
             }
             let llm = RigLlm::new(b.build()?
                 .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6)));
-            dispatch(Arc::new(llm), task, context_file, data_dir).await
+            let use_tui = interactive_tty(no_tui);
+            dispatch(Arc::new(llm), task, context_file, data_dir, use_tui).await
         }
     }
+}
+
+fn interactive_tty(no_tui: bool) -> bool {
+    !no_tui
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
 }
 
 async fn dispatch<L: axcoding::Llm>(
@@ -113,17 +126,21 @@ async fn dispatch<L: axcoding::Llm>(
     task: Option<String>,
     context_file: Option<String>,
     data_dir: PathBuf,
+    use_tui: bool,
 ) -> Result<()> {
     // The context, resolved ONCE for the session: an explicit file, or -
     // by default, and this is the termic case - the task's own directory
     // (cwd), which for a worktree task is exactly the long context the
-    // RLM was built to work over.
-    let context = match &context_file {
+    // RLM was built to work over. The note is returned for the caller to
+    // display (stderr in plain mode, a committed line under the TUI -
+    // stderr writes while an inline viewport is active would corrupt its
+    // rows).
+    let (context, note) = match &context_file {
         Some(p) => {
             let c = std::fs::read_to_string(p)
                 .with_context(|| format!("read context file {p}"))?;
-            eprintln!("context: {} chars from {}", c.chars().count(), p);
-            c
+            let note = format!("context: {} chars from {}", c.chars().count(), p);
+            (c, note)
         }
         None => {
             let (c, s) = axcoding::ctxbuild::build_from_dir(
@@ -131,40 +148,116 @@ async fn dispatch<L: axcoding::Llm>(
                 200_000,
                 2_000_000,
             );
-            eprintln!(
+            let note = format!(
                 "context: {} files, {} chars from cwd (skipped: {} oversize, {} binary)",
                 s.files, s.chars, s.skipped_oversize, s.skipped_binary
             );
-            c
+            (c, note)
         }
     };
 
     match task {
-        Some(t) => run_real(llm, &t, &context, data_dir).await,
+        Some(t) => {
+            eprintln!("{note}");
+            run_real(llm, &t, &context, data_dir).await
+        }
+        None if use_tui => interactive_tui(llm, &context, &note, data_dir).await,
         None => {
-            // One RLM run per stdin line — the PTY-host interaction model.
-            eprintln!("axcoding-rlm: one task per line; Ctrl-D or --exit to quit.");
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match std::io::stdin().read_line(&mut line) {
-                    Ok(0) => return Ok(()), // EOF
-                    Ok(_) => {}
-                    Err(e) => return Err(e.into()),
+            eprintln!("{note}");
+            interactive_plain(llm, &context, data_dir).await
+        }
+    }
+}
+
+async fn interactive_tui<L: axcoding::Llm>(
+    llm: Arc<L>,
+    context: &str,
+    note: &str,
+    data_dir: PathBuf,
+) -> Result<()> {
+    // A terminal that cannot host the inline viewport degrades to plain.
+    let Ok(mut sess) = TuiSession::new() else {
+        eprintln!("(terminal does not support the inline TUI; falling back to plain mode)");
+        return interactive_plain(llm, context, data_dir).await;
+    };
+    sess.tui.commit(note);
+
+    loop {
+        let Some(line) = sess.prompt().await else {
+            return Ok(()); // Ctrl-D / Ctrl-C on empty
+        };
+        if line == "--exit" {
+            return Ok(());
+        }
+
+        let (tx, mut rx) = TuiSession::event_channel::<axcoding::harness::HarnessEvent>();
+
+        let outcome = {
+            let llm = Arc::clone(&llm);
+            let ctx = context.to_string();
+            let dd = data_dir.clone();
+            let line = line.clone();
+            let fut = async move {
+                let harness = Harness::new(llm, HarnessCfg { data_dir: dd, ..HarnessCfg::default() });
+                let mut sink = |ev: axcoding::harness::HarnessEvent| {
+                    let _ = tx.send(ev);
+                };
+                harness
+                    .run_with_events(&line, &ctx, &mut sink)
+                    .await
+            };
+            tokio::pin!(fut);
+            let apply = |tui: &mut Tui, ev: axcoding::harness::HarnessEvent| match ev {
+                axcoding::harness::HarnessEvent::UserTask(t) => tui.commit(&format!("> {t}")),
+                axcoding::harness::HarnessEvent::Turn { text, .. } => tui.commit(&text),
+                axcoding::harness::HarnessEvent::Eval { code, .. } => {
+                    tui.commit(&format!("$ {code}"))
                 }
-                let task = line.trim();
-                if task.is_empty() {
-                    continue;
+                axcoding::harness::HarnessEvent::EvalOut { out } => {
+                    tui.commit(&format!("  {out}"))
                 }
-                if task == "--exit" {
-                    return Ok(());
-                }
-                if let Err(e) =
-                    run_real(Arc::clone(&llm), task, &context, data_dir.clone()).await
-                {
-                    eprintln!("error: {e}");
-                }
-            }
+                axcoding::harness::HarnessEvent::Answer(a) => tui.commit(&a),
+            };
+            sess.run_busy(fut, &mut rx, apply).await?
+        };
+        match outcome {
+            axcoding::tui::BusyOutcome::Done(trace) => sess.tui.commit(&format!(
+                "({} turns · {} evals · {} sub-calls · {} of {} chars touched)",
+                trace.turns,
+                trace.usage.evals,
+                trace.usage.sub_calls,
+                trace.usage.chars_touched,
+                trace.ctx_chars
+            )),
+            axcoding::tui::BusyOutcome::Failed(_) => {}
+            axcoding::tui::BusyOutcome::Cancelled => sess.tui.commit("(cancelled)"),
+        }
+    }
+}
+
+async fn interactive_plain<L: axcoding::Llm>(
+    llm: Arc<L>,
+    context: &str,
+    data_dir: PathBuf,
+) -> Result<()> {
+    eprintln!("axcoding-rlm: one task per line; Ctrl-D or --exit to quit.");
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => return Ok(()), // EOF
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let task = line.trim();
+        if task.is_empty() {
+            continue;
+        }
+        if task == "--exit" {
+            return Ok(());
+        }
+        if let Err(e) = run_real(Arc::clone(&llm), task, context, data_dir.clone()).await {
+            eprintln!("error: {e}");
         }
     }
 }

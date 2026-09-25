@@ -17,7 +17,6 @@
 //! because an agent that can loop forever spends real money.
 
 use anyhow::{bail, Context as _, Result};
-use crossterm::event::{KeyCode, KeyModifiers};
 use rig_core::client::CompletionClient;
 use rig_core::providers::{anthropic, openai};
 use std::sync::Arc;
@@ -25,7 +24,7 @@ use std::sync::Arc;
 use axcoding::auth::Provider;
 use axcoding::llm_rig::RigLlm;
 use axcoding::session::{drive_turn, UiEvent};
-use axcoding::tui::{Tui, TuiEvent};
+use axcoding::tui::{Tui, TuiSession};
 use axcoding::Llm;
 
 const SYSTEM: &str = "\
@@ -101,75 +100,36 @@ async fn interactive_plain<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
 async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
     // A terminal that cannot host the inline viewport (dumb pty, DSR
     // unanswered) degrades to the plain loop instead of dying.
-    let Ok(mut tui) = Tui::new() else {
+    let Ok(mut sess) = TuiSession::new() else {
         eprintln!("(terminal does not support the inline TUI; falling back to plain mode)");
         return interactive_plain(llm, max_turns).await;
     };
-    tui.draw();
-
-    // Blocking crossterm reader on its own thread; the async side selects
-    // on the channel so Ctrl-C can cancel an in-flight task.
-    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-    std::thread::spawn(move || loop {
-        match Tui::read_event() {
-            Ok(ev) => {
-                if ev_tx.send(ev).is_err() {
-                    return;
-                }
-            }
-            Err(_) => return,
-        }
-    });
 
     let specs = axcoding::tools::tool_specs();
     let mut transcript: Vec<axcoding::ChatMessage> = Vec::new();
 
     loop {
-        // ── prompt phase ──────────────────────────────────────────────
-        tui.set_busy(false);
-        let line = loop {
-            tokio::select! {
-                ev = ev_rx.recv() => match ev {
-                    Some(TuiEvent::Key(k)) => {
-                        if let Some(line) = tui.prompt_key(k) {
-                            if line.is_empty() {
-                                return Ok(()); // Ctrl-D / Ctrl-C on empty
-                            }
-                            break line;
-                        }
-                    }
-                    Some(TuiEvent::Resize) => tui.draw(),
-                    Some(_) => {}
-                    None => return Ok(()),
-                },
-                _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {
-                    tui.tick();
-                }
-            }
+        let Some(line) = sess.prompt().await else {
+            return Ok(()); // Ctrl-D / Ctrl-C on empty
         };
 
-        // Session commands.
         if line == "/clear" {
             transcript.clear();
-            tui.commit("(transcript cleared)");
+            sess.tui.commit("(transcript cleared)");
             continue;
         }
 
-        // ── busy phase ────────────────────────────────────────────────
-        tui.set_busy(true);
+        let (ui_tx, mut ui_rx) = TuiSession::event_channel::<UiEvent>();
+        let mut sink = |ev: UiEvent| {
+            let _ = ui_tx.send(ev);
+        };
+        // Mark BEFORE driving: a cancel rewinds to it (dropping the future
+        // mid-flight can leave a dangling assistant tool_calls message,
+        // which would 400 the next request). The block scope is what drops
+        // the pinned future (and its transcript borrow) before the
+        // post-processing below can truncate.
         let mark = transcript.len();
         let outcome = {
-            // The sink forwards into a channel so nothing here borrows
-            // `tui` while the drive future is alive: the select below
-            // needs `tui` free for its tick arm. Events are applied on
-            // the same tick that repaints, which also BATCHES streaming
-            // deltas into one draw — painting per-delta positioned every
-            // wide char with its own cursor move, and terminals render
-            // that as separate glyph runs: visibly wider CJK spacing.
-            let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-            let mut sink = |ev: UiEvent| {
-                let _ = ui_tx.send(ev);
-            };
             let drive = drive_turn(
                 &llm,
                 SYSTEM,
@@ -193,50 +153,17 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
                 }
                 UiEvent::FinalAnswer(text) => tui.commit(&text),
             };
-            let outcome = loop {
-                tokio::select! {
-                    r = &mut drive => {
-                        // Drain whatever the finished task still queued so
-                        // the final answer paints before the status flips.
-                        while let Ok(ev) = ui_rx.try_recv() {
-                            apply(&mut tui, ev);
-                        }
-                        break Some(r);
-                    }
-                    ev = ui_rx.recv() => match ev {
-                        Some(ev) => apply(&mut tui, ev),
-                        None => {}
-                    },
-                    // The tick repaints batched deltas.
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        tui.tick();
-                    }
-                    ev = ev_rx.recv() => {
-                        // Only Ctrl-C acts while busy; everything else
-                        // (typed-ahead or stray mouse input) is dropped.
-                        if let Some(TuiEvent::Key(k)) = ev {
-                            if k.kind != crossterm::event::KeyEventKind::Release
-                                && k.modifiers.contains(KeyModifiers::CONTROL)
-                                && k.code == KeyCode::Char('c')
-                            {
-                                break None;
-                            }
-                        }
-                    }
-                }
-            };
-            outcome
+            sess.run_busy(drive, &mut ui_rx, apply).await?
         };
-        tui.set_busy(false);
         match outcome {
-            Some(Ok(())) => {}
-            Some(Err(e)) => tui.commit(&format!("error: {e}")),
-            // Cancelled mid-flight: rewind the transcript to before the
-            // task so a half-finished assistant tool_calls message can't
-            // poison the next request (providers 400 on dangling calls).
-            None => {
+            axcoding::tui::BusyOutcome::Done(()) => {}
+            axcoding::tui::BusyOutcome::Failed(_) => {
+                // The error line is already committed by run_busy; the
+                // transcript up to the failure is real history and stays.
+            }
+            axcoding::tui::BusyOutcome::Cancelled => {
                 transcript.truncate(mark);
-                tui.commit("(cancelled)");
+                sess.tui.commit("(cancelled)");
             }
         }
     }

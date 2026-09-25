@@ -112,8 +112,8 @@ fn walk(root: &Path, dir: &Path, depth: usize, files: &mut Vec<std::path::PathBu
 mod tests {
     use super::*;
 
-    fn setup() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("axcoding-ctx-{}", std::process::id()));
+    fn setup(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("axcoding-ctx-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn builds_sections_skips_noise_and_respects_caps() {
-        let dir = setup();
+        let dir = setup("a");
         let (ctx, sum) = build_from_dir(&dir, 200_000, 1_000_000);
         assert!(ctx.contains("===== README.md (8 chars) ====="));
         assert!(ctx.contains("# hello"));
@@ -138,16 +138,16 @@ mod tests {
         assert_eq!(sum.files, 3, "README + main.rs + big.txt");
         assert_eq!(sum.skipped_binary, 0, "png is ext-filtered at walk time");
 
-        // per-file cap refuses big.txt (5000 > 10)
+        // per-file cap refuses big.txt (5000) AND main.rs (13) — both over 10.
         let (ctx2, sum2) = build_from_dir(&dir, 10, 1_000_000);
         assert!(!ctx2.contains("xxxxx"), "oversize file must be skipped");
-        assert_eq!(sum2.skipped_oversize, 1);
+        assert_eq!(sum2.skipped_oversize, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn total_cap_stops_accumulation() {
-        let dir = setup();
+        let dir = setup("b");
         let (ctx, sum) = build_from_dir(&dir, 100, 20);
         assert!(sum.files < 2, "total cap 20 chars must refuse most files");
         assert!(ctx.chars().count() <= 200);

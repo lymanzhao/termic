@@ -75,6 +75,22 @@ pub struct RunTrace {
     pub playbook_log: Option<String>,
 }
 
+/// One observable step of a harness run, for front-ends. Owned strings:
+/// events may outlive the borrow into renderers or channels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HarnessEvent {
+    /// The submitted task (first event, echoed above the reply).
+    UserTask(String),
+    /// Root-model narration in a turn that also issued tool calls.
+    Turn { turn: u32, text: String },
+    /// One eval the root model ran: its sequence number and code.
+    Eval { n: u32, code: String },
+    /// The (clipped) output of that eval.
+    EvalOut { out: String },
+    /// The final answer (submitted, or accepted prose).
+    Answer(String),
+}
+
 pub struct Harness<L: Llm> {
     llm: Arc<L>,
     cfg: HarnessCfg,
@@ -111,6 +127,15 @@ impl<L: Llm> Harness<L> {
     }
 
     pub async fn run(&self, task: &str, context: &str) -> Result<RunTrace> {
+        self.run_with_events(task, context, &mut |_| {}).await
+    }
+
+    pub async fn run_with_events(
+        &self,
+        task: &str,
+        context: &str,
+        sink: &mut dyn FnMut(HarnessEvent),
+    ) -> Result<RunTrace> {
         let pb_path = self.cfg.data_dir.join("playbook.json");
         let mut playbook = Playbook::load(&pb_path);
         let ctx = Arc::new(ContextStore::new(context));
@@ -137,6 +162,8 @@ impl<L: Llm> Harness<L> {
         let mut answer: Option<String> = None;
         let mut turns_used = 0u32;
 
+        sink(HarnessEvent::UserTask(task.to_string()));
+
         'outer: for _ in 0..self.cfg.max_turns {
             turns_used += 1;
             let turn: LlmTurn = self.llm.complete(&preamble, &messages, &Self::tools()).await?;
@@ -156,11 +183,18 @@ impl<L: Llm> Harness<L> {
                 break;
             }
 
+            if !turn.text.trim().is_empty() {
+                sink(HarnessEvent::Turn { turn: turns_used, text: turn.text.clone() });
+            }
             messages.push(ChatMessage::assistant_calls(turn.text.clone(), turn.tool_calls.clone()));
             for call in turn.tool_calls.clone() {
                 match call.name.as_str() {
                     "eval" => {
                         let code = arg_str(&call.args_json, "code").unwrap_or_default();
+                        sink(HarnessEvent::Eval {
+                            n: eval_log.len() as u32 + 1,
+                            code: crate::clip(&code, 160),
+                        });
                         let out = if code.trim().is_empty() {
                             "ERROR: eval needs a \"code\" argument".to_string()
                         } else {
@@ -170,6 +204,7 @@ impl<L: Llm> Harness<L> {
                                 crate::clip(&code, 160),
                                 crate::clip(&o, 200)
                             ));
+                            sink(HarnessEvent::EvalOut { out: crate::clip(&o, 200) });
                             o
                         };
                         messages.push(ChatMessage::tool_result(&call.id, call.name.clone(), out));
@@ -200,6 +235,9 @@ impl<L: Llm> Harness<L> {
         }
 
         let mut playbook_log = None;
+        if let Some(a) = &answer {
+            sink(HarnessEvent::Answer(a.clone()));
+        }
         if self.cfg.reflect {
             let usage = repl.usage();
             let digest = build_digest(
