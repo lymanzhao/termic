@@ -164,15 +164,25 @@ export default {
       titleFallback: "项目 · 任务",
       body: "智能体已完成",
     },
-    workDone: {
-      label: "完成指示器",
-      hint: "当智能体完成一轮工作并等待你处理时，为任务的智能体图标着色。",
+    marksTitle: "智能体状态标记",
+    markWorking: {
+      label: "工作中",
+      hint: "智能体正在工作。涵盖所有进行中的标记，包括下面两项。",
     },
-    working: {
-      label: "进行中指示器",
-      hint: "智能体工作时，在其标签页和侧边栏图标上显示转圈。默认开启。依赖工作状态检测，在嘈杂的 TUI 上偶尔会误判；卡住的转圈会在几分钟后自动消失。",
+    markDelegated: "在等待它启动的子智能体或脚本。没有任何计算在进行，这可能持续数小时。跟随「工作中」。",
+    markPartial: {
+      label: "部分完成",
+      hint: "部分委托的工作已返回，其余仍在运行。关闭时，会一直显示上面的标记，直到全部完成。无论如何，一轮结束前都不会被判定为完成。",
     },
-    hooksNote: "这四个选项都基于 Termic 对智能体状态的判断。如果想让智能体自己上报状态，请参阅「智能体与终端」下的<1>智能体钩子</1>。",
+    markDone: {
+      label: "工作完成",
+      hint: "智能体已完成一轮。系统通知会配合这个标记出现。",
+    },
+    markAttention: {
+      label: "需要关注",
+      hint: "智能体被你阻塞：权限请求、提问，或任何它自己无法越过的事情。",
+    },
+    hooksNote: "这些标记来自 Termic 对智能体状态的判断。如果想让智能体自己上报状态，请参阅「智能体与终端」下的<1>智能体钩子</1>。",
   },
 
   sandbox: {
@@ -184,6 +194,10 @@ export default {
     bypass: {
       label: "沙箱任务中跳过权限确认",
       hint: "开启后，沙箱任务中的智能体会跳过它们自己的权限提示。macOS seatbelt 才是真正的边界。关闭则让沙箱中的智能体照常询问。对新启动的终端生效。",
+    },
+    yoloDefault: {
+      label: "新任务以 YOLO 启动",
+      hint: "适用于本身已是沙箱的机器，如专用的 Mac mini 或虚拟机。新任务将跳过智能体自身的权限提示，对 codex 和 muse 还会关闭其内置沙箱。新建任务对话框会在创建前显示此选项，项目可在「设置 → 仓库」中覆盖。通过 CLI 创建任务的智能体仍需显式传入 <1>--yolo</1>。",
     },
     global: {
       title: "全局沙箱默认值",
@@ -517,6 +531,8 @@ export default {
       sessionIdHint: "主检出任务的第一次启动，生成一个 termic 持有的 uuid。使用 {UUID}。留空 = 此智能体在主检出中不自动恢复。",
       resumeIdLabel: "恢复 ID 参数（主检出）",
       resumeIdHint: "主检出任务第一次之后的每次启动。恢复 termic 持有的 uuid（与同目录的外部会话隔离）。使用 {UUID}。",
+      resumePickerLabel: "会话选择器参数",
+      resumePickerHint: "当已存储的会话无法恢复时，打开智能体自己的会话选择器，而不是直接开新会话。你选中的会话会通过智能体钩子传回，Termic 下次就能恢复它。不用 {UUID}。留空 = 和以前一样开新会话；内置智能体会在下次启动时恢复默认值，与其他参数列表一致。",
       nameArgsLabel: "命名参数",
       nameArgsHint: "每次启动时应用。为会话固定一个显示名（claude 会在 /resume 和输入框中显示）。支持的占位符：{WORKSPACE_SLUG}、{WORKSPACE_NAME}、{BRANCH}。",
       envLabel: "环境",
@@ -588,10 +604,8 @@ export default {
       install: "安装",
       showInstalls: "查看它具体安装的内容",
       hideInstalls: "收起安装内容",
-      configFile: "配置文件：",
-      sharedNote: "（你的文件；termic 会合并进去）",
-      addedToFile: "写入该文件的内容：",
-      entryLine: "<1>{{event}}</1> 上报 <3>{{reports}}</3>，并运行：",
+      yoursMerges: "你的文件；termic 会合并进去",
+      runsOn: "在 {{events}} 时运行",
     },
     signals: {
       show: "查看这个智能体实际在输出什么…",
@@ -754,8 +768,15 @@ export default {
     runCmdHint: "显示在「运行」下拉菜单中的额外命令，每条打开自己的运行标签页。与上面单一的运行脚本相互独立。个人和共享命令及其测试在同一个地方管理。也可以在文件树中右键文件来添加。",
     runCmdButton: "运行配置…",
     filesLabel: "要复制的文件",
-    filesHintMulti: "从此项目自己的仓库根目录复制到每个新任务的根目录。每行一个，支持 glob 模式（如 <1>.env*</1>）。各成员的列表在上方「成员与脚本」中单独设置。",
-    filesHintSingle: "从仓库根目录复制到每个新任务。每行一个，支持 glob 模式（如 <1>.env*</1>）。",
+    yoloDefault: {
+      label: "新任务以 YOLO 启动",
+      hint: "此项目的新任务是否跳过智能体自身的权限提示。新建任务对话框会以此为基础，且可按任务修改。仅保存在本机，不写入 <1>.termic.yaml</1>。",
+      inherit: "应用默认（{{value}}）",
+      on: "开",
+      off: "关",
+    },
+    filesHintMulti: "从此项目自己的仓库根目录复制到每个新任务的根目录。每行一个，支持 glob 模式（如根目录的 <1>.env*</1>、任意层级的 <3>**/.env*</3>）。各成员的列表在上方「成员与脚本」中单独设置。",
+    filesHintSingle: "从仓库根目录复制到每个新任务。每行一个，支持 glob 模式（如根目录的 <1>.env*</1>、任意层级的 <3>**/.env*</3>）。",
     hiddenLabel: "隐藏的文件",
     hiddenHint: "此仓库「全部文件」树要隐藏的模式。保存到 <1>.termic.yaml</1>（已提交，团队共享），并与你的个人列表（设置 → 通用）合并。",
     intelIntro: "语言服务器按检出运行，使用你自己的工具链，并一直持有其索引（数百 MB 到数 GB），直到停止。",

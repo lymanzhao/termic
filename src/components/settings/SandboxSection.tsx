@@ -110,14 +110,14 @@ export function SandboxSection() {
           flag. */}
       <Block id="default-yolo">
         <Toggle
-          label="Start new tasks in YOLO"
-          hint={<>
-            For a machine that is already the sandbox, like a dedicated Mac mini or a VM. New tasks start with
-            the agent's own permission prompts skipped, and for codex and muse that also turns off their
-            built-in sandbox. The New task dialog shows it before you create, and a project can override it
-            (Settings → Repositories). Agents creating tasks through the CLI still need{" "}
-            <code className="font-mono">--yolo</code>.
-          </>}
+          label={t("sandbox.yoloDefault.label")}
+          hint={
+            <Trans
+              t={t}
+              i18nKey="sandbox.yoloDefault.hint"
+              components={{ 1: <code className="font-mono" /> }}
+            />
+          }
           value={defaultYolo}
           onChange={setDefaultYolo}
         />

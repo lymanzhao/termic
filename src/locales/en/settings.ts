@@ -165,15 +165,25 @@ export default {
       titleFallback: "project · task",
       body: "agent finished",
     },
-    workDone: {
-      label: "Work-done indicator",
-      hint: "Color a task's agent icon when its agent finishes a turn and is waiting on you.",
+    marksTitle: "Agent status marks",
+    markWorking: {
+      label: "Working",
+      hint: "The agent is working right now. Covers every mid-turn mark, including the two below.",
     },
-    working: {
-      label: "Work-in-progress indicator",
-      hint: "Show a spinner on an agent's tab and sidebar icon while it's working. On by default. Relies on work detection, which can occasionally misfire on noisy TUIs; a stuck spinner auto-clears after a few minutes.",
+    markDelegated: "Waiting on subagents or scripts it started. Nothing is being computed, and this can last hours. Follows Working.",
+    markPartial: {
+      label: "Partially done",
+      hint: "Some of that work reported back while the rest still runs. Off leaves the mark above until everything is in. Either way the turn is not called done until it is.",
     },
-    hooksNote: "These four read Termic's idea of what an agent is doing. To have the agent report that itself instead, see <1>Agent hooks</1> under Agents & Terminals.",
+    markDone: {
+      label: "Work done",
+      hint: "The agent finished its turn. This is the mark a desktop notification goes with.",
+    },
+    markAttention: {
+      label: "Needs attention",
+      hint: "The agent is blocked on you: a permission prompt, a question, or anything else it cannot get past on its own.",
+    },
+    hooksNote: "These marks read Termic's idea of what an agent is doing. To have the agent report that itself instead, see <1>Agent hooks</1> under Agents & Terminals.",
   },
 
   sandbox: {
@@ -185,6 +195,10 @@ export default {
     bypass: {
       label: "Bypass permissions in sandboxed tasks",
       hint: "When on, agents in a sandboxed task skip their own permission prompts. The macOS seatbelt is the real boundary. Turn off to make sandboxed agents still ask. Applies to newly spawned terminals.",
+    },
+    yoloDefault: {
+      label: "Start new tasks in YOLO",
+      hint: "For a machine that is already the sandbox, like a dedicated Mac mini or a VM. New tasks start with the agent's own permission prompts skipped, and for codex and muse that also turns off their built-in sandbox. The New task dialog shows it before you create, and a project can override it (Settings → Repositories). Agents creating tasks through the CLI still need <1>--yolo</1>.",
     },
     global: {
       title: "Global sandbox defaults",
@@ -519,6 +533,8 @@ export default {
       sessionIdHint: "First spawn in a main-checkout task, mints a termic-owned uuid. Use {UUID}. Empty = no auto-resume in the main checkout for this agent.",
       resumeIdLabel: "Resume ID args (main checkout)",
       resumeIdHint: "Every spawn after the first in a main-checkout task. Resumes the termic-owned uuid (isolates us from external sessions in the same cwd). Use {UUID}.",
+      resumePickerLabel: "Session picker args",
+      resumePickerHint: "Opens the agent's own session picker when a stored session fails to resume, instead of starting a new session. The session you pick comes back through the agent hooks, so Termic resumes it next time. No {UUID}. Empty = start a new session, as before; a built-in agent gets its default back on the next start, like the other argument lists.",
       nameArgsLabel: "Name args",
       nameArgsHint: "Applied on every spawn. Pins a display name for the session (claude shows it in /resume and the prompt box). Placeholders supported: {WORKSPACE_SLUG}, {WORKSPACE_NAME}, {BRANCH}.",
       envLabel: "Environment",
@@ -590,10 +606,8 @@ export default {
       install: "Install",
       showInstalls: "Show exactly what this installs",
       hideInstalls: "Hide what this installs",
-      configFile: "Config file:",
-      sharedNote: "(yours; termic merges into it)",
-      addedToFile: "Added to that file:",
-      entryLine: "<1>{{event}}</1> reports <3>{{reports}}</3>, and runs:",
+      yoursMerges: "yours; termic merges into it",
+      runsOn: "Runs on {{events}}",
     },
     signals: {
       show: "Show what this agent is emitting…",
@@ -756,8 +770,15 @@ export default {
     runCmdHint: "Extra commands shown in the Run dropdown, each opening its own run tab. Separate from the single Run script above. Manage personal + shared commands, and test them, in one place. You can also add one by right-clicking a file in the tree.",
     runCmdButton: "Run configuration…",
     filesLabel: "Files to copy",
-    filesHintMulti: "Copied from this project's own repo root into the root of each new task. One per line, glob patterns OK (e.g. <1>.env*</1>). Members get their own list, in Members & scripts above.",
-    filesHintSingle: "Copied from the repo root into each new task. One per line, glob patterns OK (e.g. <1>.env*</1>).",
+    yoloDefault: {
+      label: "New tasks start in YOLO",
+      hint: "Whether new tasks of this project skip the agent's own permission prompts. The New Task dialog starts here and lets you change it per task. Saved on this machine only, not in <1>.termic.yaml</1>.",
+      inherit: "App default ({{value}})",
+      on: "On",
+      off: "Off",
+    },
+    filesHintMulti: "Copied from this project's own repo root into the root of each new task. One per line, glob patterns OK (e.g. <1>.env*</1> at the root, <3>**/.env*</3> at any depth). Members get their own list, in Members & scripts above.",
+    filesHintSingle: "Copied from the repo root into each new task. One per line, glob patterns OK (e.g. <1>.env*</1> at the root, <3>**/.env*</3> at any depth).",
     hiddenLabel: "Hidden files",
     hiddenHint: "Patterns hidden from the \"All files\" tree for this repo. Saved to <1>.termic.yaml</1> (committed, team-shared) and merged with your personal list (Settings → General).",
     intelIntro: "A language server runs per CHECKOUT, from your own toolchain, and holds its index (hundreds of megabytes to several gigabytes) until it stops.",

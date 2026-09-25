@@ -1745,7 +1745,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                         if (filter?.bell) toggleTaskFilterBell(p.id);
                         closeFilterBar();
                       }}
-                    >Clear filter</button>
+                    >{t("taskFilter.clear")}</button>
                   </div>
                 )}
                 {/* Tasks mid-creation (GH #242) — a real Task doesn't exist
