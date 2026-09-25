@@ -196,6 +196,10 @@ export default {
       label: "Bypass permissions in sandboxed tasks",
       hint: "When on, agents in a sandboxed task skip their own permission prompts. The macOS seatbelt is the real boundary. Turn off to make sandboxed agents still ask. Applies to newly spawned terminals.",
     },
+    yoloDefault: {
+      label: "Start new tasks in YOLO",
+      hint: "For a machine that is already the sandbox, like a dedicated Mac mini or a VM. New tasks start with the agent's own permission prompts skipped, and for codex and muse that also turns off their built-in sandbox. The New task dialog shows it before you create, and a project can override it (Settings → Repositories). Agents creating tasks through the CLI still need <1>--yolo</1>.",
+    },
     global: {
       title: "Global sandbox defaults",
       hint: "One per line. Wildcards (<1>*.example.com</1>) for hosts; <3>$HOME</3> + <5>~</5> expand for paths. Merged with each project's own lists when a task is created.",
@@ -766,6 +770,13 @@ export default {
     runCmdHint: "Extra commands shown in the Run dropdown, each opening its own run tab. Separate from the single Run script above. Manage personal + shared commands, and test them, in one place. You can also add one by right-clicking a file in the tree.",
     runCmdButton: "Run configuration…",
     filesLabel: "Files to copy",
+    yoloDefault: {
+      label: "New tasks start in YOLO",
+      hint: "Whether new tasks of this project skip the agent's own permission prompts. The New Task dialog starts here and lets you change it per task. Saved on this machine only, not in <1>.termic.yaml</1>.",
+      inherit: "App default ({{value}})",
+      on: "On",
+      off: "Off",
+    },
     filesHintMulti: "Copied from this project's own repo root into the root of each new task. One per line, glob patterns OK (e.g. <1>.env*</1> at the root, <3>**/.env*</3> at any depth). Members get their own list, in Members & scripts above.",
     filesHintSingle: "Copied from the repo root into each new task. One per line, glob patterns OK (e.g. <1>.env*</1> at the root, <3>**/.env*</3> at any depth).",
     hiddenLabel: "Hidden files",

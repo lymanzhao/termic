@@ -27,6 +27,7 @@ export default {
     queueRunningAria: "Message queue running",
     failedTip: "Exited with an error, click Restart to retry",
     dirtyTip: "Unsaved changes",
+    unseenTip: "Updated since you last looked",
     unpinTip: "Unpin tab",
     closeTip: "Close tab",
   },

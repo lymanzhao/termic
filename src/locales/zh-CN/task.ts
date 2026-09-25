@@ -25,6 +25,7 @@ export default {
     queueRunningAria: "消息队列运行中",
     failedTip: "以错误退出，点击“重启”重试",
     dirtyTip: "未保存的更改",
+    unseenTip: "自上次查看后有更新",
     unpinTip: "取消固定标签",
     closeTip: "关闭标签",
   },

@@ -963,11 +963,13 @@ export function RepositorySection({ projectId }: { projectId: string }) {
                 Personal (projects.json) only, never .termic.yaml: a committed
                 file must not be able to switch approvals off for a clone. */}
             <div>
-              <div className="text-[13.5px] font-medium">New tasks start in YOLO</div>
+              <div className="text-[13.5px] font-medium">{t("repo.yoloDefault.label")}</div>
               <div className="mt-0.5 mb-2 text-[12.5px] text-[var(--color-fg-dim)]">
-                Whether new tasks of this project skip the agent's own permission prompts. The New Task
-                dialog starts here and lets you change it per task. Saved on this machine only, not in{" "}
-                <code className="font-mono">.termic.yaml</code>.
+                <Trans
+                  t={t}
+                  i18nKey="repo.yoloDefault.hint"
+                  components={{ 1: <code className="font-mono" /> }}
+                />
               </div>
               <select
                 data-testid="project-default-yolo"
@@ -981,9 +983,9 @@ export function RepositorySection({ projectId }: { projectId: string }) {
                   flashRing("default_yolo"),
                 )}
               >
-                <option value="inherit">App default ({appDefaultYolo ? "on" : "off"})</option>
-                <option value="on">On</option>
-                <option value="off">Off</option>
+                <option value="inherit">{t("repo.yoloDefault.inherit", { value: t(appDefaultYolo ? "repo.yoloDefault.on" : "repo.yoloDefault.off") })}</option>
+                <option value="on">{t("repo.yoloDefault.on")}</option>
+                <option value="off">{t("repo.yoloDefault.off")}</option>
               </select>
             </div>
 

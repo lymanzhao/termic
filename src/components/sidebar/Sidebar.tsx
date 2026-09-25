@@ -1718,7 +1718,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                       key={`group:${seg.group.id}`}
                       group={seg.group}
                       projectId={p.id}
-                      label={groupLabel(seg.group, tasks)}
+                      label={groupLabel(seg.group, tasks, t)}
                       compact={compact}
                       count={seg.tasks.length}
                       memberIds={seg.tasks.map(t => t.id)}
@@ -1741,7 +1741,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                     data-testid={`project-filter-empty-${p.id}`}
                     className="ml-3 mr-1 mb-px flex h-[var(--task-row-h)] items-center justify-center gap-1.5 px-2 text-[13px] text-[var(--color-fg-faint)]"
                   >
-                    <span className="truncate">No matching tasks</span>
+                    <span className="truncate">{t("taskFilter.noMatches")}</span>
                     <button
                       className="shrink-0 rounded px-1 text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
                       onClick={() => {
@@ -3170,7 +3170,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                     <DropdownSubTrigger className="justify-between" data-testid={`task-move-to-group-${w.id}`}>
                       <span className="flex items-center gap-2">
                         <Folder className="h-4 w-4" />
-                        <span>Move to group</span>
+                        <span>{t("taskGroup.moveToGroup")}</span>
                       </span>
                       <ChevronRight className="h-3.5 w-3.5 text-[var(--color-fg-faint)]" />
                     </DropdownSubTrigger>
@@ -3195,7 +3195,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                             {current
                               ? <Check className="h-3.5 w-3.5 text-[var(--color-accent)]" />
                               : <span className="block h-2.5 w-2.5 shrink-0 rounded-full mx-0.5" style={{ backgroundColor: taskGroupColorCss(g) }} />}
-                            <span className="truncate">{groupLabel(g, all)}</span>
+                            <span className="truncate">{groupLabel(g, all, t)}</span>
                           </DropdownItem>
                         );
                       })}
@@ -3219,7 +3219,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                         }}
                       >
                         <FolderPlus className="h-4 w-4" />
-                        <span>New group</span>
+                        <span>{t("taskGroup.newGroup")}</span>
                       </DropdownItem>
                       {w.group && (
                         <DropdownItem
@@ -3228,7 +3228,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                           onSelect={() => run(taskGroupLeave(w.id))}
                         >
                           <FolderMinus className="h-4 w-4" />
-                          <span>Remove from group</span>
+                          <span>{t("taskGroup.removeFromGroup")}</span>
                         </DropdownItem>
                       )}
                     </DropdownSubContent>

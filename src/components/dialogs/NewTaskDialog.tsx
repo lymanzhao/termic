@@ -1247,18 +1247,18 @@ export function NewTaskDialog() {
           // The branch to check out: typed, or picked from the repo's own
           // refs. The typed text is the value (the rows only fill it in), so
           // a branch this repo has never fetched is still one keystroke away.
-          <Field label="Branch" hint="A local branch, or one on a remote. A remote branch gets a local branch that tracks it.">
+          <Field label={t("newTask.checkoutBranchLabel")} hint={t("newTask.checkoutBranchHint")}>
             <div className="flex flex-col gap-1.5">
               <Input
                 data-testid="checkout-branch-input"
                 value={checkoutBranch}
                 onChange={e => setCheckoutBranch(e.target.value)}
-                placeholder="origin/alice/fix-login"
+                placeholder={t("newTask.checkoutPlaceholder")}
                 autoFocus
               />
               {checkoutLoading ? (
                 <div className="flex items-center gap-2 px-1 py-2 text-[12.5px] text-[var(--color-fg-faint)]">
-                  <Loader2 className="h-4 w-4 animate-spin text-[var(--color-accent)]" /> Reading branches…
+                  <Loader2 className="h-4 w-4 animate-spin text-[var(--color-accent)]" /> {t("newTask.checkoutReading")}
                 </div>
               ) : checkoutView && checkoutView.choices.length > 0 ? (
                 <div data-testid="checkout-branch-list" className="max-h-[200px] overflow-auto rounded-md border border-[var(--color-border-soft)]">
@@ -1285,14 +1285,14 @@ export function NewTaskDialog() {
                   })}
                   {checkoutView.truncated && (
                     <div className="px-3 py-1.5 text-[11.5px] text-[var(--color-fg-faint)]">
-                      Showing the first {BRANCH_CHOICES_MAX}. Type to narrow.
+                      {t("newTask.checkoutTruncated", { count: BRANCH_CHOICES_MAX })}
                     </div>
                   )}
                 </div>
               ) : null}
               {checkoutUnfetched && (
                 <p data-testid="checkout-branch-unfetched" className="text-[11.5px] text-[var(--color-fg-dim)]">
-                  Not fetched yet. Termic will look for it on the remote when you create the task.
+                  {t("newTask.checkoutUnfetched")}
                 </p>
               )}
             </div>
@@ -1637,14 +1637,14 @@ export function NewTaskDialog() {
             disabled "auto" when the cage already turns it on. */}
         {yoloApplies && (
           <Field
-            label="YOLO"
+            label={t("newTask.yoloLabel")}
             hint={yoloCaged
-              ? "Auto-on: the sandbox is the boundary, so the agent's own prompts are skipped."
+              ? t("newTask.yoloHintAuto")
               : !yolo && yoloHeld
-                ? `Off for this task: the first message came from ${yoloHeld === "link" ? "a link" : "the issue"}, so someone else wrote it. Tick it if you trust the text.`
+                ? t(yoloHeld === "link" ? "newTask.yoloHintHeldLink" : "newTask.yoloHintHeldIssue")
                 : yolo
-                ? "Nothing cages the agent: it runs every command without asking. Change it later from the task menu."
-                : "The agent asks before running commands. The default is set in Settings → Sandbox."}
+                ? t("newTask.yoloHintOn")
+                : t("newTask.yoloHintOff")}
           >
             <label
               data-testid="new-task-yolo"
@@ -1666,7 +1666,7 @@ export function NewTaskDialog() {
                 className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded border-[var(--color-border)] bg-[var(--color-bg-2)] text-[var(--color-accent)] focus:ring-0 focus:ring-offset-0 disabled:cursor-default"
               />
               <Zap className="h-3.5 w-3.5 shrink-0" fill={yoloCaged || yolo ? "currentColor" : "none"} />
-              {yoloCaged ? "Auto-on inside the sandbox" : "Skip permission prompts"}
+              {yoloCaged ? t("newTask.yoloAutoCaged") : t("newTask.yoloSkipPrompts")}
             </label>
           </Field>
         )}
