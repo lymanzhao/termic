@@ -97,13 +97,6 @@ RUN curl -fsSL https://dev.meta.ai/install.sh | bash \
 RUN curl -fsSL https://cli.devin.ai/install.sh | bash \
     || echo "WARNING: devin install failed, Devin will be missing from this image"
 
-# axcoding is NOT installed here: it is not published to a registry, so the
-# image has nothing to fetch. To use it in Docker, uncomment and build with
-# the repo as build context (axcoding/ is a standalone crate):
-# RUN cargo install --path /repo/axcoding
-# It reads ANTHROPIC_API_KEY / OPENAI_API_KEY from the env (docker_env on the
-# agent entry) and keeps its playbook in ~/.axcoding.
-
 # ── Add your own MCP servers, CLI tools and skills here ────────────────
 # RUN npm install -g @some/mcp-server
 # RUN apt-get update && apt-get install -y <pkg> && rm -rf /var/lib/apt/lists/*

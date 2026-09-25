@@ -126,10 +126,6 @@ const SOURCES: Record<string, FooterSources> = {
   grok:     { usage: null,    context: "hooks" }, // status line (no quota in it)
   opencode: { usage: null,    context: "hooks" }, // plugin
   pi:       { usage: null,    context: "hooks" }, // extension
-  // axcoding has neither readout: it emits no status line, reads no hooks
-  // config (there is no transport to install into), and exposes no usage
-  // command. Both stay null; revisit if the binary grows a config surface.
-  // axcoding: { usage: null, context: null },
   // muse: context and quota exist only over `muse serve`, never to a TUI tab.
 };
 

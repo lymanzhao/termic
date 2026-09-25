@@ -134,9 +134,6 @@
      the dark theme takes the lighter step of Meta's own blue ramp and light
      mode gets the brand value back below. */
   --color-cli-muse:    #4599ff;
-  /* axcoding: teal-400 on dark, teal-600 in light mode (below) so the
-     hue stays readable on both grounds. */
-  --color-cli-axcoding: #2dd4bf;
   /* Devin's brand blue (#3969ca) reads dark on this ground, same problem as
      muse's; the dark theme takes a lighter step of it and light mode gets
      the brand value back below. */
@@ -243,7 +240,6 @@
     --color-cli-opencode: #6b6965;
     --color-cli-pi:      #09090b;
     --color-cli-muse:    #0064e0;
-    --color-cli-axcoding: #0d9488;
     --color-cli-devin:   #3969ca;
     /* Palette ramp: the dark-bg defaults (esp. yellow/teal) wash out
        on cream, so shift every hue darker. */

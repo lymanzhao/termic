@@ -154,7 +154,7 @@ pub fn persist_offerable(agent_id: &str) -> bool {
 /// agent's config shape. `a_new_builtin_agent_is_registered_in_every_table_that_needs_it`
 /// (agent_dirs.rs) is what makes that loud.
 pub(crate) const BASE_BUILTINS: &[&str] =
-    &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini", "muse", "devin", "axcoding"];
+    &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini", "muse", "devin"];
 
 /// Is this a base id `base_agent_id_str` actually knows, rather than one it
 /// would quietly answer "claude" for?

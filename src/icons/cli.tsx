@@ -87,20 +87,6 @@ export function PiIcon({ className }: Props) {
   );
 }
 
-// axcoding, this repo's own agent. A ring that feeds back into itself -
-// the self-improving loop - with a fixed point in the middle. Stroke
-// style so it sits with the generic glyph family.
-export function AxcodingIcon({ className }: Props) {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
-      strokeLinecap="round" strokeLinejoin="round" className={cn("inline-block", className)} aria-hidden>
-      <path d="M20 12a8 8 0 1 1-2.34-5.66" />
-      <polyline points="20 3 20 7.6 15.4 7.6" />
-      <circle cx="12" cy="12" r="2.1" fill="currentColor" stroke="none" />
-    </svg>
-  );
-}
-
 // Plain shell / terminal tabs (cli: "shell"). Boxed terminal glyph
 // (lucide square-terminal), stroke style to match the generic default.
 export function ShellIcon({ className }: Props) {
@@ -162,7 +148,6 @@ export function CliIcon({ cli, className }: { cli: string; className?: string })
     case "grok":     return <GrokIcon className={className} />;
     case "opencode": return <OpencodeIcon className={className} />;
     case "pi":       return <PiIcon className={className} />;
-    case "axcoding": return <AxcodingIcon className={className} />;
     case "muse":     return <MuseIcon className={className} />;
     case "devin":    return <DevinIcon className={className} />;
     case "copilot": return <CopilotIcon className={className} />;
@@ -172,7 +157,7 @@ export function CliIcon({ cli, className }: { cli: string; className?: string })
     // the invariant a new built-in is easiest to break: adding one to the Rust
     // registry and forgetting its `case` here, which ships an agent whose card
     // draws the terminal chevron instead of its brand mark. Cheaper than
-    // tagging all nine brand icons to say the same thing.
+    // tagging all the brand icons to say the same thing.
     default: return (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
         strokeLinecap="round" strokeLinejoin="round" className={cn("inline-block", className)}
@@ -191,7 +176,6 @@ export const CLI_BRAND_COLOR: Record<string, string> = {
   copilot:  "text-[var(--color-cli-copilot)]",
   opencode: "text-[var(--color-cli-opencode)]",
   pi:       "text-[var(--color-cli-pi)]",
-  axcoding: "text-[var(--color-cli-axcoding)]",
   muse:     "text-[var(--color-cli-muse)]",
   devin:    "text-[var(--color-cli-devin)]",
 };
@@ -216,7 +200,6 @@ export const CLI_LABEL: Record<string, string> = {
   grok:     "Grok",
   opencode: "opencode",
   pi:       "pi",
-  axcoding: "axcoding",
   muse:     "Muse Code",
   devin:    "Devin",
 };

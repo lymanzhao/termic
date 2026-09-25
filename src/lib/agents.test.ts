@@ -485,53 +485,6 @@ describe("pi resume", () => {
   });
 });
 
-// axcoding (this repo's own binary) resume. Not measured against a live
-// binary but BY CONSTRUCTION: axcoding/src/sessions.rs implements
-// `--session-id` as create-or-resume (pi's one-flag mint shape) and
-// `--continue` as newest-session-in-cwd, so the same assertions that hold
-// for pi hold here, with the native-OSC 777 work state on top.
-describe("axcoding resume", () => {
-  beforeEach(() => { mockAgents.length = 0; });
-  const args = (o: Parameters<typeof spawnArgsForCli>[1]) => spawnArgsForCli("axcoding", o);
-  const d = (o: Partial<Parameters<typeof decideResume>[0]> = {}) =>
-    decideResume({
-      isAgent: true, idCapable: true, isPrimary: true, runsTaskAgent: true,
-      isRepoRoot: false, hasResumableHistory: false, failedResume: false, ...o,
-    });
-
-  it("mints with --session-id on a first spawn", () => {
-    const a = args({ yolo: false, resume: false, sessionUuid: "u-1", resumeKnown: false });
-    expect(a).toEqual(expect.arrayContaining(["--session-id", "u-1"]));
-  });
-
-  it("resumes with the SAME flag, because --session-id creates if missing", () => {
-    const a = args({ yolo: false, resume: false, sessionUuid: "u-1", resumeKnown: true });
-    expect(a).toEqual(expect.arrayContaining(["--session-id", "u-1"]));
-    expect(a).not.toContain("--resume");
-  });
-
-  it("is id-capable, so repo-root tasks never take the cwd-resume path", () => {
-    expect(cliSupportsIdSession("axcoding")).toBe(true);
-    expect(cliSupportsResumeById("axcoding")).toBe(true);
-    expect(d({ idCapable: true, isRepoRoot: true, isPrimary: true, hasResumableHistory: true }).kind)
-      .toBe("mint");
-    expect(d({ idCapable: true, isRepoRoot: true, isPrimary: true, storedUuid: "u-1" }).kind)
-      .toBe("resume-id");
-  });
-
-  it("keeps a legacy worktree task on --continue", () => {
-    expect(args({ yolo: false, resume: true })).toContain("--continue");
-  });
-
-  it("has no title-signal patterns: work state arrives over native OSC 777", () => {
-    const sig = BUILTIN_TITLE_SIGNALS.axcoding;
-    expect(sig.attention).toEqual([]);
-    expect(sig.busy).toEqual([]);
-    expect(sig.idle).toEqual([]);
-    expect(sig.pending).toEqual([]);
-  });
-});
-
 // GH #276 follow-up, reported from a real session: with codex hooks installed,
 // EVERY codex turn ended with a needs-you bell.
 //

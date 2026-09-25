@@ -20100,75 +20100,6 @@ fn default_agents() -> Vec<Agent> {
                     .into(),
             }),
         },
-        Agent {
-            // axcoding: this repo's own rig-core agent (sources in
-            // axcoding/ at the repo root; `cargo install --path axcoding`
-            // is what puts it on PATH). Measured BY CONSTRUCTION - we wrote
-            // the binary - so every claim below is a property of its source
-            // rather than of a help text:
-            //   - it never asks for permission because it has no approval
-            //     mechanism at all; yolo_args is EMPTY as an answer.
-            //   - pi-shape sessions: `--session-id <id>` CREATES the session
-            //     if missing and resumes it if present (axcoding/src/
-            //     sessions.rs), so ONE flag covers both the mint and the
-            //     resume and the two lists are byte-identical, like pi's.
-            //     `--continue` resumes the newest session in the cwd (the
-            //     legacy worktree fallback shape).
-            //   - its login resolves env vars first, then falls back to
-            //     `$AXCODING_HOME/auth.json` (default `~/.axcoding/`,
-            //     written by `axcoding-agent auth import`, which reads the
-            //     provider config switchers like cc-switch persist into
-            //     Claude Code's settings.json). agent_dirs therefore holds
-            //     a real ConfigDir login store keyed on AXCODING_HOME, and
-            //     the account switcher works for it like claude's/codex's.
-            //   - work state arrives as NATIVE trusted OSC 777 (the binary
-            //     is its own hook; axcoding/src/osc.rs emits `agent working`
-            //     / `agent done` per turn plus `agent ready for input` and
-            //     `session <id>` at startup). TerminalPane's 777 handler is
-            //     agent-agnostic and routes on exact bodies, so `signals`
-            //     stays EMPTY by design - no title regexes exist to write.
-            id: "axcoding".into(),
-            display_name: "axcoding".into(),
-            command: "axcoding-agent".into(),
-            args: vec![],
-            icon_id: "axcoding".into(),
-            color: "#0d9488".into(),
-            builtin: true,
-            disabled: false,
-            capabilities: AgentCapabilities {
-                yolo_args: vec![],
-                runtime_yolo_command: String::new(),
-                runtime_default_command: String::new(),
-                resume_args: vec!["--continue".into()],
-                session_id_args: vec!["--session-id".into(), "{UUID}".into()],
-                resume_id_args: vec!["--session-id".into(), "{UUID}".into()],
-                resume_picker_args: vec![],
-                name_args: vec![],
-                signals: AgentSignals::default(),
-                match_output: false,
-            },
-            env: std::collections::HashMap::new(),
-            docker_env: std::collections::HashMap::new(),
-            // The cage must reach ~/.axcoding: auth.json (env-first auth
-            // masks this today) and sessions/<id>.jsonl, which every turn
-            // rewrites. Same shape as pi's `$HOME/.pi`. Caveat inherited
-            // from pi: the profile cannot authorize CREATING ~/.axcoding
-            // itself (that needs write on $HOME), so run `auth import`
-            // once outside a cage before caging tasks. state_dirs mounts
-            // the whole dir for Docker.
-            sandbox_allowed_paths: vec!["$HOME/.axcoding".into()],
-            // Empty like every other built-in: model-API hosts are the
-            // sandbox's runtime concern, not a per-agent list.
-            sandbox_allowed_hosts: vec![],
-            work_done: true,
-            accounts: Vec::new(),
-            default_account: None,
-            adopted_account: None,
-            auto_switch_account: false,
-            extends: None,
-            kind: "agent".into(),
-            post_launch_capture: None,
-        },
     ]
 }
 
@@ -26708,53 +26639,6 @@ mod tests {
         // pi mints deterministically, so it must NOT use opencode's
         // post-exit capture path.
         assert!(pi.post_launch_capture.is_none());
-    }
-
-    // axcoding is this repo's own binary (axcoding/ at the repo root), so
-    // "measured" means by-construction: the empties below are properties of
-    // its source, and the test pins them so a reviewer does not "finish"
-    // them. It never prompts (no approval mechanism exists), so yolo_args is
-    // empty as an ANSWER; there is no --name flag and no session picker in
-    // the binary, so those lists are empty as answers too; its login
-    // resolves env vars first and falls back to $AXCODING_HOME/auth.json,
-    // which agent_dirs holds as a ConfigDir login store.
-    #[test]
-    fn axcoding_empties_are_answers_not_omissions() {
-        let agents = seeded_defaults().agents;
-        let ax = agents.iter().find(|a| a.id == "axcoding").expect("axcoding seeded");
-        assert!(ax.capabilities.yolo_args.is_empty());
-        assert!(ax.capabilities.resume_picker_args.is_empty());
-        assert!(ax.capabilities.name_args.is_empty());
-        assert!(ax.post_launch_capture.is_none());
-        // The HOME path it owns holds auth.json and sessions/ (rewritten
-        // every turn); auth itself is env-first.
-        assert_eq!(ax.sandbox_allowed_paths, vec!["$HOME/.axcoding"]);
-        assert_eq!(ax.command, "axcoding-agent");
-        assert_eq!(ax.icon_id, "axcoding");
-    }
-
-    // The resume shape is pi's, by construction of the binary: one flag
-    // (`--session-id`) creates the session if missing and resumes it if
-    // present, so the mint spawn and every later resume are byte-identical
-    // and the two id lists MUST stay equal. `--continue` is the legacy
-    // cwd-resume fallback. Work state rides on NATIVE trusted OSC 777
-    // (axcoding/src/osc.rs emits the exact bodies termic routes), so the
-    // four signal lists stay empty BY DESIGN - there are no title regexes
-    // to write, and match_output would only add a second, redundant scan.
-    #[test]
-    fn axcoding_mints_like_pi_and_signals_over_osc777() {
-        let agents = seeded_defaults().agents;
-        let ax = agents.iter().find(|a| a.id == "axcoding").expect("axcoding seeded");
-        let id_args = vec!["--session-id".to_string(), "{UUID}".to_string()];
-        assert_eq!(ax.capabilities.session_id_args, id_args);
-        assert_eq!(ax.capabilities.resume_id_args, id_args, "one flag mints AND resumes");
-        assert_eq!(ax.capabilities.resume_args, vec!["--continue"]);
-        // Native OSC 777 needs no patterns; empty is the design, not a gap.
-        assert!(ax.capabilities.signals.busy.is_empty());
-        assert!(ax.capabilities.signals.idle.is_empty());
-        assert!(ax.capabilities.signals.attention.is_empty());
-        assert!(ax.capabilities.signals.pending.is_empty());
-        assert!(!ax.capabilities.match_output);
     }
 
     // Muse Code 1.0.2, measured against a live binary via its offline

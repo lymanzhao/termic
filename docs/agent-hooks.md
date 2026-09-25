@@ -42,22 +42,16 @@ target.
 | copilot | none (trust dialog precedes `sessionStart`) | `userPromptSubmitted`, `preToolUse`, `postToolUse` | `permissionRequest` | `agentStop` | none exists |
 | pi | none (`session_start` precedes the input box) | `before_agent_start`, `tool_call` | `ui_prompt_start` (an extension's own prompt; pi has no permission prompts) | `agent_settled` | none exists |
 | muse | none (`SessionStart` is lazy) | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `PermissionRequest` | `Stop` | none exists |
-| axcoding | native `session <id>` + `agent ready for input` at startup | native `agent working` at each submit | none exists (no approval mechanism) | native `agent done` on every turn end, including a failed or cancelled one | Ctrl-C (cancel), reported as `agent done` |
 
-axcoding is in this table but has NO hook transport, and the reasoning lives here
-because this is the only place anyone would find it (the same question was asked
-about muse once): axcoding is this repo's own binary (`axcoding/`), and it has no
-hook transport to install into. It reads no hooks or settings file of any shape,
-loads no plugin directory, and its only configuration surface is the process
-environment (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). So it does not need one: the
-binary writes the trusted OSC 777 bodies itself (`axcoding/src/osc.rs`, pinned
-byte-for-byte against `hookOscSequence`), and TerminalPane's 777 handler is
-agent-agnostic - it trusts the `termic` title field and routes on exact bodies,
-no installer and no per-agent patterns involved. `schemas_for` in `agent_hooks.rs`
-still has no row (nothing to install), and `SUPPORTED` does not list axcoding.
-The footer shows neither usage nor context (`SOURCES` in `lib/agentContext.ts`
-records the looking). If axcoding ever grows a config file, that is the trigger
-to revisit this paragraph and add a schema.
+External agents can skip hook transports entirely by emitting termic's trusted
+OSC 777 sequence natively (`ESC ]777;notify;termic;<body> BEL`):
+[axcoding](https://github.com/lymanzhao/axcoding) is the reference emitter (a
+standalone agent binary that was once a built-in here). It writes the bodies
+itself, pinned byte-for-byte against `hookOscSequence`, and TerminalPane's 777
+handler is agent-agnostic - it trusts the `termic` title field and routes on
+exact bodies, no installer and no per-agent patterns involved. `schemas_for`
+in `agent_hooks.rs` has no row for it (nothing to install), and `SUPPORTED`
+does not list it.
 
 Three install shapes are new with copilot, pi and muse (GH #277 follow-up):
 

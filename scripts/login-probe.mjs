@@ -51,11 +51,6 @@ const AGENTS = [
   // signal: "0 credentials" under a relocated root means the login followed.
   { id: "opencode", env: "XDG_DATA_HOME",     probe: ["auth", "list"],                     signedOut: /\b0 credentials\b|no (?:credentials|providers)/i },
   { id: "pi",       env: "HOME",              probe: ["auth", "check", "--provider", "openai-codex", "--json"], signedOut: /credentials_not_configured|not_ready/i },
-  // axcoding's store is a plain auth.json under AXCODING_HOME (plus the
-  // sessions/ dir the same path relocates); auth itself resolves env-first.
-  // Probed pointing a variable it honors, so if the store ever moves or
-  // hides behind a keyring this row fails here first.
-  { id: "axcoding", env: "AXCODING_HOME",     probe: ["--check-auth"], signedOut: /not authenticated/i },
   // Same reason as copilot, plus a caveat this probe cannot see: muse reports
   // itself signed out when its metadata INDEX moves, while the credential may
   // still sit in one shared keychain item. Left here as a note rather than a

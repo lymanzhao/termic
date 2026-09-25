@@ -656,12 +656,10 @@ describe("settings rail", () => {
   // `data-icon-id` is the hook AgentsSection exposes for precisely this, and
   // `data-cli-icon="fallback"` marks the generic glyph. The sweep is scoped
   // to `builtin: true` rows from the store because an OLD profile can still
-  // carry rows for agents since dropped from `default_agents()` (gemini is
-  // the live example: its row survives in seeded profiles, its icon case
-  // does not, and that is a legacy artifact rather than a shipped-agent
-  // regression). axcoding is asserted by NAME on top: it is the built-in
-  // this repo itself ships, so "sweep found nothing" must never quietly
-  // mean "the strip did not render".
+  // carry rows for agents since dropped from `default_agents()` (gemini and
+  // the once-builtin axcoding are the live examples: their rows survive in
+  // seeded profiles, their icon cases do not, and that is a legacy artifact
+  // rather than a shipped-agent regression).
   it("renders a brand icon for every builtin agent, never the fallback", async () => {
     await browser.execute(() =>
       window.__termic!.useApp.getState().openSettings("agents"),
@@ -681,7 +679,6 @@ describe("settings rail", () => {
       return { builtinIds, fallbacks: builtinIds.filter((id: string) => fallback.has(id)) };
     });
     expect(builtinIds.length).toBeGreaterThan(0);
-    expect(builtinIds).toContain("axcoding");
     expect(fallbacks).toEqual([]);
   });
 

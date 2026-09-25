@@ -215,24 +215,11 @@ built-in was absent from the list AND from the table, and the guard stayed
 silent. Verified by adding a fake agent and watching the suite pass, then fail.
 
 Six shapes, each because an agent measured that way: `ConfigDir` (claude,
-codex, axcoding), `SelfHostingDir` (grok: the login follows the var but its binary lives
+codex), `SelfHostingDir` (grok: the login follows the var but its binary lives
 in that tree, so Docker can never mount it), `ParentDir` (gemini appends
 `.gemini`), `XdgRoot` (opencode, devin: broader than the agent, which the UI
 says out loud), `HomeOnly` (pi), `TokenVar` (no agent currently, kept because it is the
 shape an agent that reads only a token variable would take).
-
-axcoding is the one agent that moved BETWEEN answers, and the history is kept
-because it is the walk-through for "why does the guard force a row at all". It
-shipped as `None` with a reason - its credentials were env-var-only, so there
-was nothing on disk to isolate - and that was true until it wasn't: the
-authenticating binary is in this repo, and once its resolver grew a fallback
-file (`$AXCODING_HOME/auth.json`, written by `axcoding-agent auth import`),
-"nothing to isolate" became false and the reason row would have been a lie the
-guards cannot see. What DID catch it was the probe
-(`make login-probe axcoding`), which points AXCODING_HOME at an empty dir and
-requires a signed-out answer. That is the probe's whole job: the table is
-measurements of moving software, and this is the case that proves a row can rot
-even when the "software" is your own.
 
 `None` is a THIRD answer, distinct from both a shape and an unmeasured agent,
 and `login_unsupported_reason` is what makes it distinct: copilot and muse
