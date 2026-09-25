@@ -13,6 +13,15 @@
 //! loop otherwise; one-shot when a task is given on argv. `--no-tui` (or
 //! AXCODING_NO_TUI=1) forces the plain loop.
 //!
+//! Sessions: `--session-id <id>` (create-or-resume - one flag mints and
+//! resumes, pi-style, which is what termic's mint shape expects) and
+//! `--continue` (newest session in this directory). Persisted as JSONL at
+//! `~/.axcoding/sessions/<id>.jsonl`, rewritten atomically after each
+//! settled turn. Work state rides on native OSC 777 (`axcoding::osc`):
+//! `agent working` / `agent done` per turn, `agent ready for input` +
+//! `session <id>` at startup - termic routes these with no per-agent
+//! tables on its side.
+//!
 //! One deliberate deviation from pi: `--max-turns` (default 50) exists
 //! because an agent that can loop forever spends real money.
 
@@ -23,7 +32,9 @@ use std::sync::Arc;
 
 use axcoding::auth::Provider;
 use axcoding::llm_rig::RigLlm;
+use axcoding::osc;
 use axcoding::session::{drive_turn, UiEvent};
+use axcoding::sessions::Session;
 use axcoding::tui::{Tui, TuiSession};
 use axcoding::Llm;
 
@@ -60,9 +71,47 @@ fn plain_sink(ev: UiEvent) {
     }
 }
 
-async fn interactive_plain<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
+/// Turn boundary, shared by all three modes. The TUI cannot wrap
+/// `drive_turn` itself (the future is pinned and dropped on cancel, and the
+/// CALLER truncates the transcript), so post-outcome work lives here,
+/// outside the future.
+fn turn_begin() {
+    osc::emit(osc::WORKING);
+}
+
+/// Persist the settled transcript, then close the turn. Called on EVERY
+/// outcome - Done, Failed, Cancelled - because once termic has seen the
+/// working edge it owns the turn and must not be left "working" on a
+/// failure. Cancelled arrives here already truncated, which is exactly the
+/// rewrite-at-the-truncation-mark semantics the atomic full-rewrite gives.
+fn turn_settle(
+    session: &Option<Session>,
+    transcript: &[axcoding::ChatMessage],
+) -> Result<()> {
+    let r = match session {
+        Some(s) => s.save(transcript),
+        None => Ok(()),
+    };
+    osc::emit(osc::DONE);
+    r
+}
+
+fn cleared_note(session: &Option<Session>) -> &'static str {
+    if session.is_some() {
+        "(transcript cleared; the session file rewrites on the next task)"
+    } else {
+        "(transcript cleared)"
+    }
+}
+
+async fn interactive_plain<L: Llm>(
+    llm: Arc<L>,
+    max_turns: u32,
+    session: Option<Session>,
+    mut transcript: Vec<axcoding::ChatMessage>,
+) -> Result<()> {
     eprintln!("axcoding-agent: one task per line; Ctrl-D or --exit to quit.");
-    let mut transcript = Vec::new();
+    osc::emit(osc::READY);
     let mut line = String::new();
     loop {
         line.clear();
@@ -79,12 +128,17 @@ async fn interactive_plain<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
             "--exit" => return Ok(()),
             "/clear" => {
                 transcript.clear();
-                eprintln!("(transcript cleared)");
+                eprintln!("{}", cleared_note(&session));
                 continue;
             }
             _ => {}
         }
-        drive_turn(
+        turn_begin();
+        // A failed turn does NOT kill the loop: termic classifies a fast
+        // non-zero exit after a resume-shaped spawn as a FAILED RESUME and
+        // respawns with a picker, and the transcript up to the failure is
+        // real history (the TUI has kept it since the beginning).
+        if let Err(e) = drive_turn(
             &llm,
             SYSTEM,
             &axcoding::tools::tool_specs(),
@@ -93,20 +147,31 @@ async fn interactive_plain<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
             max_turns,
             plain_sink,
         )
-        .await?;
+        .await
+        {
+            eprintln!("error: {e}");
+        }
+        if let Err(e) = turn_settle(&session, &transcript) {
+            eprintln!("error: session save failed: {e}");
+        }
     }
 }
 
-async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
+async fn interactive_tui<L: Llm>(
+    llm: Arc<L>,
+    max_turns: u32,
+    session: Option<Session>,
+    mut transcript: Vec<axcoding::ChatMessage>,
+) -> Result<()> {
     // A terminal that cannot host the inline viewport (dumb pty, DSR
     // unanswered) degrades to the plain loop instead of dying.
     let Ok(mut sess) = TuiSession::new() else {
         eprintln!("(terminal does not support the inline TUI; falling back to plain mode)");
-        return interactive_plain(llm, max_turns).await;
+        return interactive_plain(llm, max_turns, session, transcript).await;
     };
+    osc::emit(osc::READY);
 
     let specs = axcoding::tools::tool_specs();
-    let mut transcript: Vec<axcoding::ChatMessage> = Vec::new();
 
     loop {
         let Some(line) = sess.prompt().await else {
@@ -115,7 +180,7 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
 
         if line == "/clear" {
             transcript.clear();
-            sess.tui.commit("(transcript cleared)");
+            sess.tui.commit(cleared_note(&session));
             continue;
         }
 
@@ -129,6 +194,7 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
         // the pinned future (and its transcript borrow) before the
         // post-processing below can truncate.
         let mark = transcript.len();
+        turn_begin();
         let outcome = {
             let drive = drive_turn(
                 &llm,
@@ -166,6 +232,12 @@ async fn interactive_tui<L: Llm>(llm: Arc<L>, max_turns: u32) -> Result<()> {
                 sess.tui.commit("(cancelled)");
             }
         }
+        // Cancelled lands here already truncated: the settle rewrites the
+        // file at the truncation mark. A save failure is a committed note,
+        // not a loop exit - a long-running session must survive a full disk.
+        if let Err(e) = turn_settle(&session, &transcript) {
+            sess.tui.commit(&format!("(session save failed: {e})"));
+        }
     }
 }
 
@@ -178,6 +250,8 @@ async fn main() -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let mut import_force = false;
+    let mut session_id: Option<String> = None;
+    let mut continue_latest = false;
     let mut task: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -189,8 +263,13 @@ async fn main() -> Result<()> {
             "--check-auth" => check_auth = true,
             "--no-tui" => no_tui = true,
             "--force" => import_force = true,
+            "--session-id" => session_id = Some(args.next().expect("--session-id needs a value")),
+            "--continue" => continue_latest = true,
             other => task.push(other.to_string()),
         }
+    }
+    if session_id.is_some() && continue_latest {
+        bail!("--session-id and --continue are mutually exclusive");
     }
 
     if check_auth {
@@ -256,6 +335,37 @@ async fn main() -> Result<()> {
     // --model wins over the auth file's model, which wins over the default.
     let model = model.or_else(|| auth.model.clone());
 
+    // Session resolution: `--session-id <id>` creates OR resumes (one flag
+    // mints and resumes, which is byte-identical behavior for termic's mint
+    // spawn and every later resume); `--continue` takes the newest session
+    // in this directory. The `session <id>` report goes out at startup in
+    // BOTH cases so termic binds the id actually in use. Notes go to stderr
+    // BEFORE the TUI viewport exists - stderr writes inside an active
+    // inline viewport corrupt its rows.
+    let mut session: Option<Session> = None;
+    let mut transcript: Vec<axcoding::ChatMessage> = Vec::new();
+    if let Some(id) = &session_id {
+        let s = Session::open(id)?;
+        if s.resumed {
+            transcript = s.transcript()?;
+            eprintln!("(resumed session {id}, {} messages)", transcript.len());
+        }
+        osc::emit(&osc::session_body(id));
+        session = Some(s);
+    } else if continue_latest {
+        match Session::latest()? {
+            Some(s) => {
+                transcript = s.transcript()?;
+                eprintln!("(resumed session {}, {} messages)", s.id, transcript.len());
+                osc::emit(&osc::session_body(&s.id));
+                session = Some(s);
+            }
+            None => {
+                eprintln!("(no previous session in this directory; starting fresh)");
+            }
+        }
+    }
+
     let mode = if task.is_empty() {
         let tty = std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -282,7 +392,7 @@ async fn main() -> Result<()> {
             let llm = Arc::new(RigLlm::new(client.completion_model(
                 model.as_deref().unwrap_or(anthropic::completion::CLAUDE_SONNET_4_6),
             )));
-            run(llm, mode, max_turns).await
+            run(llm, mode, max_turns, session, transcript).await
         }
         Provider::OpenAi => {
             let mut b = openai::Client::builder().api_key(auth.key.clone());
@@ -292,16 +402,23 @@ async fn main() -> Result<()> {
             let client = b.build()?;
             let llm = Arc::new(RigLlm::new(client
                 .completion_model(model.as_deref().unwrap_or(openai::completion::GPT_5_6))));
-            run(llm, mode, max_turns).await
+            run(llm, mode, max_turns, session, transcript).await
         }
     }
 }
 
-async fn run<L: Llm>(llm: Arc<L>, mode: Mode, max_turns: u32) -> Result<()> {
+async fn run<L: Llm>(
+    llm: Arc<L>,
+    mode: Mode,
+    max_turns: u32,
+    session: Option<Session>,
+    transcript: Vec<axcoding::ChatMessage>,
+) -> Result<()> {
     match mode {
         Mode::Run(task) => {
-            let mut transcript = Vec::new();
-            drive_turn(
+            let mut transcript = transcript;
+            turn_begin();
+            let r = drive_turn(
                 &llm,
                 SYSTEM,
                 &axcoding::tools::tool_specs(),
@@ -310,9 +427,18 @@ async fn run<L: Llm>(llm: Arc<L>, mode: Mode, max_turns: u32) -> Result<()> {
                 max_turns,
                 plain_sink,
             )
-            .await
+            .await;
+            // The one-shot path PROPAGATES a save failure: its exit code
+            // feeds termic's run-tab failed pill, and there is no loop to
+            // keep alive.
+            turn_settle(&session, &transcript)?;
+            r
         }
-        Mode::Interactive { tui: true } => interactive_tui(llm, max_turns).await,
-        Mode::Interactive { tui: false } => interactive_plain(llm, max_turns).await,
+        Mode::Interactive { tui: true } => {
+            interactive_tui(llm, max_turns, session, transcript).await
+        }
+        Mode::Interactive { tui: false } => {
+            interactive_plain(llm, max_turns, session, transcript).await
+        }
     }
 }

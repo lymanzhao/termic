@@ -61,7 +61,10 @@ a body that says which signal it is (`lib/agentHooks.ts`):
 
 Only the first five touch the state machine. An agent with no hooks falls back
 to its title, OSC 9 and quiet heuristics, which is the same machine with worse
-inputs; see agent-hooks.md "Why not read the terminal".
+inputs; see agent-hooks.md "Why not read the terminal". axcoding is the one agent
+that reports over this channel with nothing installed: its binary emits the same
+bodies natively (`axcoding/src/osc.rs`), so it rides the exact-match routing
+instead of the fallbacks.
 
 ## Delegated work: the three verdicts
 

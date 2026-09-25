@@ -10,14 +10,16 @@
 pub mod auth;
 pub mod llm_fake;
 pub mod llm_rig;
+pub mod osc;
 pub mod session;
+pub mod sessions;
 pub mod tools;
 pub mod tui;
 
 use std::future::Future;
 
 /// One tool invocation as the model produced it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -36,7 +38,7 @@ pub enum Role {
 /// Minimal append-only transcript entry. Deliberately dumber than rig's
 /// message model: the loop lives in `bin/axcoding_agent.rs`, so it only
 /// needs this.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default, skip_serializing_if = "String::is_empty")]

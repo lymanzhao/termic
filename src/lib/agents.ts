@@ -190,15 +190,19 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
   },
   axcoding: {
     // Must mirror the Rust default_agents() entry (agents.test.ts keeps the
-    // two in step): no approval mechanism, no session persistence in v0,
-    // env-var-only auth.
+    // two in step): no approval mechanism, env-var-first auth, and pi-shape
+    // sessions - the binary's `--session-id` creates-or-resumes (one flag
+    // mints AND resumes, so both lists are identical on purpose), and
+    // `--continue` resumes the newest session in the cwd. Work state rides
+    // on NATIVE trusted OSC 777 emitted by the binary itself, so no signal
+    // patterns exist to put in the fallback tables.
     command: "axcoding-agent", args: [],
     capabilities: {
       yolo_args: [],
       runtime_yolo_command: "",
-      resume_args: [],
-      session_id_args: [],
-      resume_id_args: [],
+      resume_args: ["--continue"],
+      session_id_args: ["--session-id", "{UUID}"],
+      resume_id_args: ["--session-id", "{UUID}"],
       name_args: [],
     },
   },
@@ -486,8 +490,11 @@ export const BUILTIN_TITLE_SIGNALS: Record<string, Required<SignalPatterns>> = {
   opencode: { attention: [], busy: [], idle: [], pending: [] },
   pi: { attention: [], busy: [], idle: [], pending: [] },
   devin: { attention: [], busy: [], idle: [], pending: [] },
-  // axcoding never emits OSC 0 at all (by construction - the binary sets no
-  // titles and writes plain text), so there is nothing to capture.
+  // axcoding still never emits OSC 0 (the binary sets no titles), so there is
+  // nothing to capture here - but it is not hookless anymore: it emits the
+  // trusted OSC 777 bodies (`agent working` / `agent done` /
+  // `agent ready for input` / `session <id>`) natively, which TerminalPane
+  // routes without any per-agent patterns. Empty lists, different reason.
   axcoding: { attention: [], busy: [], idle: [], pending: [] },
 };
 

@@ -28,6 +28,28 @@ Auth resolves in order: env ANTHROPIC_API_KEY, env ANTHROPIC_AUTH_TOKEN (relay t
 
 Interactive mode (no task argument) runs an inline TUI when stdin+stdout are a terminal: streaming output, one session across lines (follow-up questions share context), `/clear` resets the session, Ctrl-D exits, Ctrl-C cancels the in-flight task. Under a PTY host (termic) it just works; finished content flows into scrollback. Non-tty (pipes, scripts) or `--no-tui` / `AXCODING_NO_TUI=1` falls back to the plain one-task-per-line loop. `--max-turns` caps a task's model calls (default 50); `AXCODING_MAX_TOKENS` overrides the output budget (default 8192).
 
+## Sessions
+
+`--session-id <id>` persists the conversation as JSONL at
+`~/.axcoding/sessions/<id>.jsonl` (`AXCODING_HOME` relocates the root). One
+flag covers both directions, pi-style: a missing id creates the file (lazily,
+on the first task), a known id resumes it. `--continue` resumes the newest
+session recorded in the CURRENT directory; nothing matches and the run starts
+fresh, never an error. Without either flag the session is ephemeral, as
+before. Files are rewritten atomically after every settled turn, so a Ctrl-C
+cancel (which rewinds the in-memory transcript) can never leave the file
+diverged. `/clear` empties memory; the file rewrites to match on the next
+task.
+
+## Work-state signals (termic)
+
+When stdout is a terminal the binary emits termic's trusted OSC 777 sequence
+(`ESC ]777;notify;termic;<body> BEL`, `axcoding/src/osc.rs`): `session <id>`
+and `agent ready for input` at startup, `agent working` when a task starts,
+`agent done` when it settles (failed and cancelled turns included). termic
+routes these by exact body with no per-agent config; into a pipe they are
+never written.
+
 ## Run
 
 ```sh
@@ -57,6 +79,8 @@ src/lib.rs        shared types, Llm trait (the seam)
 src/llm_fake.rs   scripted backend (tests)
 src/llm_rig.rs    rig-core 0.42 adapter
 src/session.rs    drive_turn: the explicit tool loop
+src/sessions.rs   persisted session files (JSONL, atomic rewrite)
+src/osc.rs        native OSC 777 work-state emission
 src/tools.rs      the four tool specs + execution
 src/tui.rs        inline-TUI session plumbing (Viewport::Inline)
 src/auth.rs       env -> auth.json credential resolution

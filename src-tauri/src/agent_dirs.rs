@@ -230,9 +230,9 @@ pub fn login_store(base_id: &str) -> Option<LoginStore> {
         // then falls back to `$AXCODING_HOME/auth.json` (default
         // `~/.axcoding/`, written by `axcoding-agent auth import` from the
         // provider config switchers like cc-switch persist into Claude
-        // Code's settings.json). The binary honors AXCODING_HOME for BOTH
-        // the auth file and the playbook dir, so relocating the var
-        // relocates the whole login. Measured by construction - we wrote
+        // Code's settings.json). The binary honors AXCODING_HOME for the
+        // auth file and the sessions dir (axcoding/src/sessions.rs), so
+        // relocating the var relocates the whole login. Measured by construction - we wrote
         // the resolver (axcoding/src/auth.rs) - and enforced going forward
         // by the probe row in scripts/login-probe.mjs, which points the var
         // at an empty dir and requires a signed-out answer. Unlike the
@@ -506,11 +506,12 @@ pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
         // `.local/bin`), so unlike grok these are safe to mount over in
         // Docker — see assets/Dockerfile.default.
         "muse" => &[".config/muse", ".local/share/muse"],
-        // axcoding (this repo's own agent): the only HOME state is the
-        // auth file `axcoding-agent auth import` writes
-        // (`$HOME/.axcoding/auth.json`). Auth resolves env-first, so this
-        // is state rather than login - but it is real WRITE state, which
-        // is exactly what a cage or a Docker mount must not silently deny.
+        // axcoding (this repo's own agent): HOME state is the auth file
+        // `axcoding-agent auth import` writes (`$HOME/.axcoding/auth.json`)
+        // plus `sessions/`, which every turn rewrites
+        // (axcoding/src/sessions.rs). Auth resolves env-first, so this is
+        // state rather than login - but it is real WRITE state, which is
+        // exactly what a cage or a Docker mount must not silently deny.
         "axcoding" => &[".axcoding"],
         // grok: binary, bundled skills, and config all live under `.grok`
         // with no clean relocation env. Listed here for Seatbelt (which
