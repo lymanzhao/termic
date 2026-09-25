@@ -35,7 +35,8 @@ export function watchedBadgedTab(s: AppState): string {
   // badges, and a tab can hold either without the other (a keystroke clears
   // unread and leaves the dot).
   const t = tabs.find(t =>
-    (t.unread || (t.type === "terminal" && t.workState === "done") || (t.type === "scratch" && t.unseen))
+    (t.unread || (t.type === "terminal" && (t.workState === "done" || !!t.delegatedWork?.partial))
+      || (t.type === "scratch" && t.unseen))
     && isTabOnScreenIn(s, taskId, t.id));
   return t ? `${taskId}:${t.id}` : "";
 }
@@ -75,6 +76,11 @@ export function useSeenWhenWatched() {
     const tab = (app.tabs[taskId] ?? []).find(t => t.id === tabId);
     if (tab?.type === "terminal" && tab.workState === "done") {
       app.setWorkState(taskId, tabId, "idle", "seen: on screen in a focused window");
+    }
+    // Partially done: the news that some delegated work came back is read
+    // now. The delegated state itself stays, since the rest still runs.
+    if (tab?.type === "terminal" && tab.delegatedWork?.partial) {
+      app.patchTab(taskId, tabId, { delegatedWork: { ...tab.delegatedWork, partial: false } });
     }
     // A pad an agent wrote while you were away: on screen now, so seen.
     if (tab?.type === "scratch" && tab.unseen) app.patchTab(taskId, tabId, { unseen: false });

@@ -445,7 +445,9 @@ only). If it is mid-turn and \
 supports work-done detection, the prompt QUEUES and delivers when the turn \
 finishes, EXCEPT while the agent is stalled on work it delegated (subagents \
 or shells still running, its own loop stopped): then it is typed at once, so \
-a report back reaches an orchestrator that is waiting on it. An agent with \
+a report back reaches an orchestrator that is waiting on it. It also QUEUES \
+while the user has an unsent draft typed into that agent, so it never lands \
+in the middle of their text; it goes once they send or clear it. An agent with \
 detection disabled gets it typed immediately (with a warning: completion \
 cannot be observed, and --wait refuses such agents). \
 With no agent running, --resume restores the last session and --fresh starts \

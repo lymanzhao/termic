@@ -110,6 +110,18 @@ describe("send --tab: explicit target (GH #138 part 2)", () => {
     expect(deliverMessage).toHaveBeenCalledWith("pty-2", "run tests");
   });
 
+  it("queues on an IDLE agent while the user has a draft in its prompt", async () => {
+    // Typing now would land inside the user's unsubmitted text, and Enter
+    // would send both as one message.
+    seed([
+      term(),
+      term({ id: "t-second", cli: "codex", is_default: false, ptyId: "pty-2", composing: true }),
+    ]);
+    const r = await send({ tabId: "t-second" });
+    expect(r.mode).toBe("queued");
+    expect(deliverMessage).not.toHaveBeenCalled();
+  });
+
   it("still queues on a delegated agent that has gone back to work", async () => {
     // delegatedWork alone stays on the tab while the model works again; only
     // the idle mark says the loop has stopped.

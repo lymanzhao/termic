@@ -544,8 +544,11 @@ async function deliverOrQueue(
   if (!ptyId) throw new Error("the agent tab lost its PTY before the prompt could be typed");
   // An agent stalled on delegated work (its own loop stopped, subagents or
   // shells still running) takes the prompt now rather than queueing it.
-  const busy = capable
-    && ((tab.workState === "working" && !tab.delegatedIdle) || (tab.queue?.length ?? 0) > 0);
+  // And whatever the agent is doing: a user mid-draft in its prompt. Typing
+  // now would land inside their unsubmitted text and Enter would send both
+  // as one message, so the prompt queues and follows their draft instead.
+  const busy = !!tab.composing || (capable
+    && ((tab.workState === "working" && !tab.delegatedIdle) || (tab.queue?.length ?? 0) > 0));
   if (busy) {
     useApp.getState().enqueueAgentMessage(p.taskId, tab.id, p.prompt, 1, p.promptId);
     return { mode: "queued", capable };

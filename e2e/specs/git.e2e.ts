@@ -4,6 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import { archiveTask, clickByText, clickMenuItem, clickWhenVisible, createWorktreeTask, dismissOverlays, ensureActiveTask, openRightTab, flushEditorMeasure, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitGone, waitVisible } from "../helpers";
 
+/** `execSync` for git against the shared fixture, retrying a moment on
+ *  `index.lock`. The app runs its own git on this repo (the Git panel's status
+ *  refresh), so a spec's `git commit` can land in the few milliseconds that
+ *  process holds the index lock and fail with "File exists". It did, twice in
+ *  one day's full runs, and passed on its own every time. Any other failure
+ *  throws at once. */
+function execGit(cmd: string, opts?: Parameters<typeof execSync>[1]): Buffer {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return execSync(cmd, opts) as Buffer;
+    } catch (e: any) {
+      const msg = `${e?.message ?? ""}${e?.stderr ?? ""}`;
+      if (attempt >= 40 || !msg.includes("index.lock")) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+}
+
 // Git integration is central to termic (every task is a worktree/checkout).
 // This guards the Git panel: switching to it shows the working-tree status.
 // The seeded fixture-repo has a single commit and no edits, so the state is
@@ -598,7 +616,7 @@ describe("git history tab", () => {
   const probe = `history-probe-${stamp}.txt`;
   /** The fixture's own branch, read rather than assumed: the picker lists it
    *  by name and `main` vs `master` depends on the seeding git's defaults. */
-  const BRANCH = execSync(`git -C "${fixture}" branch --show-current`).toString().trim();
+  const BRANCH = execGit(`git -C "${fixture}" branch --show-current`).toString().trim();
 
   after(async () => {
     if (taskId) await archiveTask(taskId);
@@ -607,8 +625,8 @@ describe("git history tab", () => {
     try {
       // Only ours: a reset that fired blind would throw away whatever the
       // fixture legitimately holds if this spec never got as far as committing.
-      const head = execSync(`git -C "${fixture}" log -1 --pretty=%s`).toString().trim();
-      if (head === subject) execSync(`git -C "${fixture}" reset --hard HEAD~1`, { stdio: "ignore" });
+      const head = execGit(`git -C "${fixture}" log -1 --pretty=%s`).toString().trim();
+      if (head === subject) execGit(`git -C "${fixture}" reset --hard HEAD~1`, { stdio: "ignore" });
     } catch { /* the commit never landed */ }
   });
 
@@ -661,8 +679,8 @@ describe("git history tab", () => {
     // A commit made OUTSIDE the app: the tab must read the repo, not some
     // in-app cache of what termic itself committed.
     writeFileSync(path.join(fixture, probe), "probe\n");
-    execSync(`git -C "${fixture}" add "${probe}"`);
-    execSync(`git -C "${fixture}" commit -q -m "${subject}"`);
+    execGit(`git -C "${fixture}" add "${probe}"`);
+    execGit(`git -C "${fixture}" commit -q -m "${subject}"`);
 
     await openGraph();
 
@@ -934,8 +952,8 @@ describe("git compare mode", () => {
   const committedBody = `committed ${stamp}\n`;
 
   before(() => {
-    headSha = execSync(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
-    execSync(`git -C "${fixture}" branch -f ${baseBranch} ${headSha}`);
+    headSha = execGit(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
+    execGit(`git -C "${fixture}" branch -f ${baseBranch} ${headSha}`);
   });
   after(async () => {
     // The Git tab's sub-tab is persisted, so leaving it on Compare would hand
@@ -945,10 +963,10 @@ describe("git compare mode", () => {
     // This spec COMMITS to the shared fixture checkout, so it has to put the
     // repo back exactly as it found it — the specs after this one assert on a
     // clean tree and would fail on the leftovers.
-    execSync(`git -C "${fixture}" reset --hard ${headSha}`);
-    execSync(`git -C "${fixture}" clean -fd`);
+    execGit(`git -C "${fixture}" reset --hard ${headSha}`);
+    execGit(`git -C "${fixture}" clean -fd`);
     try {
-      execSync(`git -C "${fixture}" branch -D ${baseBranch}`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" branch -D ${baseBranch}`, { stdio: "ignore" });
     } catch { /* never created */ }
   });
 
@@ -1003,8 +1021,8 @@ describe("git compare mode", () => {
     // tab's tree/list/combined mode through the same flattenRows.
     mkdirSync(path.join(fixture, "cmp-nested", "deep"), { recursive: true });
     writeFileSync(path.join(fixture, "cmp-nested", "deep", "buried.txt"), "buried\n");
-    execSync(`git -C "${fixture}" add committed.txt cmp-nested`);
-    execSync(`git -C "${fixture}" commit -q -m "e2e compare probe ${stamp}"`);
+    execGit(`git -C "${fixture}" add committed.txt cmp-nested`);
+    execGit(`git -C "${fixture}" commit -q -m "e2e compare probe ${stamp}"`);
     writeFileSync(path.join(fixture, "README.md"), `# edited by the compare spec ${stamp}\n`);
     writeFileSync(path.join(fixture, "compare-untracked.txt"), "untracked\n");
 
@@ -1196,7 +1214,7 @@ describe("image diff", () => {
     // Tasks open the repo ROOT (taskOpenRepo), so these cases dirty the shared
     // fixture in place — restore both files or the commit spec below sees a
     // tree that never goes clean.
-    execSync(`git -C "${fixture}" checkout -- shot.png README.md`);
+    execGit(`git -C "${fixture}" checkout -- shot.png README.md`);
   });
 
   const diffPaneText = () =>
@@ -1339,12 +1357,12 @@ describe("git stage & commit", () => {
   let headSha = "";
 
   before(() => {
-    headSha = execSync(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
+    headSha = execGit(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
   });
   after(async () => {
     if (taskId) await archiveTask(taskId);
-    execSync(`git -C "${fixture}" reset --hard ${headSha}`);
-    execSync(`git -C "${fixture}" clean -fd`);
+    execGit(`git -C "${fixture}" reset --hard ${headSha}`);
+    execGit(`git -C "${fixture}" clean -fd`);
   });
 
   const status = () =>
@@ -1426,24 +1444,24 @@ describe("git commit & push", () => {
   let bare = "";
 
   before(() => {
-    headSha = execSync(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
+    headSha = execGit(`git -C "${fixture}" rev-parse HEAD`).toString().trim();
     bare = mkdtempSync(path.join(os.tmpdir(), "e2e-bare-"));
     execSync(`git init --bare -q "${bare}"`);
     try {
-      execSync(`git -C "${fixture}" remote remove origin`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" remote remove origin`, { stdio: "ignore" });
     } catch {
       /* none */
     }
-    execSync(`git -C "${fixture}" remote add origin "${bare}"`);
+    execGit(`git -C "${fixture}" remote add origin "${bare}"`);
   });
   after(async () => {
     if (taskId) await archiveTask(taskId);
     try {
-      execSync(`git -C "${fixture}" branch --unset-upstream`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" branch --unset-upstream`, { stdio: "ignore" });
     } catch {
       /* no upstream */
     }
-    execSync(`git -C "${fixture}" reset --hard ${headSha}`);
+    execGit(`git -C "${fixture}" reset --hard ${headSha}`);
     // Restore the fixture's SEEDED origin (the sibling bare repo the seed set
     // up), not just drop the throwaway one: later specs (the agent-race test)
     // create worktrees off the project default base `origin/main`, so that ref
@@ -1451,22 +1469,22 @@ describe("git commit & push", () => {
     // "not a valid object name: origin/main". Idempotent + best-effort.
     const seedOrigin = `${fixture}-origin.git`;
     try {
-      execSync(`git -C "${fixture}" remote remove origin`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" remote remove origin`, { stdio: "ignore" });
     } catch {
       /* none */
     }
     if (existsSync(seedOrigin)) {
-      execSync(`git -C "${fixture}" remote add origin "${seedOrigin}"`);
-      execSync(`git -C "${fixture}" fetch -q origin`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" remote add origin "${seedOrigin}"`);
+      execGit(`git -C "${fixture}" fetch -q origin`, { stdio: "ignore" });
       try {
-        execSync(`git -C "${fixture}" branch --set-upstream-to=origin/main main`, {
+        execGit(`git -C "${fixture}" branch --set-upstream-to=origin/main main`, {
           stdio: "ignore",
         });
       } catch {
         /* upstream already set */
       }
     }
-    execSync(`git -C "${fixture}" clean -fd`);
+    execGit(`git -C "${fixture}" clean -fd`);
     rmSync(bare, { recursive: true, force: true });
   });
 
@@ -1936,17 +1954,17 @@ describe("git branch bar layout", () => {
   const longBranch = "feature/title-authoring-model";
 
   before(() => {
-    original = execSync(`git -C "${fixture}" rev-parse --abbrev-ref HEAD`).toString().trim();
+    original = execGit(`git -C "${fixture}" rev-parse --abbrev-ref HEAD`).toString().trim();
     // -B, not -b: a crashed earlier run can leave the branch behind.
-    execSync(`git -C "${fixture}" checkout -q -B ${longBranch}`);
+    execGit(`git -C "${fixture}" checkout -q -B ${longBranch}`);
   });
 
   after(async () => {
     await selectGitView("commit").catch(() => {});
     if (taskId) await archiveTask(taskId);
-    execSync(`git -C "${fixture}" checkout -q ${original}`);
+    execGit(`git -C "${fixture}" checkout -q ${original}`);
     try {
-      execSync(`git -C "${fixture}" branch -D ${longBranch}`, { stdio: "ignore" });
+      execGit(`git -C "${fixture}" branch -D ${longBranch}`, { stdio: "ignore" });
     } catch { /* already gone */ }
   });
 

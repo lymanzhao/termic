@@ -1689,3 +1689,20 @@ describe("task group collapse", () => {
     expect(useApp.getState().collapsedTaskGroups.lead).toBe(false);
   });
 });
+
+
+// ── partial done is news, and looking at the tab reads it ─────────────
+
+describe("visiting a partially-done tab", () => {
+  it("drops the partial mark and keeps the delegated state", () => {
+    const work = { label: "subagent", count: 1, ids: ["a"], partial: true };
+    useApp.setState({
+      tabs: { ws1: [{ id: "t1", type: "terminal", title: "claude", cli: "claude", workState: "working", delegatedWork: work } as never] },
+      activeTab: {},
+    });
+    useApp.getState().setActiveTabId("ws1", "t1");
+    const t = useApp.getState().tabs.ws1[0] as { workState?: string; delegatedWork?: typeof work };
+    expect(t.delegatedWork).toEqual({ ...work, partial: false });
+    expect(t.workState).toBe("working"); // the rest is still running
+  });
+});

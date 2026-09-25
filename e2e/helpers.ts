@@ -926,6 +926,31 @@ export async function setHooksOwnState(cli: string, on: boolean): Promise<void> 
   }, cli, on);
 }
 
+/** Type into the agent's prompt WITHOUT submitting: the same xterm input
+ *  path as `submitToAgent`, minus the Enter, so TerminalPane sees a user
+ *  draft (control bytes such as Ctrl-U, "\x15", go through it too). */
+export async function typeIntoAgent(taskId: string, text: string): Promise<void> {
+  const result = await browser.execute(
+    (id, line) => {
+      const host = document.querySelector(`[data-task-id="${id}"]`);
+      if (!host) return "task view is not mounted";
+      const ta = [...host.querySelectorAll<HTMLTextAreaElement>(".xterm-helper-textarea")].find(
+        (el) => {
+          const r = (el.closest(".xterm") ?? el).getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        },
+      );
+      if (!ta) return "no visible terminal in the task view";
+      ta.focus();
+      ta.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: line, bubbles: true }));
+      return "ok";
+    },
+    taskId,
+    text,
+  );
+  if (result !== "ok") throw new Error(`typeIntoAgent: ${result}`);
+}
+
 export async function submitToAgent(taskId: string, text: string): Promise<void> {
   // What `lastInputAt` was before this submit. TerminalPane stamps it from
   // xterm's `onData` for a CR, so it advancing is PROOF the keystrokes went

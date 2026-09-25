@@ -21,6 +21,7 @@ import {
   clickWhenVisible,
   waitVisible,
   cliRpc,
+  typeIntoAgent,
   ensureActiveTask,
   openTask,
   queuedCount,
@@ -2971,8 +2972,23 @@ describe("delegated work", () => {
     });
     await snap("agent-delegated-partial.png");
 
-    // The second lands. Still partial, still no bell.
+    // Looking at the tab reads the "some came back" news: the partial mark
+    // goes, the rest is still running, so it stays delegated (the ring).
+    await browser.execute((id) => {
+      const s = window.__termic!.useApp.getState();
+      s.setActiveTabId(id, s.tabs[id][0].id);
+    }, taskId);
+    await browser.waitUntil(async () => (await taskViewBadge(taskId)) !== "partial", {
+      timeout: 5_000, timeoutMsg: "visiting the tab did not clear the partial mark",
+    });
+    expect(await delegatedLabel(taskId)).toBe("subagent");
+
+    // The second lands: new news after the visit, so the partial mark comes
+    // BACK (the delegated ring in between was the read state). Still no bell.
     await submitToAgent(taskId, "#delegated 1 subagent q3");
+    await browser.waitUntil(async () => (await taskViewBadge(taskId)) === "partial", {
+      timeout: 20_000, timeoutMsg: `the next subagent back did not re-mark partial (saw ${await taskViewBadge(taskId)})`,
+    });
     await browser.pause(1_500);
     if ((await workBadges(taskId)).includes("done")) {
       throw new Error("rang done with one subagent still running, which is the bug");
@@ -3095,5 +3111,64 @@ describe("delegated work", () => {
         + ` label=${await delegatedLabel(taskId)} store=${JSON.stringify(state)}`,
       );
     }
+  });
+});
+
+// A message from another agent (or the message queue) must never be typed
+// into the user's unsubmitted draft: it landed mid-sentence and the Enter
+// that followed submitted both halves as one prompt. While the user has a
+// draft, the message queues and follows their draft instead.
+describe("agent messages wait for your draft", () => {
+  let taskId!: string;
+  const NAME = "e2e-draft-guard";
+  const logs = async () => String((await cliRpc({ cmd: "logs", task: NAME })).data?.data ?? "");
+  const echoed = async (text: string) => (await logs()).includes(`FAKE-AGENT echo: ${text}\r`);
+
+  before(async function () {
+    this.timeout(90_000);
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask(NAME);
+    await waitForAgentReady(taskId);
+  });
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("queues a report while you type, and sends it after your own message", async function () {
+    this.timeout(90_000);
+    await typeIntoAgent(taskId, "half typed");
+    await browser.waitUntil(() => browser.execute(
+      (id) => !!window.__termic!.useApp.getState().tabs[id][0].composing, taskId), {
+      timeout: 5_000, timeoutMsg: "the draft was never noticed",
+    });
+    const r = await cliRpc({ cmd: "send", task: NAME, prompt: "report-from-peer" });
+    expect(r.ok).toBe(true);
+    expect(r.data.mode).toBe("queued");
+    expect(await queuedCount(taskId)).toBe(1);
+
+    // Enter submits YOUR words alone...
+    await submitToAgent(taskId, "");
+    await browser.waitUntil(() => echoed("half typed"), {
+      timeout: 20_000, timeoutMsg: "the draft was not submitted on its own",
+    });
+    expect(await logs()).not.toContain("half typedreport-from-peer");
+    // ...and the report follows as its own message once that turn ends.
+    await browser.waitUntil(async () => (await queuedCount(taskId)) === 0 && (await echoed("report-from-peer")), {
+      timeout: 30_000, timeoutMsg: "the held report never went after the user's turn",
+    });
+  });
+
+  it("sends the held report as soon as you clear your draft instead", async function () {
+    this.timeout(90_000);
+    await typeIntoAgent(taskId, "never mind");
+    const r = await cliRpc({ cmd: "send", task: NAME, prompt: "second-report" });
+    expect(r.data.mode).toBe("queued");
+    // Ctrl-U clears the line: the prompt is empty, so the report goes now.
+    await typeIntoAgent(taskId, "\x15");
+    await browser.waitUntil(async () => (await queuedCount(taskId)) === 0 && (await echoed("second-report")), {
+      timeout: 30_000, timeoutMsg: "the held report did not go when the draft was cleared",
+    });
+    expect(await logs()).not.toContain("never mindsecond-report");
   });
 });

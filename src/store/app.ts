@@ -2344,6 +2344,10 @@ export const useApp = create<AppState>((set, get) => ({
       if (t.type === "terminal") {
         const patch: Partial<TerminalTab> = {};
         if (t.unread) patch.unread = null;
+        // "Some of the delegated work came back" is news, and looking at the
+        // tab is reading it: drop the partial mark and keep the plain
+        // delegated ring, which still says the rest is running.
+        if (t.delegatedWork?.partial) patch.delegatedWork = { ...t.delegatedWork, partial: false };
         if (t.workState === "done"
             || (t.workState === "working" && visitMayClearWorking(s.agentHooksInstalled, t.cli))) {
           patch.workState = "idle";

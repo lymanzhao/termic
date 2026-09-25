@@ -504,6 +504,40 @@ const captureArmedRef = useRef(false);
   // a focused tab's "done" to "idle", so we can't watch workState for this).
   const sendNextQueuedRef = useRef<((force?: boolean) => boolean) | null>(null);
 
+  // ── The user's unsubmitted draft ──
+  // Anything typed into the prompt while the user has a draft there lands in
+  // the middle of it, and the Enter that follows submits both halves as one
+  // message. So we follow the draft from the user's own keystrokes and hold
+  // every automatic send while one exists (see `composing` on TerminalTab).
+  // A rough character count is enough: it only has to tell "something is
+  // there" from "the prompt is empty". Shift+Enter bypasses onData (it is
+  // written straight to the PTY), so a multi-line draft stays a draft.
+  const draftLenRef = useRef(0);
+  const trackDraft = useCallback((data: string) => {
+    let n = draftLenRef.current;
+    if (/[\r\n]/.test(data) || data === "\x03" || data === "\x15") {
+      n = 0; // submitted (Enter), or cleared (Ctrl-C, Ctrl-U)
+    } else if (data.startsWith("\x1b[200~")) {
+      n += Math.max(1, data.length - 12); // a bracketed paste into the prompt
+    } else if (data === "\x1b[A" || data === "\x1bOA") {
+      // Up arrow: history recall puts an old prompt in the input without a
+      // single typed character. Treat it as a draft; Enter or a clear ends it.
+      n = Math.max(n, 1);
+    } else if (data.startsWith("\x1b")) {
+      return; // arrows, Escape, and xterm's own replies (cursor reports)
+    } else {
+      for (const ch of data) {
+        if (ch === "\x7f" || ch === "\b") n = Math.max(0, n - 1);
+        else if (ch >= " ") n += 1;
+      }
+    }
+    draftLenRef.current = n;
+    const composing = n > 0;
+    const cur = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
+    // Written only when it flips: this runs on every keystroke (bear trap 8).
+    if (!!cur?.composing !== composing) patchTab(task.id, tab.id, { composing });
+  }, [task.id, tab.id]);
+
   // Single funnel for every "work done" transition. Enforces one-done-per-
   // submit (blocks oscillation / late-OSC re-fires) and suppresses the
   // sidebar bell + OS notification when the user is actively looking at
@@ -728,6 +762,14 @@ const captureArmedRef = useRef(false);
     if (!ptyId) return false;
     const cur = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
     if (!cur || cur.type !== "terminal") return false;
+    // Never type into the user's unsubmitted draft. The queue resumes when
+    // the draft ends: Enter starts their turn and its done drains us after,
+    // and a draft cleared on an idle agent wakes the kick effect below.
+    // "Send now" (force) is the user asking for exactly this, so it goes.
+    if (cur.composing && !force) {
+      debugLogRef.current?.("queue-held", "user is typing a draft");
+      return false;
+    }
     const q = cur.queue ?? [];
     // A scheduled item (GH #300) is eligible once due whether or not the
     // queue is active; a future one is skipped so ordinary items still drain.
@@ -844,6 +886,9 @@ const captureArmedRef = useRef(false);
   // adding a message to an idle agent with an already-active queue still fires.
   const queueActive = tab.type === "terminal" ? tab.queueActive : undefined;
   const queueKick = tab.type === "terminal" ? tab.queueKick : undefined;
+  // A draft ending on an idle agent is a kick too: whatever was held while
+  // the user typed can go now.
+  const composing = tab.type === "terminal" ? !!tab.composing : false;
   //
   // A due scheduled item (GH #300) wakes it too, without an active queue.
   // `tabPtyLive` is in the deps for exactly that: reopening a chat whose item
@@ -852,8 +897,9 @@ const captureArmedRef = useRef(false);
     const cur = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
     if (!queueActive && !hasDueScheduled(cur?.queue, Date.now())) return;
     if (cur?.workState === "working") return;
+    if (cur?.composing) return;
     sendNextQueuedRef.current?.();
-  }, [queueActive, queueKick, tabPtyLive, task.id, tab.id]);
+  }, [queueActive, queueKick, tabPtyLive, composing, task.id, tab.id]);
 
   // "Send now": drain the head immediately on a queueForceKick bump, WITHOUT
   // the mid-turn guard above — the user explicitly asked to advance now.
@@ -3074,6 +3120,7 @@ const captureArmedRef = useRef(false);
           // `\x1b[<row>;<col>R` and also begins with ESC. Matching the whole
           // payload keeps those out. Alt-chords arrive as `\x1b` PLUS the
           // character in one call, so they are excluded too.
+          trackDraft(data);
           if (data === "\x1b" || data === "\x03") {
             escAtRef.current = Date.now();
             wdlog(`${data === "\x03" ? "Ctrl-C" : "ESC"} pressed; the title or a quiet terminal may end this turn briefly`);

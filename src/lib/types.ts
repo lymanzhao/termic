@@ -1388,6 +1388,14 @@ export interface TerminalTab extends BaseTab {
    *  making it resume). Not the same as `delegatedWork`, which stays on the
    *  tab while the model works. Session-only. */
   delegatedIdle?: boolean;
+  /** The user has text typed into the agent's input that they have not
+   *  submitted. Nothing may be typed into the prompt meanwhile, or it lands
+   *  in the middle of their draft and Enter submits both: the message queue
+   *  holds its next send, and another agent's message (`termic send`, MCP
+   *  task_send) queues instead of being typed. Tracked from the user's own
+   *  keystrokes in TerminalPane (Enter, Ctrl-C / Ctrl-U or backspacing to
+   *  nothing ends it); written only when it flips. Session-only. */
+  composing?: boolean;
   /** Set while a library prompt (target "new-agent") is waiting for this
    *  freshly spawned agent to come up before its prompt is injected. Drives
    *  the "starting agent" loader overlay in TerminalPane; cleared once the

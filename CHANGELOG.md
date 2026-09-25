@@ -4,7 +4,7 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.8.1] - 2026-09-24
+## [1.8.3] - 2026-09-25
 
 Tasks your agents start now group together in the sidebar.
 
@@ -60,6 +60,18 @@ Tasks your agents start now group together in the sidebar.
   the receiving agent's queue while that agent was only waiting on
   subagents or shells it had started, so an orchestrator did not hear from
   its workers until all of its work was done. It is now delivered at once.
+- A message from another agent, or from the message queue, arriving while
+  you were typing into that agent landed in the middle of your text, and the
+  next Enter sent both as one prompt. Nothing is typed into a draft now: the
+  message waits until you send or clear yours.
+- A `files to copy` pattern with `**` or several wildcards (such as
+  `**/.env*`) now copies nested files, keeping their paths. Thanks to
+  [@adamatan](https://github.com/adamatan).
+  ([#320](https://github.com/simion/termic/issues/320))
+- A window restored at a size larger than the screen now fits on it.
+- The partially-done mark stayed on a tab after you had looked at it. Looking
+  now clears it, and the tab shows the delegated ring until the next piece
+  of background work reports back.
 
 ## [1.7.0] - 2026-09-22
 

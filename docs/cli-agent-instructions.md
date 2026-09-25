@@ -184,8 +184,9 @@ task you run in (the headers helper sends your `$TERMIC_TASK_ID`).
 ### Driving an existing task
 
 - `"$TERMIC_CLI" send <task> -p "<text>"` - prompt the RUNNING
-  agent (queues if it is mid-turn, but is typed at once while it only
-  waits on subagents or shells it started). With no agent running, add
+  agent (queues if it is mid-turn or the user is typing into it, but is
+  typed at once while it only waits on subagents or shells it started).
+  With no agent running, add
   `--resume` (restore the last session) or `--fresh` (new agent, no
   context). `-p -` reads stdin. This is the notification channel above:
   ask for a report back rather than adding `--wait`.
