@@ -5281,6 +5281,7 @@ dependencies = [
  "termic-proto",
  "toml_edit 0.25.11+spec-1.1.0",
  "uuid",
+ "windows-sys 0.60.2",
  "zip",
 ]
 
@@ -5294,6 +5295,7 @@ dependencies = [
  "serde",
  "serde_json",
  "termic-proto",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5302,6 +5304,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

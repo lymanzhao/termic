@@ -1713,12 +1713,20 @@ fn url_for(port: u16) -> String {
 /// which would let a credential outlive the port that vouched for it
 /// (see the mint-per-bind note in apply_enabled).
 fn token_from_file(dir: &Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(MCP_TOKEN_FILE);
     let meta = std::fs::metadata(&path).ok()?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return None;
+    // The 0600 check (group/other bits clear) is the Unix part of the
+    // token-file trust model. Windows files inherit the profile DACL,
+    // which already excludes other users; there is no bit to check.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = &meta;
     let token = std::fs::read_to_string(&path).ok()?;
     let token = token.trim().to_string();
     if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -3856,6 +3864,7 @@ command = \"/bin/true\"\n";
     /// the copy affordance only reads a file this server would have
     /// written, so a hand-made or loosened one is not handed out.
     #[test]
+    #[cfg(unix)]
     fn token_from_file_accepts_only_a_file_this_server_wrote() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

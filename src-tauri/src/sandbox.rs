@@ -2615,6 +2615,7 @@ mod tests {
     // ── builtin_runtime_paths ─────────────────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn the_login_store_allow_survives_the_control_plane_deny() {
         // ORDER, not presence. The control-plane deny covers the whole termic
         // data dir and is deliberately the FINAL filesystem rule, so an allow
@@ -2870,6 +2871,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn enforce_still_denies_network() {
         use crate::{Task, SandboxMode};
         let task = Task { cli: "claude".into(), ..Default::default() };
@@ -2893,6 +2895,7 @@ mod tests {
     // reachability is proven by running connect()/open() in the cage.
 
     use crate::{SandboxMode, Task};
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -2944,13 +2947,18 @@ mod tests {
         std::fs::write(&control_file, "readable proof").unwrap();
         // A live control-plane socket + an unrelated peer socket.
         let socket_path = data_dir.join(termic_proto::SOCKET_FILE);
+        #[cfg(unix)]
         let _sock = UnixListener::bind(&socket_path).unwrap();
         let control_socket = root.join("peer.sock");
+        #[cfg(unix)]
         let _peer = UnixListener::bind(&control_socket).unwrap();
         // Leak the listeners for the test's lifetime (dropping would unlink
         // the socket files). The TempDir cleans everything on drop.
-        std::mem::forget(_sock);
-        std::mem::forget(_peer);
+        #[cfg(unix)]
+        {
+            std::mem::forget(_sock);
+            std::mem::forget(_peer);
+        }
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
         Fixture {
             tmp,

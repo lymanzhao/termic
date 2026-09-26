@@ -76,16 +76,20 @@ function staticImports(code: string): string[] {
 }
 
 /** Every module statically reachable from `main.tsx`, plus the first path by
- *  which each was reached (so a failure names the chain, not just the file). */
+ *  which each was reached (so a failure names the chain, not just the file).
+ *  Map keys are normalized to forward slashes: Windows path.join produces
+ *  backslash keys, and the endsWith/startsWith assertions below are written
+ *  against POSIX-style specifiers. The queue keeps the raw path. */
 function walk(): Map<string, string[]> {
-  const seen = new Map<string, string[]>([[ENTRY, [ENTRY]]]);
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const seen = new Map<string, string[]>([[norm(ENTRY), [norm(ENTRY)]]]);
   const queue = [ENTRY];
   while (queue.length) {
     const file = queue.shift()!;
-    const trail = seen.get(file)!;
+    const trail = seen.get(norm(file))!;
     for (const spec of staticImports(readFileSync(file, "utf8"))) {
       const next = resolveLocal(spec, file);
-      const key = next ?? spec;
+      const key = norm(next ?? spec);
       if (seen.has(key)) continue;
       seen.set(key, [...trail, key]);
       if (next) queue.push(next);
@@ -94,8 +98,10 @@ function walk(): Map<string, string[]> {
   return seen;
 }
 
+const srcNorm = src.replace(/\\/g, "/");
+
 function rel(p: string) {
-  return p.startsWith(src) ? p.slice(src.length + 1) : p;
+  return p.startsWith(srcNorm) ? p.slice(srcNorm.length + 1) : p;
 }
 
 describe("main chunk", () => {

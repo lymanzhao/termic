@@ -31,12 +31,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use termic_proto::transport::{Listener, Stream};
 
 use tauri::{Emitter, Manager};
 use termic_proto as proto;
@@ -44,7 +44,9 @@ use termic_proto::{Command, ErrorCode, Reply, ReplyData, Request, StreamEvent, W
 
 use crate::{dlog, Project, Task};
 
-/// Darwin's sockaddr_un.sun_path is 104 bytes including the NUL.
+/// Darwin's sockaddr_un.sun_path is 104 bytes including the NUL. Unix
+/// only: named pipes have no path-length limit in this range.
+#[cfg(unix)]
 const MAX_SUN_PATH: usize = 103;
 
 /// `open` is user-visible feedback; give a busy webview a little longer.
@@ -175,7 +177,7 @@ pub fn raise_owner(deep_link: Option<&str>) -> bool {
 /// file left by a crash), ask it to raise its window (and take over any
 /// deep link we were launched with) and report true.
 fn raise_existing(sock: &Path, deep_link: Option<&str>) -> bool {
-    let Ok(stream) = UnixStream::connect(sock) else { return false };
+    let Ok(stream) = Stream::connect(sock) else { return false };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let Ok(mut writer) = stream.try_clone() else { return false };
@@ -216,6 +218,7 @@ fn server_main(app: tauri::AppHandle) {
         }
     };
     let sock = dir.join(proto::SOCKET_FILE);
+    #[cfg(unix)]
     if sock.as_os_str().as_bytes().len() > MAX_SUN_PATH {
         dlog(&format!(
             "[cli] socket path exceeds the {MAX_SUN_PATH}-byte unix limit, control socket disabled: {}",
@@ -224,21 +227,29 @@ fn server_main(app: tauri::AppHandle) {
         return;
     }
     // Stale socket from a previous boot (or a crashed instance): unlink
-    // before bind, the standard unix-daemon dance.
-    let _ = std::fs::remove_file(&sock);
-    let listener = match UnixListener::bind(&sock) {
+    // before bind, the standard unix-daemon dance. Windows needs no
+    // cleanup (pipe instances vanish with the owning process).
+    proto::transport::prepare_bind(&sock);
+    let listener = match Listener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
             dlog(&format!("[cli] bind {} failed: {e}", sock.display()));
             return;
         }
     };
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(&sock, {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(0o600)
     }) {
         dlog(&format!("[cli] chmod 0600 on {} failed: {e}", sock.display()));
         return;
+    }
+    #[cfg(windows)]
+    {
+        // The default pipe DACL already restricts the endpoint to
+        // creator-owner, SYSTEM and admins; there is no chmod to apply.
+        dlog(&format!("[cli] listening on pipe for {}", sock.display()));
     }
     // Write the token only AFTER the socket is bound, so at startup the two
     // appear together (we never advertise a token before a live socket).
@@ -259,7 +270,7 @@ fn server_main(app: tauri::AppHandle) {
 
 /// Accept loop, decomposed from `server_main` so integration tests can
 /// drive a real socket with a stub host.
-fn serve_listener(listener: UnixListener, host: Arc<dyn CliHost>) {
+fn serve_listener(listener: Listener, host: Arc<dyn CliHost>) {
     // A transient accept error (EMFILE when the app is fd-heavy with many
     // PTYs, ECONNABORTED, EINTR) must NOT kill the server thread: a dead
     // listener also silently breaks the release single-instance guard (a
@@ -289,10 +300,10 @@ fn serve_listener(listener: UnixListener, host: Arc<dyn CliHost>) {
     }
 }
 
-fn serve_conn(stream: UnixStream, host: Arc<dyn CliHost>) {
-    // Same-uid peer check BEFORE reading anything. Root is not exempted:
-    // there is no reason for another uid, root included, to be here.
-    if peer_uid(&stream) != Some(unsafe { libc::geteuid() }) {
+fn serve_conn(stream: Stream, host: Arc<dyn CliHost>) {
+    // Same-user peer check BEFORE reading anything. Root / admin is not
+    // exempted: there is no reason for another user to be here.
+    if !stream.peer_is_self_user() {
         return;
     }
     // A client that connects and never sends must not pin this thread.
@@ -420,8 +431,8 @@ fn run_attach_session(
     task_id: String,
     attachment: crate::PtyAttachment,
     host: Arc<dyn CliHost>,
-    reader: BufReader<UnixStream>,
-    mut writer: UnixStream,
+    reader: BufReader<Stream>,
+    mut writer: Stream,
 ) {
     // Both directions can be legitimately silent for minutes; EOF is
     // the liveness signal, not a read timeout. (The socket options live
@@ -499,7 +510,7 @@ fn run_attach_session(
         &Reply::ok(req_id, ReplyData::Attach(proto::AttachData { task_id, reason })),
     );
     // Unblock the input thread's socket read so it can exit.
-    let _ = writer.shutdown(std::net::Shutdown::Both);
+    let _ = writer.shutdown();
     let _ = input_thread.join();
 }
 
@@ -514,7 +525,7 @@ pub(crate) trait EventSink {
 }
 
 struct SocketSink<'a> {
-    writer: &'a mut UnixStream,
+    writer: &'a mut Stream,
 }
 
 impl EventSink for SocketSink<'_> {
@@ -3637,49 +3648,19 @@ pub(crate) fn mint_token() -> String {
 
 pub(crate) fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     // Recreate rather than truncate so the 0600 mode is guaranteed even
-    // if an old file existed with different permissions.
+    // if an old file existed with different permissions. Windows gets the
+    // same guarantee from the user-profile DACL the file inherits.
     let _ = std::fs::remove_file(path);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path)?;
     f.write_all(token.as_bytes())?;
     f.flush()
-}
-
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        // SAFETY: valid fd from a live UnixStream; out-params are plain ints.
-        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0 {
-            Some(uid)
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: valid fd; SO_PEERCRED fills a ucred of exactly this size.
-        let ok = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        } == 0;
-        if ok { Some(cred.uid) } else { None }
-    }
 }
 
 // ───────────────────────────── Tauri host ────────────────────────────
@@ -4608,7 +4589,9 @@ pub fn cli_rpc_progress(id: String, payload: String) -> Result<(), String> {
 pub(crate) fn bundled_cli_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("app binary has no parent dir")?;
-    let p = dir.join("termic-cli");
+    // The bundler installs the sidecar as `termic-cli.exe` on Windows
+    // (build.rs / build-cli.mjs stage both spellings during the build).
+    let p = dir.join(if cfg!(windows) { "termic-cli.exe" } else { "termic-cli" });
     if p.is_file() {
         Ok(p)
     } else {
@@ -4672,10 +4655,21 @@ fn prune_legacy_links() {
     }
 }
 
+#[cfg(unix)]
 fn user_bin() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local/bin"))
 }
 
+/// The Windows analog of `~/.local/bin`: a directory inside the user's
+/// profile, created on demand. Deliberately NOT WindowsApps (reserved for
+/// app execution aliases) and never a machine location (writing there
+/// needs elevation, which a launch or a Settings click must not raise).
+#[cfg(windows)]
+fn user_bin() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("Programs").join("termic").join("bin"))
+}
+
+#[cfg(unix)]
 fn install_targets(name: &str) -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from(format!("/usr/local/bin/{name}"))];
     if let Some(bin) = user_bin() {
@@ -4684,18 +4678,69 @@ fn install_targets(name: &str) -> Vec<PathBuf> {
     v
 }
 
-/// Is `dir` on the user's LOGIN-SHELL PATH (not the app's launchd PATH)?
-/// That is what a fresh terminal resolves commands against, so it is the
-/// honest "will `termic` be found" check. Uses the same resolved PATH the
-/// PTY spawn uses (shell_env), so the answer matches the real shell.
+/// User bin only. There is no system-wide location writable without the
+/// elevation machinery this platform port does not have; the `system`
+/// install button lands in the same user bin and adds it to the user
+/// PATH (see `install_at`).
+#[cfg(windows)]
+fn install_targets(name: &str) -> Vec<PathBuf> {
+    user_bin().map(|bin| vec![bin.join(format!("{name}.cmd"))]).unwrap_or_default()
+}
+
+/// First line of every shim we write. Both the recognition primitive
+/// (`replaceable`) and the Settings status read it: a file that does not
+/// carry it is somebody else's file and is never touched.
+#[cfg(windows)]
+const SHIM_MARKER: &str = "rem Added by Termic (termic-cli shim)";
+
+/// Second line of the shim: the absolute path of the sidecar it runs.
+#[cfg(windows)]
+fn shim_src(link: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(link).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "@echo off" {
+        return None;
+    }
+    if lines.next()?.trim() != SHIM_MARKER {
+        return None;
+    }
+    let target = lines.next()?.trim().strip_prefix('"')?.strip_suffix("\" %*")?;
+    Some(PathBuf::from(target))
+}
+
+#[cfg(unix)]
 fn dir_on_login_path(dir: &Path) -> bool {
     let path = crate::shell_env::resolved_path();
     std::env::split_paths(&path).any(|p| p == dir)
 }
 
-/// A symlink we may replace: anything whose target basename is
-/// `termic-cli` (a previous install, possibly from an older app path).
-/// A real file or a foreign symlink is never touched.
+/// Is `dir` on the PATH a fresh terminal will resolve against? On
+/// Windows that is the process PATH (login-time user + machine Path;
+/// registry edits only reach NEW shells after the WM_SETTINGCHANGE
+/// broadcast, which this check does not see - same honesty as the Unix
+/// check, which reads the login shell's resolved PATH and not ours).
+#[cfg(windows)]
+fn dir_on_login_path(dir: &Path) -> bool {
+    let want = std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string();
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p).any(|p| {
+                let p = std::fs::canonicalize(&p).unwrap_or(p);
+                p.to_string_lossy().trim_end_matches(['/', '\\']).eq_ignore_ascii_case(&want)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// A link we may replace: Unix, anything whose target basename is
+/// `termic-cli` (a previous install, possibly from an older app path);
+/// Windows, a shim carrying our marker whose target names `termic-cli`.
+/// A real file or a foreign link is never touched.
+#[cfg(unix)]
 fn replaceable(link: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(link) {
         Err(_) => Ok(true), // absent
@@ -4707,11 +4752,59 @@ fn replaceable(link: &Path) -> Result<bool, String> {
     }
 }
 
+#[cfg(windows)]
+fn replaceable(link: &Path) -> Result<bool, String> {
+    match shim_src(link) {
+        // Absent, or present and ours.
+        None => Ok(!link.exists()),
+        Some(target) => Ok(target.file_name().is_some_and(|n| {
+            n == "termic-cli" || n == "termic-cli.exe"
+        })),
+    }
+}
+
+/// Does an installed link already point at `src`? (The "reinstall is a
+/// no-op" check in the launch reconcile.)
+#[cfg(unix)]
+fn installed_points_at(target: &Path, src: &Path) -> bool {
+    std::fs::read_link(target).ok().as_deref() == Some(src.as_path())
+}
+
+#[cfg(windows)]
+fn installed_points_at(target: &Path, src: &Path) -> bool {
+    match shim_src(target) {
+        Some(t) if t == src => true,
+        // Case-insensitive fallback: NTFS is case-preserving and the shim
+        // records exactly what we were given at write time, but a drive
+        // letter or profile case can drift between launches.
+        Some(t) => {
+            std::fs::canonicalize(&t).ok()
+                == std::fs::canonicalize(src).ok().map(|s| s)
+        }
+        None => false,
+    }
+}
+
+/// Write the shim: a `.cmd` that runs the sidecar. A real symlink needs
+/// privileges Windows does not grant by default; a shim needs neither
+/// privileges nor a PATH edit to resolve once its directory is on PATH.
+#[cfg(windows)]
+fn write_shim(src: &Path, link: &Path) -> std::io::Result<()> {
+    let body = format!("@echo off\n{SHIM_MARKER}\n\"{}\" %*\n", src.display());
+    std::fs::write(link, body)
+}
+
+#[cfg(unix)]
 fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(link).is_ok() {
         std::fs::remove_file(link)?;
     }
     std::os::unix::fs::symlink(src, link)
+}
+
+#[cfg(windows)]
+fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
+    write_shim(src, link)
 }
 
 /// Atomic replace: build the new link under a temp name in the SAME
@@ -4723,11 +4816,23 @@ fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
 /// the explicit install path, where the user clicked a button and gets
 /// the error. It is not tolerable on the silent launch reconcile, which
 /// would delete a working `termic` and say nothing.
+#[cfg(unix)]
 fn symlink_atomic(src: &Path, link: &Path) -> std::io::Result<()> {
     let base = link.file_name().and_then(|n| n.to_str()).unwrap_or("termic");
     let tmp = link.with_file_name(format!(".{base}.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(src, &tmp)?;
+    std::fs::rename(&tmp, link).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+#[cfg(windows)]
+fn symlink_atomic(src: &Path, link: &Path) -> std::io::Result<()> {
+    let base = link.file_name().and_then(|n| n.to_str()).unwrap_or("termic");
+    let tmp = link.with_file_name(format!(".{base}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    write_shim(src, &tmp)?;
     std::fs::rename(&tmp, link).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -4873,7 +4978,7 @@ pub fn reconcile_link() {
         return;
     }
 
-    if std::fs::read_link(&target).ok().as_deref() != Some(src.as_path()) {
+    if !installed_points_at(&target, &src) {
         if let Err(e) = symlink_atomic(&src, &target) {
             // An unwritable /usr/local/bin is the expected failure. Say so
             // in the log and change nothing else: pruning the legacy link
@@ -4900,6 +5005,10 @@ pub fn reconcile_link() {
 /// macOS runs Terminal.app sessions as LOGIN shells, which is why bash gets
 /// `.bash_profile` rather than `.bashrc`: bash reads only the former for a
 /// login shell, so the usual Linux answer silently does nothing here.
+///
+/// Unix only. Windows has no rc files; its `cli_add_to_path` edits the
+/// registry user PATH instead.
+#[cfg(unix)]
 fn shell_rc_and_line(shell: &str, dir: &Path) -> (PathBuf, String) {
     let home = dirs::home_dir().unwrap_or_default();
     let d = dir.display();
@@ -4925,12 +5034,130 @@ fn shell_rc_and_line(shell: &str, dir: &Path) -> (PathBuf, String) {
 
 /// Marker written above our line, so a reader knows who put it there and a
 /// user can find and delete it. Also what makes the append IDEMPOTENT.
+#[cfg(unix)]
 const PATH_MARKER: &str = "# Added by Termic: put the termic command on PATH";
+
+/// Append `dir` to the user's registry PATH (HKCU\\Environment) and
+/// broadcast the change, so NEW shells (and the Start menu, and the run
+/// dialog) resolve `termic` without a logout. Already-running processes,
+/// including open terminals, keep their inherited copy: the message
+/// says to open a new terminal, exactly like the rc-file route does.
+#[cfg(windows)]
+fn win_add_to_user_path(dir: &Path) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
+        KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // Current user Path (REG_EXPAND_SZ: it may contain %VAR% references
+    // that must survive the round trip untouched, so we read raw UTF-16
+    // and only ever APPEND).
+    let value_name = wide("Path");
+    let mut len: u32 = 0;
+    // SAFETY: null buffer + &mut len is the documented size probe; the
+    // second call gets a live allocation of the reported size.
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide("Environment").as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    let mut current = String::new();
+    if len > 0 {
+        let mut buf = vec![0u16; (len as usize) / 2];
+        let mut got = len;
+        // SAFETY: buf/len are a live allocation of the probed size.
+        unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                wide("Environment").as_ptr(),
+                value_name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut _,
+                &mut got,
+            )
+        };
+        current = String::from_utf16_lossy(&buf[..(got as usize / 2).max(0)]);
+    }
+    // Idempotent: a dir already there (case-insensitive, matching how
+    // Windows compares PATH entries) is not appended again.
+    let want = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    let already = current
+        .split(';')
+        .map(|e| e.trim().trim_end_matches(['/', '\\']))
+        .any(|e| e.eq_ignore_ascii_case(&want));
+    if already {
+        return Ok(());
+    }
+    let mut next = current.trim_end_matches(';').to_string();
+    if !next.is_empty() {
+        next.push(';');
+    }
+    next.push_str(&dir.to_string_lossy());
+    let data = wide(&next);
+
+    // SAFETY: standard three-call registry pattern; the key handle is
+    // closed on every path below.
+    unsafe {
+        let mut hkey = std::ptr::null_mut();
+        let rc = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide("Environment").as_ptr(),
+            0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut hkey,
+        );
+        if rc != 0 {
+            return Err(format!("open HKCU\\Environment: error {rc}"));
+        }
+        let bytes_len = (data.len() * 2) as u32;
+        let rc = RegSetValueExW(
+            hkey,
+            value_name.as_ptr(),
+            0,
+            REG_EXPAND_SZ,
+            data.as_ptr() as *const u8,
+            bytes_len,
+        );
+        RegCloseKey(hkey);
+        if rc != 0 {
+            return Err(format!("write HKCU\\Environment\\Path: error {rc}"));
+        }
+        // Best-effort: shells started from an existing explorer keep the
+        // old PATH until that explorer relaunches even without this, and
+        // a declined broadcast must not fail the install.
+        let env = wide("Environment");
+        SendMessageTimeoutW(
+            HWND_BROADCAST as _,
+            WM_SETTINGCHANGE,
+            0,
+            env.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            2000,
+            std::ptr::null_mut(),
+        );
+    }
+    Ok(())
+}
 
 /// Is this dir already handled by `rc`? Checks for OUR marker and, more
 /// importantly, for any mention of the directory at all: a user who added it
 /// by hand, in their own wording, must not get a duplicate line appended
 /// underneath theirs.
+#[cfg(unix)]
 fn rc_already_has(existing: &str, dir: &Path) -> bool {
     let d = dir.display().to_string();
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
@@ -4943,6 +5170,27 @@ fn rc_already_has(existing: &str, dir: &Path) -> bool {
         !l.starts_with('#')
             && (l.contains(&d) || l.contains(&tilde) || l.contains(&dollar))
     }) || existing.contains(PATH_MARKER)
+}
+
+/// Windows half of `cli_add_to_path`: the user bin into the registry
+/// PATH (idempotent), with the same "already there is a success" shape
+/// the rc-file path returns.
+#[cfg(windows)]
+fn add_to_path_inner() -> Result<String, String> {
+    let dir = user_bin().ok_or("no home directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    win_add_to_user_path(&dir)?;
+    if dir_on_login_path(&dir) {
+        Ok(format!(
+            "{} is already on PATH. Open a new terminal for it to take effect.",
+            dir.display()
+        ))
+    } else {
+        Ok(format!(
+            "Added {} to your PATH. Open a new terminal for it to take effect.",
+            dir.display()
+        ))
+    }
 }
 
 /// Append the PATH line to the user's shell startup file.
@@ -4962,6 +5210,7 @@ pub async fn cli_add_to_path() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+#[cfg(unix)]
 fn add_to_path_inner() -> Result<String, String> {
     let dir = user_bin().ok_or("no home directory")?;
     let shell = crate::shell_env::login_shell();
@@ -4976,6 +5225,7 @@ fn add_to_path_inner() -> Result<String, String> {
 ///
 /// Returns the message shown in Settings either way, because "already there"
 /// is a success the user needs to read, not an error.
+#[cfg(unix)]
 fn append_path_line(rc: &Path, line: &str, dir: &Path) -> Result<String, String> {
     let existing = match std::fs::read_to_string(rc) {
         Ok(s) => s,
@@ -5056,6 +5306,38 @@ fn install_inner(name: &str, system: bool) -> Result<String, String> {
 }
 
 fn install_at(name: &str, system: bool) -> Result<String, String> {
+    #[cfg(windows)]
+    { install_at_windows(name, system) }
+    #[cfg(not(windows))]
+    { install_at_unix(name, system) }
+}
+
+/// Windows install: there is no system-wide location without elevation,
+/// so both flavors land in the user bin. `system=true` additionally puts
+/// that bin on the user's registry PATH right away (the no-prompt flavor
+/// leaves PATH alone, matching the Unix split between the silent
+/// on-enable install and the explicit button).
+#[cfg(windows)]
+fn install_at_windows(name: &str, system: bool) -> Result<String, String> {
+    let src = bundled_cli_path()?;
+    let link = install_user(&src, name)?;
+    let dir = link.parent().unwrap_or(&link).to_path_buf();
+    if dir_on_login_path(&dir) {
+        return Ok(format!("installed at {}", link.display()));
+    }
+    if !system {
+        return Ok(format!("installed at {}{}", link.display(), on_path_suffix(&dir)));
+    }
+    win_add_to_user_path(&dir)
+        .map_err(|e| format!("could not add {} to your PATH: {e}", dir.display()))?;
+    Ok(format!(
+        "installed at {} (added to your user PATH; open a new terminal)",
+        link.display()
+    ))
+}
+
+#[cfg(not(windows))]
+fn install_at_unix(name: &str, system: bool) -> Result<String, String> {
     let src = bundled_cli_path()?;
 
     if system {
@@ -5118,24 +5400,34 @@ pub struct CliInstallStatus {
     pub on_path: bool,
 }
 
+/// "A link of ours that still resolves": the installed state the
+/// Settings UI reports. Unix, our symlink whose target basename is
+/// `termic-cli`; Windows, our shim whose recorded sidecar still exists.
+#[cfg(unix)]
+fn is_our_installed_link(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).map(|md| md.file_type().is_symlink()).unwrap_or(false)
+        && std::fs::read_link(link)
+            .ok()
+            .is_some_and(|t| t.file_name().is_some_and(|n| n == "termic-cli"))
+        && link.exists()
+}
+
+#[cfg(windows)]
+fn is_our_installed_link(link: &Path) -> bool {
+    shim_src(link).is_some_and(|t| t.exists())
+}
+
 #[tauri::command]
 pub fn cli_install_status(_app: tauri::AppHandle) -> CliInstallStatus {
     let name = install_name();
     for link in install_targets(name) {
-        if let Ok(md) = std::fs::symlink_metadata(&link) {
-            let ours = md.file_type().is_symlink()
-                && std::fs::read_link(&link)
-                    .ok()
-                    .is_some_and(|t| t.file_name().is_some_and(|n| n == "termic-cli"))
-                && link.exists();
-            if ours {
-                let on_path = link.parent().is_some_and(dir_on_login_path);
-                return CliInstallStatus {
-                    path: Some(link.to_string_lossy().into_owned()),
-                    name: name.to_string(),
-                    on_path,
-                };
-            }
+        if is_our_installed_link(&link) {
+            let on_path = link.parent().is_some_and(dir_on_login_path);
+            return CliInstallStatus {
+                path: Some(link.to_string_lossy().into_owned()),
+                name: name.to_string(),
+                on_path,
+            };
         }
     }
     CliInstallStatus { path: None, name: name.to_string(), on_path: false }
@@ -5537,6 +5829,14 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use test_support::*;
+
+    // Socket tests run through the platform transport: the real
+    // UnixStream/UnixListener on macOS/Linux, the named-pipe Stream/
+    // Listener on Windows (same operation surface).
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
+    #[cfg(not(unix))]
+    use termic_proto::transport::{Listener as UnixListener, Stream as UnixStream};
 
     fn handle(req: &Request, host: &dyn CliHost) -> Reply {
         handle_request(req, host, &mut VecSink::default())
@@ -7473,6 +7773,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn token_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -7636,6 +7937,7 @@ mod tests {
     /// into a fish config is a syntax error the user meets in their next
     /// terminal rather than here, where we could have told them.
     #[test]
+    #[cfg(unix)]
     fn the_path_line_matches_the_shell_that_will_read_it() {
         let dir = Path::new("/Users/u/.local/bin");
 
@@ -7663,6 +7965,7 @@ mod tests {
     /// Appending twice is the failure this has to prevent, and "twice" has
     /// more spellings than our own.
     #[test]
+    #[cfg(unix)]
     fn an_rc_that_already_has_the_dir_is_left_alone() {
         let home = dirs::home_dir().unwrap_or_default();
         let dir = home.join(".local/bin");
@@ -7690,6 +7993,7 @@ mod tests {
     /// Against real files, because this writes into a dotfile the user wrote
     /// and the failure mode is silent corruption rather than an error.
     #[test]
+    #[cfg(unix)]
     fn appending_the_path_line_never_corrupts_the_users_rc() {
         let dir = std::env::temp_dir().join(format!("termic-rc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7718,6 +8022,30 @@ mod tests {
         assert!(fresh.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_shim_round_trips_through_recognition() {
+        // The shim IS the install on Windows: write it, then verify every
+        // recognition primitive the reconcile/status paths rely on.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("app").join("termic-cli.exe");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"binary").unwrap();
+        let link = dir.path().join("bin").join("termic.cmd");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+
+        symlink_replacing(&src, &link).unwrap();
+        assert!(replaceable(&link).unwrap(), "a shim of ours is replaceable");
+        assert!(shim_src(&link).is_some_and(|t| t == src), "the shim records its source");
+        assert!(installed_points_at(&link, &src), "reconcile sees it as current");
+        assert!(is_our_installed_link(&link), "install status reports it");
+
+        // A foreign .cmd is never ours to replace.
+        let foreign = dir.path().join("bin").join("other.cmd");
+        std::fs::write(&foreign, b"@echo off\r\nrem someone else\r\n").unwrap();
+        assert!(!replaceable(&foreign).unwrap(), "a foreign shim is not replaceable");
     }
 
     #[test]
@@ -7766,6 +8094,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_prefers_an_existing_current_name_over_a_legacy_one() {
         let cur = PathBuf::from("/usr/local/bin/termic");
@@ -7773,6 +8102,7 @@ mod tests {
         assert_eq!(reconcile_target("termic", Some(cur.clone()), &legacy), Some(cur));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_atomic_replaces_without_a_gap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7796,6 +8126,7 @@ mod tests {
         assert!(strays.is_empty(), "left temp links behind: {strays:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_legacy_links_leaves_foreign_files_alone() {
         // `replaceable` is the only thing standing between a prune and
@@ -7819,6 +8150,7 @@ mod tests {
         assert!(!replaceable(&link).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_targets_use_the_name() {
         let t = install_targets("termic-dev");

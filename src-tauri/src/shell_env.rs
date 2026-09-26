@@ -426,8 +426,19 @@ fn run_probe_loop(
 /// One full probe attempt: run the shell, and on success turn its env
 /// dump into the `LoginEnv` to swap in. `None` on timeout/failure/empty.
 fn probe_once() -> Option<LoginEnv> {
-    let probed = probe_login_shell().filter(|v| !v.is_empty())?;
-    Some(env_from_probe(&probed))
+    // Unix only. The probe runs the user's login shell and parses its
+    // `env` dump; on Windows there is no login shell, and "succeeding"
+    // through an inherited Git Bash SHELL var yields an MSYS-style PATH
+    // that native Windows binaries cannot resolve, so every spawned
+    // git/agent would lose its subprocess lookups. The process env IS
+    // the Windows login environment; bare_login_env serves it.
+    #[cfg(windows)]
+    return None;
+    #[cfg(not(windows))]
+    {
+        let probed = probe_login_shell().filter(|v| !v.is_empty())?;
+        Some(env_from_probe(&probed))
+    }
 }
 
 /// The env served before any probe succeeds: the inherited PATH from a
@@ -615,18 +626,31 @@ pub(crate) fn is_env_key(k: &str) -> bool {
 /// per shell), but covers the common static installers so at least
 /// `claude`, `codex`, `gemini` resolve.
 pub(crate) fn fallback_path(current: &str) -> String {
-    let mut seen: std::collections::HashSet<String> =
-        current.split(':').map(String::from).collect();
-    let mut out = current.to_string();
-    for p in fallback_dirs() {
-        if seen.insert(p.clone()) {
-            if !out.is_empty() {
-                out.push(':');
-            }
-            out.push_str(p);
-        }
+    // Windows: the process PATH already carries System32, the user's
+    // package-manager dirs and everything else a spawned tool needs. The
+    // unix extras below mean nothing here, and the ':' separator would
+    // corrupt the whole value into one unresolvable entry (a spawned git
+    // then can't find its own git-receive-pack).
+    #[cfg(windows)]
+    {
+        let _ = current;
+        current.to_string()
     }
-    out
+    #[cfg(not(windows))]
+    {
+        let mut seen: std::collections::HashSet<String> =
+            current.split(':').map(String::from).collect();
+        let mut out = current.to_string();
+        for p in fallback_dirs() {
+            if seen.insert(p.clone()) {
+                if !out.is_empty() {
+                    out.push(':');
+                }
+                out.push_str(p);
+            }
+        }
+        out
+    }
 }
 
 /// The well-known tool dirs, resolved against this account. The one
@@ -637,6 +661,12 @@ pub(crate) fn fallback_path(current: &str) -> String {
 /// and `passwd_name` must not run on several threads at once (CLI
 /// detection probes every agent in parallel).
 pub(crate) fn fallback_dirs() -> &'static [String] {
+    // No unix profile dirs to union on Windows (see fallback_path).
+    #[cfg(windows)]
+    {
+        &[]
+    }
+    #[cfg(not(windows))]
     FALLBACK_DIRS.get_or_init(|| fallback_extras(&account_home(), &account_user()))
 }
 
@@ -732,12 +762,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_homebrew_when_missing() {
         let result = fallback_path("/usr/bin:/bin");
         assert!(result.contains("/opt/homebrew/bin"), "must add homebrew bin");
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_does_not_duplicate_existing_entry() {
         let result = fallback_path("/usr/bin:/opt/homebrew/bin:/bin");
         let count = result.split(':').filter(|s| *s == "/opt/homebrew/bin").count();
@@ -745,12 +777,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_preserves_original_entries_first() {
         let result = fallback_path("/usr/bin:/bin");
         assert!(result.starts_with("/usr/bin:/bin"), "original path must be at the start");
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_empty_current_path() {
         let result = fallback_path("");
         assert!(result.contains("/opt/homebrew/bin"), "must add extras even for empty path");
@@ -758,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_private_tmp_equiv_via_cargo_bin() {
         // ~/.cargo/bin is always added (for rustup installs).
         let home = std::env::var("HOME").unwrap_or_default();
@@ -769,6 +804,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_nix_profile_dirs() {
         let extras = fallback_extras("/Users/x", "x");
         for dir in [
@@ -782,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_system_nix_dirs_without_home_or_user() {
         // A GUI process can launch with neither set. The two system-wide
         // nix profiles don't depend on either, so they still apply.
@@ -791,6 +828,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_xdg_nix_profile_dir() {
         // use-xdg-base-directories (nix 2.14+) moves the per-user
         // profile here and leaves no ~/.nix-profile behind.
@@ -799,6 +837,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_prefers_nix_over_homebrew() {
         // A nix-darwin login PATH puts the nix profiles ahead of
         // homebrew, so a tool installed in both must resolve the same
@@ -810,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_skips_per_user_nix_dirs_without_home_or_user() {
         // Neither $HOME/$USER nor the passwd entry resolved. Interpolating
         // the empties would yield a bogus /etc/profiles/per-user//bin
@@ -826,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_keeps_nix_dirs_in_nix_darwin_order() {
         let extras = fallback_extras("/Users/x", "x");
         let at = |dir: &str| extras.iter().position(|p| p == dir).unwrap();
@@ -840,6 +881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_all_entries_nonempty() {
         let result = fallback_path("/usr/bin:/bin");
         for entry in result.split(':') {

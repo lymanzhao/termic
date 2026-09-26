@@ -1,6 +1,36 @@
 # Windows support (audit + plan)
 
-Status: **proposed, not started. Nothing here has been compiled on Windows.**
+Status: **Milestone 1 shipped on the `windows-port` branch (2026-09-26).**
+The app compiles and launches on Windows 11 x64, `cargo test --lib` is green
+(1016 passed), `npm test` is green (2433), and `tauri build` produces MSI +
+NSIS bundles; the release exe serves the CLI over a named pipe (verified
+end to end with `termic list`). Still idea-level: nothing here is merged to
+main, and the runtime surface beyond the smoke test (real agent sessions,
+scripts, update flows) has not been exercised by hand.
+
+What the branch carried, against the tiers below:
+
+- Tier 1 all landed: sidecar `.exe` naming (build.rs + build-cli.mjs),
+  process_group/PermissionsExt/symlink sites gated or routed through a
+  `make_link` helper (junction for dirs, hardlink-or-copy for files),
+  `libc` target-gated.
+- The control plane (Tier 3 §2) is a named pipe in
+  `termic-proto/src/transport.rs` with overlapped-IO timeouts, the default
+  DACL, and a client-token SID check - the two transport sides share the
+  type, and Unix behavior is a thin std delegation.
+- The PATH corruption predicted in Tier 2 is real and fixed: on Windows the
+  login-shell probe is skipped and `fallback_path` serves the process PATH
+  (an inherited Git Bash `SHELL` produced an MSYS PATH that native git
+  could not resolve - found by `ahead_count` failing, not by reading).
+- LSP discovery probes `.venv/Scripts/<tool>.exe` and npm `.bin/.exe/.cmd`
+  shims; `find_on_path` and the venv pythonPath do the same.
+
+Still open, in rough priority order: the ~30 frontend `/`-separator sites
+(Tier 2), window chrome overlap (Tier 3 §4), `bash -lc` scripts and agent
+CLI discovery with PATHEXT (Tier 3 §3) - both untested on a real agent
+session - pinned LSP downloads and the updater endpoint remain
+macOS-only, process-group kill is taskkill `/T` rather than Job Objects,
+and the e2e suite has never run on Windows.
 
 Every line reference below came from reading the tree on 2026-07-27, not from
 running a Windows build. That distinction matters: the compile-error list in

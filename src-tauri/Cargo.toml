@@ -127,3 +127,16 @@ termic-cli = { path = "../termic-cli" }
 # feature, not a profile check.)
 [features]
 e2e = ["dep:tauri-plugin-wdio-webdriver"]
+
+# Windows process management (proc_kill / proc_alive in lib.rs):
+# OpenProcess / TerminateProcess / GetExitCodeProcess FFI. 0.60.2 is
+# already in the dependency tree via tauri, so this changes no
+# resolution.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
