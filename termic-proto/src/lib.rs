@@ -18,7 +18,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Read, Write};
 
-pub mod transport;
 
 /// Bumped whenever the wire shape changes incompatibly. The unauthenticated
 /// hello carries it so a CLI left resolved in an old shell fails with

@@ -29181,6 +29181,9 @@ mod tests {
             assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "-b", "main"]);
+        // A machine-wide autocrlf=true rewrites LF fixtures to CRLF on
+        // checkout, which corrupts the content comparisons downstream.
+        run(&["config", "core.autocrlf", "false"]);
         run(&["-c", "user.name=Test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"]);
         let f = path.join("base.txt");
         fs::write(&f, "base content\n").unwrap();

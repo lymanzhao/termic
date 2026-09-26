@@ -1125,6 +1125,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fallback_path_adds_private_tmp_equiv_via_cargo_bin() {
         // ~/.cargo/bin is always added (for rustup installs).
         let home = std::env::var("HOME").unwrap_or_default();
