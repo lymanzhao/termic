@@ -32,6 +32,7 @@ import { projectForgeIssues } from "@/lib/ipc";
 import { buildIssuePrompt, issueBranch, issueTaskName } from "@/lib/issuePrompt";
 import { readMemberModes, persistMemberMode, seedMemberMode } from "@/components/dialogs/memberModes";
 import { scoped } from "@/lib/profileScope";
+import { installCommand } from "@/lib/platform";
 
 const CLIS = ["claude", "codex", "agy", "grok", "opencode"] as const;
 
@@ -1706,7 +1707,7 @@ export function NewTaskDialog() {
                     <Trans i18nKey="newTask.issuesNeedCli" values={{ cli: forgeCli }} components={{ mono: <span className="mono" /> }} />
                   </div>
                   <div className="mt-1">
-                    <Trans i18nKey="newTask.issuesNeedCliBody" values={{ cli: forgeCli }} components={{ code: <code className="mono" /> }} />
+                    <Trans i18nKey="newTask.issuesNeedCliBody" values={{ cli: forgeCli, install: installCommand(forgeCli) }} components={{ code: <code className="mono" /> }} />
                   </div>
                 </>
               ) : issueLookup.status === "cli-unauthed" ? (

@@ -11,6 +11,13 @@ name: Release
 # Termic instances on either platform see the in-app updater pill
 # within ~5 min (CF Pages cache TTL on the manifest).
 #
+# Windows (experimental): NSIS installer on windows-latest, signed for the
+# updater with the same key. It is deliberately NOT in the release job's
+# `needs`: a Windows failure must never hold back the Mac and Linux release.
+# `release-windows` attaches its assets to the release afterwards, and the
+# manifest carries a `windows-x86_64` entry only when that upload happened.
+# No Authenticode signing yet, so SmartScreen warns on the first install.
+#
 # Linux scope: AppImage only. `.deb` / `.rpm` are skipped intentionally
 # because the Tauri updater can't replace package-manager-owned files,
 # so shipping them would split users into "self-update works" vs
@@ -560,6 +567,65 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.sig
 
+  # ─── Windows x64 (experimental) ────────────────────────────────────
+  # The signature is checked against the app's own public key before
+  # anything is uploaded: a wrong key would otherwise ship installs that
+  # never update.
+  build-windows:
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version:    ${{ steps.meta.outputs.version }}
+      setup_name: ${{ steps.find.outputs.setup_name }}
+      sig:        ${{ steps.hashes.outputs.sig }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # .gitattributes pins LF; this keeps Git for Windows from rewriting
+      # the checkout anyway.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Build & sign (NSIS)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY:          ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles nsis
+      - name: Locate installer
+        id: find
+        run: |
+          BUNDLE_DIR=src-tauri/target/release/bundle/nsis
+          ls -la "$BUNDLE_DIR"
+          SETUP=$(ls "$BUNDLE_DIR"/*-setup.exe | head -n1)
+          echo "setup_name=$(basename "$SETUP")" >> "$GITHUB_OUTPUT"
+          echo "setup_path=$SETUP" >> "$GITHUB_ENV"
+      - name: Verify the updater signature against the app's key
+        run: node scripts/verify-updater-sig.mjs "$setup_path"
+      - name: Read .sig
+        id: hashes
+        run: |
+          SIG=$(cat "${setup_path}.sig")
+          { echo 'sig<<EOF'; echo "$SIG"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termic-${{ steps.meta.outputs.version }}-windows-x86_64
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+
   # ─── Stitch the universal build into a Release ────────────────────
   release:
     needs: [build-mac, build-linux]
@@ -629,6 +695,31 @@ jobs:
             mac/dmg/*.dmg mac/macos/* \
             linux/*.AppImage linux/*.AppImage.sig
 
+  # ─── Attach the Windows build to the release ──────────────────────
+  # After the release exists, and only if the Windows build succeeded, so a
+  # Windows failure costs Windows users this version and nothing else.
+  release-windows:
+    needs: [build-windows, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.build-windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: termic-${{ needs.build-windows.outputs.version }}-windows-x86_64
+          path: windows
+      - name: Upload installer + note it in the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: |
+          gh release upload "v${VERSION}" --repo "${{ github.repository }}" \
+            windows/*-setup.exe windows/*-setup.exe.sig
+          gh release view "v${VERSION}" --repo "${{ github.repository }}" --json body -q .body > notes.md
+          cat >> notes.md <<'NOTE'
+          - **Windows** (x64, experimental): download the `-setup.exe` below and run it. It is not code-signed yet, so SmartScreen asks first: More info, then Run anyway. The sandbox is Docker only on Windows.
+          NOTE
+          gh release edit "v${VERSION}" --repo "${{ github.repository }}" --notes-file notes.md
+
   # ─── Bump the Homebrew cask ────────────────────────────────────────
   bump-tap:
     needs: [build-mac, release]
@@ -681,7 +772,10 @@ jobs:
   #                      THIS repo (authored by scripts/release.sh); it's
   #                      copied over verbatim.
   bump-website:
-    needs: [build-mac, build-linux, release]
+    # release-windows is waited for but may be skipped or fail; the manifest
+    # then simply has no Windows entry, as before.
+    needs: [build-mac, build-linux, build-windows, release, release-windows]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # The termic.dev repo — where both files get committed.
@@ -699,6 +793,9 @@ jobs:
           MAC_SIG:   ${{ needs.build-mac.outputs.sig }}
           LINUX_SIG: ${{ needs.build-linux.outputs.sig }}
           LINUX_APPIMAGE: ${{ needs.build-linux.outputs.appimage_name }}
+          WINDOWS_OK:    ${{ needs.release-windows.result == 'success' }}
+          WINDOWS_SIG:   ${{ needs.build-windows.outputs.sig }}
+          WINDOWS_SETUP: ${{ needs.build-windows.outputs.setup_name }}
         run: |
           cd site
           VERSION="${{ needs.build-mac.outputs.version }}"
@@ -731,6 +828,17 @@ jobs:
             }
           }
           JSON
+          # Windows only when its installer is actually on the release: an
+          # entry pointing at a missing asset would make every Windows
+          # install fail its update check instead of just not seeing one.
+          if [ "$WINDOWS_OK" = "true" ]; then
+            BASE="$BASE" node -e '
+              const fs = require("fs"), p = process.argv[1];
+              const m = JSON.parse(fs.readFileSync(p, "utf8"));
+              m.platforms["windows-x86_64"] = { signature: process.env.WINDOWS_SIG, url: process.env.BASE + "/" + process.env.WINDOWS_SETUP };
+              fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+            ' "${{ env.WEBSITE_MANIFEST_PATH }}"
+          fi
           # Both changelog artifacts are copied verbatim from the termic
           # repo (CHANGELOG.md is the source of truth; changelog.json is the
           # slim derived summary file generated by scripts/release.sh). The

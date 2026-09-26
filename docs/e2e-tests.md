@@ -64,8 +64,12 @@ Tests run **on a real Mac only** — they launch a GUI window.
 
 ## CI
 
-An `e2e` job in `.github/workflows/test.yml` runs the suite on `macos-14` for
-PRs and pushes to `main`. It is **not a required check yet** — it's there to
+The suite runs on all three platforms for PRs and pushes to `main`: `e2e`
+(`macos-14`) and `e2e-linux` (WebKitGTK under Xvfb, `ubuntu-22.04`) in
+`.github/workflows/test.yml`, and the Windows job (WebView2) in
+`.github/workflows/windows.yml`. Specs for a feature a platform does not have
+are excluded in `wdio.conf.ts` (Touch ID off macOS, the Activity monitor on
+Windows). None is a **required check yet**: they are there to
 surface flakiness under CI so we can harden it before gating merges. The
 gitignored `.e2e/` fixture profile is recreated by `node scripts/e2e-seed.mjs`
 (templates in `scripts/e2e-seed/`); screenshots are skipped when `CI` is set

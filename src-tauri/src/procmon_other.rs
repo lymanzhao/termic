@@ -3,7 +3,9 @@
 //! here, so this just answers "unsupported" — see lib.rs's 3-way `mod
 //! procmon` cfg split.
 
-pub use crate::procmon_common::{ChildRow, ProcRow, Root, Snapshot};
+pub use crate::procmon_common::{ProcRow, Root, Snapshot};
+#[cfg(test)]
+pub use crate::procmon_common::ChildRow;
 
 pub fn start(_roots: Vec<Root>) -> Snapshot {
     Snapshot { session: 0, unix_ms: 0.0, rows: Vec::new(), sample_ms: 0.0, webkit_unavailable: true }

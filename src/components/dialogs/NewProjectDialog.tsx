@@ -13,6 +13,8 @@ import { Checkbox } from "@/components/ui/Checkbox";
 import { projectAdd, projectAddMulti, discoverRepos, discoveryDismiss, settingsLoad, pathIsGitRepo, pathExists, cachedHomeDir } from "@/lib/ipc";
 import { repoNameFromUrl } from "@/lib/cloneUrl";
 import { expandTilde } from "@/lib/pathMatch";
+import { joinPath } from "@/lib/osPath";
+import { IS_WINDOWS } from "@/lib/platform";
 import { AuxTerminal } from "@/components/task/AuxTerminal";
 import type { DiscoveredRepo, Project, ProjectMember } from "@/lib/types";
 import { Folder, FolderPlus, Layers, RotateCcw, X, Download } from "lucide-react";
@@ -158,7 +160,7 @@ export function NewProjectDialog() {
   // the Add gate polled `~/r/<name>` and never lit. Shown expanded too, since
   // the whole job of this line is to say where the repo is about to go.
   const cloneParentAbs = expandTilde(cloneParent.trim().replace(/\/+$/, ""), homePath);
-  const cloneDest = cloneParentAbs && cloneName ? `${cloneParentAbs}/${cloneName}` : "";
+  const cloneDest = cloneParentAbs && cloneName ? joinPath(cloneParentAbs, cloneName) : "";
 
   // Poll the destination while the terminal is up.
   //
@@ -206,10 +208,11 @@ export function NewProjectDialog() {
     // splits on and this string is about to be typed at a real prompt. The
     // name is `repoNameFromUrl`'s output, which already refuses anything with
     // a separator in it.
-    const url = cloneUrl.trim().replaceAll("'", `'\\''`);
+    // PowerShell (the Windows terminal's shell) escapes a quote by doubling it.
+    const url = cloneUrl.trim().replaceAll("'", IS_WINDOWS ? "''" : `'\\''`);
     setCloneStarted({
       parent,
-      dest: `${parent}/${name}`,
+      dest: joinPath(parent, name),
       // Trailing CR: the command RUNS on its own. Clicking Clone is the
       // decision to clone, and making the user press Enter at a prompt they
       // did not ask to be at was friction for no safety, since the button

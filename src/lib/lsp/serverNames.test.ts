@@ -32,6 +32,12 @@ describe("a language with nothing resolved yet", () => {
     expect(serverFor("/repo/bin/ruby-lsp", "ruby")).toBe("ruby-lsp");
   });
 
+  it("names a Windows server by its program, not its path or extension", () => {
+    expect(serverFor("C:\\repo\\node_modules\\.bin\\tsgo.cmd", "typescript")).toBe("TypeScript 7 (tsgo)");
+    expect(serverFor("C:\\repo\\.venv\\Scripts\\ty.exe", "python")).toBe("ty");
+    expect(MEMORY_NOTE[serverFor("C:\\r\\tsgo.exe", "typescript")]).toBeTruthy();
+  });
+
   it("says the binary's name rather than inventing one for a server we do not know", () => {
     expect(serverFor("/usr/local/bin/some-other-lsp", "elixir")).toBe("some-other-lsp");
   });

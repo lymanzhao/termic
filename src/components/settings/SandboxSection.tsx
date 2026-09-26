@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/Button";
 import { usePrefs } from "@/store/prefs";
 import { Block, ListField, SectionTitle, Toggle, useBackendSettings } from "./Controls";
 import { SandboxPicker, DockerEngineNote } from "@/components/SandboxPicker";
+import { SEATBELT_AVAILABLE } from "@/lib/platform";
 import { cleanLines } from "@/lib/utils";
 
 export function SandboxSection() {
@@ -153,7 +154,12 @@ export function SandboxSection() {
         </div>
         <div className="mt-3 flex flex-col gap-4">
           <ListField label={t("sandbox.global.allowedPaths")} placeholder={"~/Documents/notes\n~/scratch"} value={sbRw} onChange={setSbRw} />
-          <ListField label={t("sandbox.global.allowedHosts")} placeholder={"*.example.com\nbitbucket.org"} value={sbHosts} onChange={setSbHosts} />
+          {/* Hosts are a Seatbelt-only rule (its network proxy). Docker
+              mode leaves the network open, so off macOS there is nothing
+              for this list to do. */}
+          {SEATBELT_AVAILABLE && (
+            <ListField label={t("sandbox.global.allowedHosts")} placeholder={"*.example.com\nbitbucket.org"} value={sbHosts} onChange={setSbHosts} />
+          )}
         </div>
         <div className="mt-3">
           <Button variant="primary" disabled={!sbDirty || busy} onClick={saveSb}>

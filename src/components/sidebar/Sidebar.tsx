@@ -2,7 +2,7 @@
 // Two layout flavors: full (220px) vs compact (56px, icon-only with tooltips).
 
 import { ThemePicker } from "@/components/ThemePicker";
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type FocusEvent as ReactFocusEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type FocusEvent as ReactFocusEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { logWorkState } from "@/lib/workStateLog";
@@ -48,9 +48,12 @@ import { GroupActionsMenuItems } from "./GroupActionsMenuItems";
 import { ProjectFilterBar, ProjectFilterToggle } from "./ProjectTaskFilter";
 import { filterTasks, isFilterActive, taskHasNotification } from "@/lib/taskFilter";
 import { TaskGroupBlock } from "./TaskGroupBlock";
-import { flattenSegments, groupColorCss as taskGroupColorCss, groupLabel, layoutTaskList, liveGroups, nextGroupColor } from "@/lib/taskGroups";
+import { SpawnedFromMark, SpawnLinksOverlay } from "./SpawnLinks";
+import { crossProjectStrays, flattenSegments, groupColorCss as taskGroupColorCss, groupLabel, layoutTaskList, liveGroups, nextGroupColor } from "@/lib/taskGroups";
 import { taskNeedsAttention, taskWorkDone, taskWorking, taskDelegated } from "@/lib/taskWorkState";
 import { delegatedTitle } from "@/lib/delegatedWork";
+import { FILE_MANAGER } from "@/lib/openExternal";
+import { kbd } from "@/lib/platform";
 
 /** Pick a default name for a freshly-created task (repo-root OR worktree).
  *  Format: "<agent>-N" where N is the next unused index for that CLI among
@@ -336,8 +339,13 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
     dragTaskGroupRef.current = g;
     setDragTaskGroupState(g);
   };
+  // Pre-link data: a group spanning projects draws its lone members as plain
+  // rows (taskGroups.ts crossProjectStrays).
+  const groupStrays = useMemo(() => crossProjectStrays(tasks), [tasks]);
   const groupFor = (t: Task): TaskGroup | null =>
-    t.id === dragTaskId && dragTaskGroup !== undefined ? dragTaskGroup : t.group ?? null;
+    t.id === dragTaskId && dragTaskGroup !== undefined
+      ? dragTaskGroup
+      : groupStrays.has(t.id) ? null : t.group ?? null;
   const taskDragListenersRef = useRef<{ move: (e: PointerEvent) => void; up: (e: PointerEvent) => void } | null>(null);
   // A completed drop still fires a click on the row (pointerup lands on the
   // same element), which would activate the task the user only meant to
@@ -400,12 +408,21 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
       if (joining) {
         // Join through a LIVE member, not the group id: that is the lead's
         // task id, and the lead may be archived or gone entirely.
-        const via = target && all.find(t => t.group?.id === target.id && t.id !== armed.id && !t.archived)?.id;
+        // In THIS project: a group that spans projects from before groups stayed
+        // in one has members elsewhere, and Rust refuses a join across.
+        const via = target && all.find(t => t.group?.id === target.id && t.id !== armed.id && !t.archived && t.project_id === armed.projectId)?.id;
         // Dropped into a collapsed group: open it, or the task you just
         // placed disappears from view the moment you let go.
         if (target) useApp.getState().setTaskGroupCollapsed(target.id, false);
-        const write = via ? taskGroupJoin(armed.id, via) : taskGroupLeave(armed.id);
-        void Promise.allSettled([reorder, write]).then(() => useApp.getState().loadAll());
+        // AFTER the reorder, not beside it: task_reorder re-saves every task
+        // whose order moved, the dropped one included, from a list it loaded
+        // before the join landed, so a concurrent join could be written and
+        // then overwritten with the old group. Lost on the Windows runner.
+        const armedId = armed.id;
+        void reorder.catch(() => {})
+          .then(() => (via ? taskGroupJoin(armedId, via) : taskGroupLeave(armedId)))
+          .catch(() => {})
+          .then(() => useApp.getState().loadAll());
       } else {
         reorder.catch(() => { void useApp.getState().loadAll(); });
       }
@@ -1118,8 +1135,11 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
       <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={projectsScrollRef}
-        className={cn("flex-1 overflow-y-auto min-h-0", compact ? "no-scrollbar px-1.5 py-1.5" : "px-2 py-2")}
+        className={cn("relative flex-1 overflow-y-auto min-h-0", compact ? "no-scrollbar px-1.5 py-1.5" : "px-2 py-2")}
       >
+        {/* Lines to the hovered task's parent and the tasks it spawned. The
+            icon rail has no room for them. */}
+        {!compact && <SpawnLinksOverlay containerRef={projectsScrollRef} />}
         <div className={cn(
           "flex items-center justify-between text-[12px] uppercase tracking-wider text-[var(--color-fg-dim)]",
           compact ? "flex-col gap-1.5 py-1" : "px-2 py-1",
@@ -1581,7 +1601,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                   )}
                   <ContextMenuItem onSelect={() => openPath(p.root_path).catch(() => {})}>
                     <FolderOpen />
-                    {t("revealInFinder")}
+                    {t("revealInFinder", { manager: FILE_MANAGER })}
                   </ContextMenuItem>
                   <ContextMenuItem onSelect={() => copyToClipboard(p.root_path, "path")}>
                     <Copy />
@@ -2193,7 +2213,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               removed earlier for a different reason: it duplicated the button
               in the PROJECTS header, which is where the action belongs, next
               to the list it acts on. */}
-          <Tip content={t("settingsTip")}>
+          <Tip content={t("settingsTip", { combo: kbd("⌘,") })}>
             <Button size="icon" variant="icon" className={compact ? undefined : "ml-auto"}
                     onClick={() => openSettings()}>
               <Settings className={iconSize(compact)} />
@@ -2837,6 +2857,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                 {label}
               </span>
               <TaskLocationIcon isMainCheckout={w.is_main_checkout} size="h-3.5 w-3.5" />
+              {w.spawned_by && <SpawnedFromMark task={w} />}
             </>
           )}
           {/* PR/MR state: tiny pull-request glyph colored by live state
@@ -3163,7 +3184,8 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                   change, for a menu nobody has open. */}
               {menuOpen && (() => {
                 const all = useApp.getState().tasks;
-                const groups = liveGroups(all.filter(t => t.project_id === w.project_id));
+                const strays = crossProjectStrays(all);
+                const groups = liveGroups(all.filter(t => t.project_id === w.project_id && !strays.has(t.id)));
                 const run = (p: Promise<void>) => { void p.finally(() => loadAll()); };
                 return (
                   <DropdownSub>
@@ -3178,7 +3200,7 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                       {groups.map(g => {
                         // Join through a live member, not the group id: that is
                         // the lead's task id, and the lead may be archived.
-                        const via = all.find(t => !t.archived && t.id !== w.id && t.group?.id === g.id)?.id;
+                        const via = all.find(t => !t.archived && t.id !== w.id && t.group?.id === g.id && t.project_id === w.project_id)?.id;
                         const current = w.group?.id === g.id;
                         return (
                           <DropdownItem

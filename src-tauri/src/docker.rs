@@ -69,6 +69,66 @@ impl Mount {
     }
 }
 
+/// Where a HOST path appears inside the (Linux) container.
+///
+/// Docker mode mounts the task at the same absolute path on both sides, so
+/// the paths an agent prints, the images termic pastes, and the cwd-keyed
+/// session ids are valid in both places. On macOS and Linux that is the
+/// identity. On Windows it cannot be: a container target must start with
+/// `/`, and `C:\Users\u\repo` is not a Linux path at all. There the
+/// path maps to `/c/Users/u/repo` (the drive letter as the first segment,
+/// Git Bash's convention), which stays stable per host path, so session
+/// resume by cwd keeps working.
+pub(crate) fn in_container(host: &str) -> String {
+    if cfg!(windows) {
+        windows_to_container(host)
+    } else {
+        host.to_string()
+    }
+}
+
+/// For a git worktree (its `.git` is a `gitdir:` FILE), write a copy of
+/// that file whose gitdir is the container-side path, and return where it
+/// was written. `None` for a regular checkout or anything unreadable.
+fn container_gitfile(task_path: &str) -> Option<String> {
+    let dot_git = std::path::Path::new(task_path).join(".git");
+    if !std::fs::metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let raw = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let abs = if std::path::Path::new(raw).is_absolute() {
+        raw.to_string()
+    } else {
+        std::path::Path::new(task_path).join(raw).to_string_lossy().into_owned()
+    };
+    let dir = crate::global_dir().ok()?.join("docker-gitfiles");
+    std::fs::create_dir_all(&dir).ok()?;
+    // One file per worktree, named by a hash of its path, so concurrent tabs
+    // of one task share it and two tasks never collide.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    task_path.hash(&mut h);
+    let out = dir.join(format!("{:016x}.git", h.finish()));
+    std::fs::write(&out, format!("gitdir: {}\n", in_container(&canonicalize_or_keep(&abs)))).ok()?;
+    Some(out.to_string_lossy().into_owned())
+}
+
+/// Pure half of `in_container`, tested on every platform.
+pub(crate) fn windows_to_container(host: &str) -> String {
+    // A verbatim `\\?\C:\...` prefix (fs::canonicalize output) carries
+    // nothing the mapping needs.
+    let h = host.strip_prefix(r"\\?\").unwrap_or(host);
+    let b = h.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let drive = (b[0] as char).to_ascii_lowercase();
+        let rest = h[2..].replace('\\', "/");
+        let rest = rest.trim_start_matches('/');
+        return if rest.is_empty() { format!("/{drive}") } else { format!("/{drive}/{rest}") };
+    }
+    h.replace('\\', "/")
+}
+
 // ───────────────────────────── Spec ────────────────────────────────────
 
 /// Everything needed to render one `docker run` invocation for a task
@@ -357,14 +417,17 @@ const UNSAFE_MOUNT_TARGET_ROOTS: &[&str] = &[
 /// same as every other sandbox list parser in this file.
 fn sanitize_extra_mount(raw: &str, home: &str, task_path: &str) -> Option<(String, String)> {
     let raw = raw.trim();
-    let (host_raw, container_raw) = raw.split_once(':')?;
+    // Split at the LAST colon: the container half is a Linux path and never
+    // contains one, while a Windows host half starts with a drive letter
+    // (`C:\\data:/data`).
+    let (host_raw, container_raw) = raw.rsplit_once(':')?;
     let host_raw = host_raw.trim();
     let container_raw = container_raw.trim();
     if host_raw.is_empty() || container_raw.is_empty() {
         return None;
     }
     let host = canonicalize_or_keep(&subst_path(host_raw, home, task_path));
-    if host.is_empty() || !host.starts_with('/') {
+    if host.is_empty() || !std::path::Path::new(&host).is_absolute() {
         return None;
     }
     if !container_raw.starts_with('/') || container_raw.contains("..") || container_raw.contains('\0') {
@@ -468,7 +531,8 @@ fn git_identity_container_path(xdg_config_home: &str) -> String {
 /// same local config itself, from a level that outranks the file we write.
 ///
 /// Absent keys come back `None` (`git config --get` exits non-zero), and a
-/// host with no identity at all mounts nothing.
+/// host with no identity at all mounts nothing (except on Windows, where the
+/// same file also carries `windows_container_git_config`).
 ///
 /// `fallback` is read instead when `dir` is not a directory, which is not a
 /// hypothetical: the SETTINGS-level command preview builds its spec from a
@@ -522,6 +586,23 @@ fn git_identity_config(name: Option<&str>, email: Option<&str>) -> Option<String
         s.push_str(&format!("\temail = {e}\n"));
     }
     Some(s)
+}
+
+/// Windows host: the git settings the container needs and cannot get from
+/// the host's own config, appended to the same global-level file (so a
+/// repo's own `.git/config` still wins, which `GIT_CONFIG_*` env would not
+/// allow). `core.autocrlf`: Git for Windows turns it on in its SYSTEM
+/// config, which the container never sees, so Linux git would report every
+/// CRLF-checked-out file as modified. `gc`: the worktree metadata in
+/// `<repo>/.git/worktrees` holds host paths the container cannot resolve,
+/// and an automatic `git gc` there runs `worktree prune`, which could drop
+/// the host's worktree record.
+fn windows_container_git_config(autocrlf: Option<&str>) -> String {
+    let mut s = String::from("[gc]\n\tauto = 0\n\tworktreePruneExpire = never\n");
+    if let Some(v) = autocrlf.map(str::trim).filter(|v| matches!(*v, "true" | "false" | "input")) {
+        s.push_str(&format!("[core]\n\tautocrlf = {v}\n"));
+    }
+    s
 }
 
 /// Stage the file on the host and return its path. One file per TASK, because
@@ -614,11 +695,27 @@ pub fn build_spec(
     let task_path = canonicalize_or_keep(&task.path);
     mounts.push(Mount::implicit(
         task_path.clone(),
-        task_path.clone(),
+        in_container(&task_path),
         false,
         "your code (the task)",
         true,
     ));
+    // Windows: the worktree's `.git` FILE points at its gitdir with a host
+    // path (`gitdir: C:/Users/u/repo/.git/worktrees/x`), which Linux git in
+    // the container reads as relative and gives up on. Mount a corrected
+    // copy over it, read-only, pointing at the same gitdir's container path.
+    // The host file is never touched.
+    if cfg!(windows) {
+        if let Some(fixed) = container_gitfile(&task_path) {
+            mounts.push(Mount::implicit(
+                fixed,
+                format!("{}/.git", in_container(&task_path)),
+                true,
+                "git worktree pointer, rewritten for the container's paths",
+                true,
+            ));
+        }
+    }
 
     // 2. Parent `.git` for a worktree (pointer file holds an absolute
     //    path into <parent>/.git/worktrees/<name>). Same-path mount or git
@@ -626,7 +723,7 @@ pub fn build_spec(
     if let Some(parent_git) = parent_git_dir_for_worktree(&task.path) {
         mounts.push(Mount::implicit(
             parent_git.clone(),
-            parent_git,
+            in_container(&parent_git),
             false,
             "git metadata, required for worktrees to work",
             true,
@@ -645,7 +742,7 @@ pub fn build_spec(
         }
         mounts.push(Mount::implicit(
             p.clone(),
-            p,
+            in_container(&p),
             false,
             "linked repo in this task",
             true,
@@ -653,7 +750,7 @@ pub fn build_spec(
         if let Some(parent_git) = parent_git_dir_for_worktree(&m.path) {
             mounts.push(Mount::implicit(
                 parent_git.clone(),
-                parent_git,
+                in_container(&parent_git),
                 false,
                 "git metadata for a linked repo",
                 true,
@@ -687,7 +784,7 @@ pub fn build_spec(
         }
         mounts.push(Mount::implicit(
             p.clone(),
-            p,
+            in_container(&p),
             false,
             "extra allowed directory (from your sandbox config / .termic.yaml)",
             false,
@@ -893,10 +990,10 @@ pub fn build_spec(
     //    Read-only: the app is the only writer.
     {
         let attachments = crate::attachments_dir().to_string_lossy().into_owned();
-        if !attachments.is_empty() && !mounts.iter().any(|m| m.container == attachments) {
+        if !attachments.is_empty() && !mounts.iter().any(|m| m.container == in_container(&attachments)) {
             mounts.push(Mount::implicit(
                 attachments.clone(),
-                attachments,
+                in_container(&attachments),
                 true,
                 "files you drop or paste into the terminal (read-only)",
                 false,
@@ -942,24 +1039,41 @@ pub fn build_spec(
                 std::path::Path::new(&task_path),
                 std::path::Path::new(&home),
             );
-            match git_identity_config(name.as_deref(), email.as_deref()) {
+            let identity = git_identity_config(name.as_deref(), email.as_deref());
+            no_identity_warning = identity.is_none();
+            let windows_extra = cfg!(windows).then(|| {
+                let autocrlf = crate::git(&["config", "--get", "core.autocrlf"], std::path::Path::new(&task_path)).ok();
+                windows_container_git_config(autocrlf.as_deref())
+            });
+            let contents = match (identity, windows_extra) {
+                (Some(i), Some(w)) => Some(format!("{i}{w}")),
+                (Some(i), None) => Some(i),
+                (None, Some(w)) => Some(format!("# Written by termic for the Docker sandbox.\n{w}")),
+                (None, None) => None,
+            };
+            match contents {
                 Some(contents) => {
                     if let Some(host) = stage_git_identity(&task.id, &contents) {
                         mounts.push(Mount::implicit(
                             host,
                             container,
                             true,
-                            "your git identity (name and email), so commits made in the container are yours",
+                            if cfg!(windows) {
+                                "your git identity, plus the line-ending and gc settings a Windows checkout needs in the container"
+                            } else {
+                                "your git identity (name and email), so commits made in the container are yours"
+                            },
                             false,
                         ));
                     }
                 }
-                // Say so rather than let the agent discover it. This is the
-                // one case the feature cannot rescue, and it is silent
-                // otherwise: the container simply has no identity, the agent's
-                // first commit dies on "Please tell me who you are", and
-                // nothing anywhere says termic looked and found none.
-                None => no_identity_warning = true,
+                // No identity: say so (no_identity_warning, set above) rather
+                // than let the agent discover it. This is the one case the
+                // feature cannot rescue, and it is silent otherwise: the
+                // container simply has no identity, the agent's first commit
+                // dies on "Please tell me who you are", and nothing anywhere
+                // says termic looked and found none.
+                None => {}
             }
         }
     }
@@ -1017,7 +1131,7 @@ pub fn build_spec(
     let mut warnings: Vec<String> = Vec::new();
     if no_identity_warning {
         warnings.push(
-            "No git identity found on this Mac, so a commit made inside the container will fail with \"Please tell me who you are\". Set one with: git config --global user.name \"Your Name\" and git config --global user.email \"you@example.com\"."
+            "No git identity found on this machine, so a commit made inside the container will fail with \"Please tell me who you are\". Set one with: git config --global user.name \"Your Name\" and git config --global user.email \"you@example.com\"."
                 .to_string(),
         );
     }
@@ -1067,7 +1181,7 @@ pub fn build_spec(
         label: format!("{LABEL_KEY}={}", task.id),
         image: image.to_string(),
         mounts,
-        workdir: canonicalize_or_keep(cwd),
+        workdir: in_container(&canonicalize_or_keep(cwd)),
         env,
         extra_args,
     }
@@ -1134,7 +1248,7 @@ pub fn validate_extra_args(args: &[String]) -> Result<(), String> {
 pub fn validate_extra_mounts(mounts: &[String]) -> Result<(), String> {
     for raw in mounts {
         let raw_t = raw.trim();
-        let Some((host_raw, container_raw)) = raw_t.split_once(':') else {
+        let Some((host_raw, container_raw)) = raw_t.rsplit_once(':') else {
             return Err(format!("\"{raw}\" isn't a valid mount: expected host_path:container_path."));
         };
         let host_raw = host_raw.trim();
@@ -1169,9 +1283,16 @@ fn host_uid_gid() -> String {
     format!("{}:{}", unsafe { libc::getuid() }, unsafe { libc::getgid() })
 }
 
+/// Windows has no uid to mirror. Root would be the obvious stand-in, but
+/// Claude Code refuses `--dangerously-skip-permissions` as root, and Docker
+/// tasks run agents in exactly that mode (the container is the boundary),
+/// so every Claude launch would fail. A fixed non-root id instead: the
+/// image makes `/root` world-writable (Dockerfile.default) so any uid can
+/// use it, and Docker Desktop's Windows bind mounts do not enforce
+/// ownership.
 #[cfg(not(unix))]
 fn host_uid_gid() -> String {
-    "0:0".to_string()
+    "1000:1000".to_string()
 }
 
 // ──────────────────────────── render_argv ──────────────────────────────
@@ -1383,7 +1504,7 @@ pub fn write_dockerfile(contents: &str) -> Result<(), String> {
 /// launchd, which misses `/usr/local/bin`, `/opt/homebrew/bin`, `~/.docker/bin`,
 /// OrbStack, and custom DOCKER_HOST / DOCKER_CONTEXT settings in shell profiles.
 pub fn docker_cmd() -> Command {
-    let mut cmd = Command::new("docker");
+    let mut cmd = crate::proc_ctl::command("docker");
     let (path, inject) = crate::shell_env::spawn_env();
     cmd.env("PATH", path);
     for (k, v) in inject {
@@ -1483,11 +1604,16 @@ pub fn check() -> DockerStatus {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     let binary = version.is_some();
+    // Ready means a daemon that runs LINUX containers. Docker Desktop on
+    // Windows can be switched to Windows containers, where `docker info`
+    // still succeeds and then `FROM node:lts-bookworm` fails at build time
+    // with an error that names neither mode. Everywhere else OSType is
+    // always linux.
     let daemon = binary
         && docker_cmd()
-            .arg("info")
+            .args(["info", "--format", "{{.OSType}}"])
             .output()
-            .map(|o| o.status.success())
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
             .unwrap_or(false);
     DockerStatus { binary, daemon, version }
 }
@@ -2444,18 +2570,21 @@ mod tests {
         assert!(spec.env.iter().any(|(k, _)| k == "USER"));
     }
 
+    #[cfg(unix)] // unix host paths; the Windows form is tested below
     #[test]
     fn sanitize_extra_mount_accepts_a_valid_host_container_pair() {
         let got = sanitize_extra_mount("/tmp/mcp-data:/data/mcp", "/Users/x", "/tmp/task");
         assert_eq!(got, Some(("/tmp/mcp-data".to_string(), "/data/mcp".to_string())));
     }
 
+    #[cfg(unix)] // unix host paths; the Windows form is tested below
     #[test]
     fn sanitize_extra_mount_expands_home_and_workspace_on_the_host_half() {
         let got = sanitize_extra_mount("$HOME/mcp-data:/data/mcp", "/Users/x", "/tmp/task");
         assert_eq!(got, Some(("/Users/x/mcp-data".to_string(), "/data/mcp".to_string())));
     }
 
+    #[cfg(unix)] // unix host paths; the Windows form is tested below
     #[test]
     fn sanitize_extra_mount_trims_a_trailing_slash_on_the_container_half() {
         let got = sanitize_extra_mount("/tmp/mcp-data:/data/mcp/", "/Users/x", "/tmp/task");
@@ -2569,7 +2698,9 @@ mod tests {
             let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-clip0001", "claude", &[], None);
             let att = spec.mounts.iter().find(|m| m.host.ends_with("termic-attachments"))
                 .expect("the attachments dir should be mounted");
-            assert_eq!(att.host, att.container, "same path both sides or the typed path is a lie");
+            // The same path both sides (Linux container path on Windows), or
+            // the path the frontend types is a lie.
+            assert_eq!(in_container(&att.host), att.container, "the typed path must be the mounted one");
             assert!(att.read_only, "the container has no reason to write here");
             assert!(std::path::Path::new(&att.host).is_dir(), "{} should exist already", att.host);
             // Canonical, or the Seatbelt rule, the mount and the typed text
@@ -2614,7 +2745,7 @@ mod tests {
             // The git identity file (step 4d) also lands under `/root/.config`
             // and is not a shared config dir: it is mounted for every task
             // regardless of this list, so it is exempt from the check.
-            assert!(!none.mounts.iter().any(|m| m.container.starts_with("/root/.config/")
+            assert!(!none.mounts.iter().any(|m| m.container.replace('\\', "/").starts_with("/root/.config/")
                 && m.container != "/root/.config/git/config"));
             assert!(!none.env.iter().any(|(k, _)| k == "GH_CONFIG_DIR"));
         });
@@ -2648,6 +2779,7 @@ mod tests {
         assert_ne!(gh[0], "/tmp/whatever");
     }
 
+    #[cfg(unix)] // unix host paths; the Windows form is tested below
     #[test]
     fn task_extra_mounts_are_added_and_deduped_by_container_path() {
         let task = stub_task("t11", "/tmp/termic-docker-test-does-not-exist-11");
@@ -2752,7 +2884,7 @@ mod tests {
         let allowed = vec![shared_path.clone()];
         let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &allowed, &[], "pty-aaaa1111", "claude", &[], None);
         let mounted: Vec<String> = spec.mounts.iter().map(|m| m.container.clone()).collect();
-        let canon = canonicalize_or_keep(&shared_path);
+        let canon = in_container(&canonicalize_or_keep(&shared_path));
         assert!(mounted.contains(&canon), "{mounted:?}");
     }
 
@@ -3153,5 +3285,33 @@ mod tests {
             apply(&mut row, Some(&stats), &mut hist, 3);
         }
         assert_eq!(row.cpu_history, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn windows_paths_map_to_a_stable_linux_path() {
+        assert_eq!(windows_to_container(r"C:\Users\u\repo"), "/c/Users/u/repo");
+        assert_eq!(windows_to_container(r"\\?\D:\wt\api"), "/d/wt/api");
+        assert_eq!(windows_to_container("C:/Users/u"), "/c/Users/u");
+        assert_eq!(windows_to_container(r"C:\"), "/c");
+        // Already a POSIX path: unchanged.
+        assert_eq!(windows_to_container("/root/.claude"), "/root/.claude");
+    }
+
+    #[test]
+    fn a_windows_extra_mount_splits_at_the_last_colon() {
+        // `C:\data:/data`: the drive colon must not be taken as the split.
+        let host = std::env::temp_dir();
+        let raw = format!("{}:/data/mcp", host.display());
+        let got = sanitize_extra_mount(&raw, "/Users/x", "/tmp/task").expect("a valid pair");
+        assert_eq!(got.1, "/data/mcp");
+    }
+
+    #[test]
+    fn the_windows_git_settings_keep_repo_local_config_in_charge() {
+        let c = windows_container_git_config(Some("true\n"));
+        assert!(c.contains("[gc]") && c.contains("auto = 0") && c.contains("worktreePruneExpire = never"), "{c}");
+        assert!(c.contains("autocrlf = true"), "{c}");
+        // Anything that is not a real autocrlf value is dropped, not written.
+        assert!(!windows_container_git_config(Some("yes\n[x]")).contains("autocrlf"));
     }
 }

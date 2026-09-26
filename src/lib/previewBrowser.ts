@@ -119,8 +119,36 @@ export function presetHint(p: BrowserPreset | undefined): string | undefined {
 /** Presets for the platform the app is running on. Windows is not a shipped
  *  target, so it falls through to the Linux list, whose "system default" entry
  *  is the only one that would work there anyway. */
+/** Windows presets. The browsers are not on PATH there, so each is named by
+ *  its default per-machine install path; the field stays editable for a
+ *  per-user install. */
+const CHROME_WIN = '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"';
+const EDGE_WIN = '"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"';
+const FIREFOX_WIN = '"C:\\Program Files\\Mozilla Firefox\\firefox.exe"';
+export const WINDOWS_BROWSER_PRESETS: BrowserPreset[] = [
+  { label: "System default", command: "" },
+  { label: "Microsoft Edge", command: EDGE_WIN },
+  { label: "Google Chrome", command: CHROME_WIN },
+  { label: "Firefox", command: FIREFOX_WIN },
+  {
+    label: "Chrome, specific profile",
+    command: `${CHROME_WIN} --profile-directory=Default`,
+    hint: "Find the profile name at chrome://version, under Profile Path.",
+  },
+  {
+    label: "Edge, specific profile",
+    command: `${EDGE_WIN} --profile-directory=Default`,
+    hint: "Find the profile name at edge://version, under Profile Path.",
+  },
+  { label: "Chrome, incognito", command: `${CHROME_WIN} --incognito` },
+  { label: "Edge, InPrivate", command: `${EDGE_WIN} --inprivate` },
+  { label: "Firefox, private window", command: `${FIREFOX_WIN} -private-window` },
+];
+
+/** Presets for the platform the app is running on. */
 export function browserPresets(platform: string = navigator.platform): BrowserPreset[] {
-  return /mac/i.test(platform) ? MAC_BROWSER_PRESETS : LINUX_BROWSER_PRESETS;
+  if (/mac/i.test(platform)) return MAC_BROWSER_PRESETS;
+  return /win/i.test(platform) ? WINDOWS_BROWSER_PRESETS : LINUX_BROWSER_PRESETS;
 }
 
 /** The command that should open a link for `project`, or "" for the OS

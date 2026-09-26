@@ -370,7 +370,7 @@ fn screenshot(app: &tauri::AppHandle) -> Result<Vec<u8>, String> {
     let (w, h) = (size.width as f64 / scale, size.height as f64 / scale);
 
     let out = std::env::temp_dir().join(format!("termic-automation-{}.png", std::process::id()));
-    let status = std::process::Command::new("screencapture")
+    let status = crate::proc_ctl::command("screencapture")
         .args([
             "-x",
             "-R",

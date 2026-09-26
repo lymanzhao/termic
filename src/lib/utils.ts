@@ -15,12 +15,18 @@ export function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)); }
  *  worktree DIRECTORY from the same name (`utils.test.ts` and lib.rs's
  *  `slugify_collapses_dash_runs` pin the pair against one case list). */
 export function slugify(s: string) {
-  return s
+  const slug = s
     .toLowerCase()
     .replace(/[^a-z0-9-_]+/g, "-")
     .replace(/-{2,}/g, "-")
     .replace(/^-+|-+$/g, "");
+  // Windows cannot create a directory with a reserved device name, and the
+  // slug is a worktree directory. On every OS, so a task named on a Mac
+  // still checks out on a teammate's Windows machine.
+  return WINDOWS_RESERVED.test(slug) ? `${slug}-1` : slug;
 }
+
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 
 /** Like {@link slugify} but PRESERVES slashes, so an already-qualified
  *  branch pasted from elsewhere (e.g. Linear's "username/my-feature")

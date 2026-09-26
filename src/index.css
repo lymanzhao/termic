@@ -74,6 +74,11 @@
   --color-ok-fg:     #ffffff;
   --color-warn:      #f0b13a;
   --color-err:       #ef5350;
+  /* The Windows caption bar's Close button (WindowControls): Windows' own
+     red with a white glyph on hover, the same in every theme because it is
+     the system's colour, not the app's. */
+  --color-caption-close:    #c42b1c;
+  --color-caption-close-fg: #ffffff;
   /* The one-letter git status chips (M / + / D) in the Git panel and
      Compare are a SOLID fill with ink on top, at 10.5px — so unlike a
      coloured letter on the app surface, each fill needs an ink that

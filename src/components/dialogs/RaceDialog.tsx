@@ -18,6 +18,7 @@ import { startRace, suggestRaceName, type Racer } from "@/lib/agentRace";
 import { projectYoloDefault } from "@/lib/projectSandboxDefault";
 import { cn, slugify } from "@/lib/utils";
 import { Flag, Loader2, Minus, Plus } from "lucide-react";
+import { SEATBELT_AVAILABLE } from "@/lib/platform";
 
 // Cap per CLI so a fat-fingered stepper can't spawn a dozen worktrees.
 const MAX_PER_CLI = 4;
@@ -57,9 +58,9 @@ export function RaceDialog() {
     // Sandbox and YOLO both seed from what a plain New Task in this project
     // would get (project default, then the global default).
     const p = useApp.getState().projects.find(p => p.id === projectId);
-    setSandbox(p?.default_sandbox_mode
+    setSandbox(SEATBELT_AVAILABLE && (p?.default_sandbox_mode
       ? isSandboxEnforced(p.default_sandbox_mode)
-      : (!!p?.default_sandbox || usePrefs.getState().globalDefaultSandboxKind !== "off"));
+      : (!!p?.default_sandbox || usePrefs.getState().globalDefaultSandboxKind !== "off")));
     setYolo(projectYoloDefault(p, usePrefs.getState().defaultYolo));
     setErr(null); setBusy(false); setProgress(null);
   }, [projectId, open]);
@@ -219,7 +220,8 @@ export function RaceDialog() {
           auto-on inside the cage); bare YOLO is the dangerous one and shows
           red, same vocabulary as the sidebar's zap badge. */}
       <div className="mt-3 flex items-center gap-5">
-        <label
+        {/* Seatbelt-only: off macOS there is no Enforce cage to put racers in. */}
+        {SEATBELT_AVAILABLE && <label
           title={t("race.sandboxTitle")}
           className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
         >
@@ -230,8 +232,7 @@ export function RaceDialog() {
             className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded border-[var(--color-border)] bg-[var(--color-bg-2)] text-[var(--color-accent)] focus:ring-0 focus:ring-offset-0"
           />
           {t("race.sandboxLabel")}
-        </label>
-        <label
+        </label>}        <label
           data-testid="race-yolo"
           title={sandbox
             ? t("race.yoloTitleSandboxed")

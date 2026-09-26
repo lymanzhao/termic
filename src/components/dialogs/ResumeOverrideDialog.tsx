@@ -18,6 +18,7 @@ import { taskSetResumeOverride, ptyKill } from "@/lib/ipc";
 import { isTerminalCli } from "@/lib/agents";
 import type { TerminalTab } from "@/lib/types";
 import { History, RotateCcw } from "lucide-react";
+import { kbd } from "@/lib/platform";
 
 export function ResumeOverrideDialog() {
   const { t } = useTranslation("dialogs");
@@ -135,9 +136,8 @@ export function ResumeOverrideDialog() {
         <span className="mt-1 block text-[11.5px] text-[var(--color-fg-faint)]">
           {t("resumeOverride.hintMissingSession")}{" "}
           {canRestart
-            ? <Trans t={t} i18nKey="resumeOverride.pressSaveRestart" components={{ kbd: <kbd className="font-mono" /> }} />
-            : <Trans t={t} i18nKey="resumeOverride.pressSave" components={{ kbd: <kbd className="font-mono" /> }} />}
-        </span>
+            ? <Trans t={t} i18nKey="resumeOverride.pressSaveRestart" values={{ combo: kbd("⌘↵") }} components={{ kbd: <kbd className="font-mono" /> }} />
+            : <Trans t={t} i18nKey="resumeOverride.pressSave" components={{ kbd: <kbd className="font-mono" /> }} />}        </span>
       </label>
 
       {err && <p className="mt-3 text-[13.5px] text-[var(--color-err)]">{err}</p>}

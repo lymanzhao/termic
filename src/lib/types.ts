@@ -3,6 +3,8 @@
 // The one import here, and type-only so nothing is pulled in at runtime: the
 // shape belongs with the policy that reads it, not with the wire structs.
 import type { DelegatedWork } from "./delegatedWork";
+// Dependency-free (a user-agent check), so this still pulls in nothing.
+import { SEATBELT_AVAILABLE } from "./platform";
 
 export type CLI = "claude" | "codex" | "agy" | "grok" | "opencode";
 
@@ -21,6 +23,9 @@ export function effectiveSandboxMode(
   task: { sandbox_mode?: SandboxMode; sandbox_enabled?: boolean } | null | undefined,
 ): SandboxMode {
   if (!task) return "off";
+  // No Seatbelt on this OS: whatever mode was stored reads as off, so
+  // nothing (YOLO auto-on above all) treats the task as caged.
+  if (!SEATBELT_AVAILABLE) return "off";
   if (task.sandbox_mode) return task.sandbox_mode;
   return task.sandbox_enabled ? "enforce" : "off";
 }
@@ -308,6 +313,11 @@ export interface Task {
   order?: number;
   /** Sidebar task group (see `TaskGroup`). Absent on ungrouped tasks. */
   group?: TaskGroup;
+  /** Id of the task whose agent created this one through the CLI or MCP.
+   *  Set with or without a shared group: a task spawned into another project
+   *  joins none, and this is its only link back (the sidebar draws it on
+   *  hover, src/components/sidebar/SpawnLinks.tsx). */
+  spawned_by?: string;
   /** True when this task points at the project's main repo checkout
    *  (no git worktree). The UI shows a distinct icon and archive only
    *  removes the entry — the repo on disk is untouched. */

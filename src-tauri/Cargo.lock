@@ -5241,12 +5241,13 @@ dependencies = [
 
 [[package]]
 name = "termic"
-version = "1.8.3"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
+ "dunce",
  "flate2",
  "font-kit",
  "glob",
@@ -5281,6 +5282,8 @@ dependencies = [
  "termic-proto",
  "toml_edit 0.25.11+spec-1.1.0",
  "uuid",
+ "webview2-com",
+ "windows-core 0.61.2",
  "windows-sys 0.60.2",
  "zip",
 ]
@@ -5304,7 +5307,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "windows-sys 0.60.2",
 ]
 
 [[package]]

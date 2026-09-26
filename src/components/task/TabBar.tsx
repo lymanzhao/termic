@@ -26,6 +26,7 @@ import { delegatedTitle } from "@/lib/delegatedWork";
 import { BackgroundRing } from "@/components/ui/BackgroundRing";
 import { formatTerminalTitle } from "@/lib/terminalTitle";
 import { fileIconUrl, folderIconUrl } from "@/lib/explorer/iconResolver";
+import { kbd } from "@/lib/platform";
 
 const CLIS = ["claude", "codex", "agy", "grok", "opencode"] as const;
 
@@ -256,7 +257,7 @@ export function TabBar({ task }: { task: Task }) {
 
       {/* Fixed control cluster — never scrolls; always reachable on the right. */}
       <div className="flex shrink-0 items-center gap-1 pl-1 pr-2">
-        <Tip content={t("tabBar.broadcastTip")} side="bottom">
+        <Tip content={t("tabBar.broadcastTip", { combo: kbd("⇧⌘B") })} side="bottom">
           <Button
             size="icon" variant="icon" className="h-8 w-8"
             onClick={() => openBroadcast(task.id)}
@@ -279,7 +280,7 @@ function SplitPaneToggle({ taskId }: { taskId: string }) {
   const hasSplit = useApp(s => !!s.splitTree[taskId]);
   const splitPane = useApp(s => s.splitPane);
   return (
-    <Tip content={t("tabBar.splitRightTip")} side="bottom">
+    <Tip content={t("tabBar.splitRightTip", { combo: kbd("⌘D") })} side="bottom">
       <Button
         size="icon" variant="icon" className="h-8 w-8"
         onClick={() => splitPane(taskId, 'v')}
@@ -296,7 +297,7 @@ function SplitBelowToggle({ taskId }: { taskId: string }) {
   const hasSplit = useApp(s => !!s.splitTree[taskId]);
   const splitPane = useApp(s => s.splitPane);
   return (
-    <Tip content={t("tabBar.splitBelowTip")} side="bottom">
+    <Tip content={t("tabBar.splitBelowTip", { combo: kbd("⇧⌘D") })} side="bottom">
       <Button
         size="icon" variant="icon" className="h-8 w-8"
         onClick={() => splitPane(taskId, 'h')}

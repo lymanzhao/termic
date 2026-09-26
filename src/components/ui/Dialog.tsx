@@ -5,6 +5,7 @@ import { X } from "lucide-react";
 import type React from "react";
 import { type ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { dragRegion, appRegionStyle } from "@/lib/platform";
 
 interface Props {
   open: boolean;
@@ -52,7 +53,7 @@ interface Props {
  *  needs to be clickable at all, plus the link styling the switches share. */
 export const dialogTitleAction = {
   "data-tauri-drag-region": "false",
-  style: { WebkitAppRegion: "no-drag" } as React.CSSProperties,
+  style: appRegionStyle("no-drag") as React.CSSProperties,
   className:
     "inline-flex items-center gap-1.5 whitespace-nowrap text-[12.5px] text-[var(--color-fg-dim)] hover:text-[var(--color-accent)]",
 } as const;
@@ -74,8 +75,7 @@ export function AppDialog({ open, onOpenChange, title, description, className, h
             click (no movement) still bubbles to Radix for outside-
             click-to-dismiss. */}
         <Dialog.Overlay
-          data-tauri-drag-region
-          style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+          {...dragRegion()}
           className={cn(
             "fixed inset-0 z-40 data-[state=open]:animate-in data-[state=open]:fade-in-0",
             overlayClassName ?? "bg-black/65",
@@ -125,8 +125,7 @@ export function AppDialog({ open, onOpenChange, title, description, className, h
                 // is positioned absolute and opts out via its own
                 // data-tauri-drag-region="false".
                 <div
-                  data-tauri-drag-region
-                  style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+                  {...dragRegion()}
                   // Always spaced from the body. The container's `gap-2` is
                   // 8px, which is a paragraph gap, not a header gap: with a
                   // description the title, the description and the first field
@@ -157,7 +156,7 @@ export function AppDialog({ open, onOpenChange, title, description, className, h
             {!hideClose && (
               <Dialog.Close
                 data-tauri-drag-region="false"
-                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+                style={appRegionStyle("no-drag")}
                 className="absolute right-3 top-3 rounded-md p-1 text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)]"
               >
                 <X className="h-4 w-4" />

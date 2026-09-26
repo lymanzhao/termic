@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { createQuickTask, derivedBranch } from "@/lib/quickTask";
 import { GitBranch, SquareChevronRight } from "lucide-react";
+import { kbd } from "@/lib/platform";
 
 export function CustomCommandDialog() {
   const { t } = useTranslation("dialogs");
@@ -138,6 +139,7 @@ export function CustomCommandDialog() {
           <Trans
             t={t}
             i18nKey="customCommand.commandHintLaunch"
+            values={{ combo: kbd("⌘↵") }}
             components={{ kbd: <kbd className="font-mono" /> }}
           />
         </span>

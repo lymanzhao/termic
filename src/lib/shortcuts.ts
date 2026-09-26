@@ -12,6 +12,7 @@
 // their own flags. `key` is a normalized token: a lowercase letter ("l"),
 // punctuation ("[", "]", ","), an arrow ("ArrowUp"…), or the sentinel "1-9"
 // for the "jump to tab N" range (matches any digit 1-9 with the modifiers).
+import { IS_MAC, kbd } from "./platform";
 
 export type Binding = {
   cmd: boolean;
@@ -108,10 +109,10 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
   // has. The defaults are IntelliJ's, which is where most of this app's users
   // learned them.
   { id: "go-to-definition", group: "Code navigation", label: "Go to definition",
-    hint: "In the editor. Lands on the source, not a stub; ⌘-click does the same.",
+    hint: `In the editor. Lands on the source, not a stub; ${kbd("⌘")}-click does the same.`,
     defaultBinding: B("F12") },
   { id: "find-usages", group: "Code navigation", label: "Find usages",
-    hint: "In the editor. ⌘-clicking a definition asks the same question.",
+    hint: `In the editor. ${kbd("⌘")}-clicking a definition asks the same question.`,
     defaultBinding: B("F12", { shift: true }) },
   // NOT IntelliJ's ⌥⌘B and ⌃⇧B. ⌥⌘B already toggles the right sidebar here,
   // and the editor's copy of it fired on top of that (this table's own
@@ -158,7 +159,7 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
     // NOT ⌘N — that is already "New task…" and stealing it would cost the
     // app's most-used create. ⌥⌘N is free (⌥⌘B and ⌥⌘P are the other two
     // Option-Cmd bindings) and rebindable like everything else.
-    hint: "An untitled buffer in this task. It survives a relaunch; ⌘S saves it into the project.",
+    hint: `An untitled buffer in this task. It survives a relaunch; ${kbd("⌘S")} saves it into the project.`,
     defaultBinding: B("n", { cmd: true, alt: true }) },
   { id: "close-tab", group: "Tabs", label: "Close active tab",
     defaultBinding: B("w", { cmd: true }) },
@@ -168,13 +169,13 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
     hint: "Jump focus to the main pane (its agent terminal or the open editor) from anywhere",
     defaultBinding: B("l", { cmd: true }) },
   { id: "clear-terminal", group: "Terminal", label: "Clear focused terminal",
-    hint: "Clears the focused terminal's scrollback, the standard ⌘K every terminal uses.",
+    hint: `Clears the focused terminal's scrollback, the standard ${kbd("⌘K")} every terminal uses.`,
     defaultBinding: B("k", { cmd: true }) },
   { id: "split-pane-right", group: "Terminal", label: "Split pane right",
     hint: "Open a new pane to the right of the focused pane (vertical divider).",
     defaultBinding: B("d", { cmd: true }) },
   { id: "split-pane-below", group: "Terminal", label: "Split pane below",
-    hint: "Open a new pane below the focused pane (horizontal divider). Also: ⇧⌘D by default.",
+    hint: `Open a new pane below the focused pane (horizontal divider). Also: ${kbd("⇧⌘D")} by default.`,
     defaultBinding: B("d", { cmd: true, shift: true }) },
   { id: "toggle-terminal", group: "Terminal", label: "Toggle terminal panel",
     hint: "Show + focus the bottom split, or hide it and return to the agent",
@@ -194,7 +195,7 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
 
   // General
   { id: "command-palette", group: "General", label: "Command palette",
-    hint: "Search every command and action (the ⇧⌘P convention from VS Code / Sublime)",
+    hint: `Search every command and action (the ${kbd("⇧⌘P")} convention from VS Code / Sublime)`,
     defaultBinding: B("p", { cmd: true, shift: true }) },
   { id: "new-task-quick", group: "General", label: "New task…",
     hint: "Search a project and start a new task", defaultBinding: B("n", { cmd: true }) },
@@ -387,14 +388,14 @@ export function eventKeyToken(e: KeyboardEvent): string {
  *  sentinel matches any digit 1-9 with the binding's modifiers. */
 export function bindingMatches(e: KeyboardEvent, b: Binding | undefined): boolean {
   if (!b) return false;
-  // LINUX/WINDOWS: folding Ctrl into `cmd` is safe on macOS (the shell uses
-  // the physically-separate Ctrl key, the app uses Cmd) but hijacks readline
-  // off macOS — Ctrl+W (close-tab), Ctrl+K (clear-terminal), Ctrl+T (new-tab),
-  // Ctrl+P (file-finder) are all emacs/readline editing keys. `focus-terminal`
-  // dodges this via its isTyping guard; the others don't. Before shipping a
-  // real Linux/Windows build, gate this fold so Ctrl is only the app modifier
-  // when focus is NOT inside a terminal (or require Meta specifically on those
-  // platforms). See the matching note in useShortcuts.ts.
+  // LINUX/WINDOWS: Ctrl folds into `cmd`, so every shortcut fires there too.
+  // Inside a terminal, readline keeps plain Ctrl+letter: xterm consumes those
+  // before this handler sees them, and TerminalPane's PASS_TO_APP only takes
+  // Shift/Alt bindings off macOS (docs/windows.md, "Keys").
+  //
+  // AltGr (German, Polish, French layouts) reports as Ctrl+Alt in Chromium,
+  // so a key that types `@` or `{` would otherwise fire a Ctrl+Alt binding.
+  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   const cmd = e.metaKey || e.ctrlKey;
   if (cmd !== b.cmd || e.shiftKey !== b.shift || e.altKey !== b.alt) return false;
   if (b.key === "1-9") return /^[1-9]$/.test(e.key);
@@ -458,10 +459,7 @@ export function bindingToCmKey(b: Binding): string {
  *  platform (Ctrl+L on Linux/Windows hits the same command as ⌘L on a Mac);
  *  this flag only changes how modifiers are LABELLED. Detected once from the
  *  user agent — synchronous, unlike Tauri's async `platform()`. */
-export const IS_MAC: boolean = (() => {
-  if (typeof navigator === "undefined") return true;
-  return /Mac|iPhone|iPad|iPod/.test(navigator.userAgent || "");
-})();
+export { IS_MAC };
 
 /** The Cmd-or-Ctrl modifier reads as "Cmd" on macOS, "Ctrl" elsewhere; the
  *  Option-or-Alt modifier reads as "Option" on macOS, "Alt" elsewhere. */
@@ -510,6 +508,27 @@ export function bindingGlyphs(b: Binding): string[] {
   if (b.cmd) out.push("⌘");
   out.push(keyGlyph(b.key));
   return out;
+}
+
+/** A binding as one string, for tooltips and hints: the glyph run on macOS
+ *  (`⌥⌘P`), the Windows / Linux convention elsewhere (`Ctrl+Alt+P`), where
+ *  ⌘ and ⌥ are keys nobody has. */
+export function bindingText(b: Binding, isMac: boolean = IS_MAC): string {
+  if (isMac) return bindingGlyphs(b).join("");
+  // Windows / Linux order: Ctrl, Alt, Shift, then the key (Microsoft's
+  // style guide, and what VS Code and Windows Terminal print). The glyph
+  // order above is the macOS one (⌥⇧⌘), which read "Shift+Ctrl+P".
+  const parts: string[] = [];
+  if (b.cmd) parts.push("Ctrl");
+  if (b.alt) parts.push("Alt");
+  if (b.shift) parts.push("Shift");
+  parts.push(glyphLabel(keyGlyph(b.key)));
+  return parts.join("+");
+}
+
+/** One chip's label: the glyph on macOS, the key's name elsewhere. */
+export function displayGlyph(glyph: string): string {
+  return IS_MAC ? glyph : glyphLabel(glyph);
 }
 
 /** Stable signature for conflict detection (two ids sharing one = a clash). */

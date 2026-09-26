@@ -7,7 +7,7 @@ members = ["../termic-proto", "../termic-cli"]
 
 [package]
 name = "termic"
-version = "1.8.3"
+version = "1.9.1"
 description = "Run claude, gemini, and codex in parallel — each in its own git worktree."
 authors = ["Simion Agavriloaei"]
 edition = "2021"
@@ -92,8 +92,30 @@ tauri-plugin-deep-link = "2"
 # Wire types + framing for the CLI control socket (cli_server.rs). The
 # same crate termic-cli links, so server and client cannot drift.
 termic-proto = { path = "../termic-proto" }
+# canonicalize() without Windows' `\\?\` verbatim prefix, which cmd.exe (and
+# so every npm `.cmd` agent shim) refuses as a working directory. A no-op
+# re-export of std on unix.
+dunce = "1"
 # Optional: only pulled in by the `e2e` feature (WebdriverIO harness).
 tauri-plugin-wdio-webdriver = { version = "1", optional = true }
+
+# Windows-only: process-tree kill and liveness (proc_ctl.rs). Already in
+# the dependency tree via tauri/wry, so this adds no build time.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_System_IO",
+  "Win32_System_Registry",
+] }
+# WebView2's settings object, to switch off its browser accelerator keys
+# (lib.rs `disable_browser_accelerators`). Both are what wry itself uses.
+webview2-com = "0.38"
+windows-core = "0.61"
 
 # macOS-only: raw Objective-C bridge used to round the window's content
 # layer on macOS Tahoe (26+) so the WKWebView corners match the system's

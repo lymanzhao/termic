@@ -10,6 +10,11 @@
 #   BUNDLE_ID used to quit a running copy   (default: com.simion.termic)
 set -euo pipefail
 
+# Windows (Git Bash): an NSIS installer, not a .app. Same contract.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) exec "$(dirname "$0")/install-app-windows.sh" "${1:-Termic}" ;;
+esac
+
 APP_NAME="${1:-Termic}"
 BUNDLE_ID="${2:-com.simion.termic}"
 SRC="src-tauri/target/release/bundle/macos/$APP_NAME.app"

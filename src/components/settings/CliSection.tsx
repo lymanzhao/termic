@@ -18,6 +18,7 @@ import type { CliInstallStatus } from "@/lib/types";
 import { Button } from "@/components/ui/Button";
 import { Block, SectionTitle, Toggle, useBackendSettings } from "./Controls";
 import { cn } from "@/lib/utils";
+import { IS_WINDOWS } from "@/lib/platform";
 
 export function CliSection() {
   const { t } = useTranslation("settings");
@@ -113,6 +114,15 @@ export function CliSection() {
           value={cliEnabled}
           onChange={saveCliEnabled}
         />
+        {IS_WINDOWS ? (
+          // No install-onto-PATH on Windows yet (cli_server.rs,
+          // windows_unsupported): say so instead of offering buttons that fail.
+          <p className={cn("mt-3 text-[12.5px] text-[var(--color-fg-dim)]", !cliEnabled && "opacity-50")}>
+            Installing <code className="font-mono">{name}</code> onto your PATH is not available on Windows yet.
+            Agents running inside Termic already have it: their terminals get the command on PATH and in{" "}
+            <code className="font-mono">TERMIC_CLI</code>.
+          </p>
+        ) : (
         <div className={cn("mt-3", !cliEnabled && "pointer-events-none opacity-50 select-none")}>
           {cliInstall?.path ? (
             <p className="text-[12.5px] text-[var(--color-fg-dim)]">
@@ -190,6 +200,7 @@ export function CliSection() {
             <p className="mt-2 text-[12px] text-[var(--color-fg-faint)]">{cliInstallMsg}</p>
           )}
         </div>
+        )}
       </Block>
 
       <Block>

@@ -8,6 +8,7 @@ import { useTranslation, Trans } from "react-i18next";
 import { cn } from "@/lib/utils";
 import type { SandboxMode, SandboxSelection } from "@/lib/types";
 import { SANDBOX_VISUALS, sandboxPickerLabelT, sandboxModeText, SandboxIcon, DockerSandboxIcon, DOCKER_SANDBOX_COLOR } from "@/components/SandboxIcon";
+import { SEATBELT_AVAILABLE } from "@/lib/platform";
 
 /** Row-major order: OFF / ENFORCING (FS) on top, MONITORING / ENFORCING
  *  below, DOCKER on its own row - it's a different MECHANISM, not another
@@ -36,10 +37,15 @@ export function SandboxPicker({
   compact?: boolean;
 }) {
   const { t } = useTranslation("chrome");
+  // Off this OS's map entirely (Windows, Linux): the Seatbelt cards are not
+  // shown at all, rather than shown disabled, so the choice reads as what it
+  // is there: no cage, or Docker.
+  const hideSeatbelt = !SEATBELT_AVAILABLE;
+  const order: SandboxMode[] = hideSeatbelt ? ["off"] : ORDER;
   return (
     <div className="flex flex-col gap-2">
-      <div className="grid grid-cols-2 gap-2">
-        {ORDER.map(id => {
+      <div className={cn("grid gap-2", hideSeatbelt ? "grid-cols-1" : "grid-cols-2")}>
+        {order.map(id => {
           const v = SANDBOX_VISUALS[id];
           const active = value === id;
           const unsupported = seatbeltUnavailable && id !== "off";

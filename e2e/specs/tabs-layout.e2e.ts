@@ -858,6 +858,10 @@ describe("layout", () => {
   // are the one gesture family that isn't pointer-based), persisted to
   // localStorage so the width survives a relaunch.
   it("widens the sidebar by dragging its edge", async () => {
+    // From the floor, so the drag has room under the 33vw cap: on a 1024px
+    // window (the CI runner's) the default width plus 60 is past it.
+    await mouseDrag("[data-resize-handle='sidebar-width']", -600);
+    await browser.waitUntil(async () => ((await width()) as number) === 160, { timeout: 8_000 });
     const start = (await width()) as number;
     await mouseDrag("[data-resize-handle='sidebar-width']", 60);
     await browser.waitUntil(async () => ((await width()) as number) > start + 40, {

@@ -76,12 +76,11 @@ function staticImports(code: string): string[] {
 }
 
 /** Every module statically reachable from `main.tsx`, plus the first path by
- *  which each was reached (so a failure names the chain, not just the file).
- *  Map keys are normalized to forward slashes: Windows path.join produces
- *  backslash keys, and the endsWith/startsWith assertions below are written
- *  against POSIX-style specifiers. The queue keeps the raw path. */
+ *  which each was reached (so a failure names the chain, not just the file). */
 function walk(): Map<string, string[]> {
-  const norm = (p: string) => p.replace(/\\/g, "/");
+  // Keys use `/` on every OS: the assertions below match suffixes like
+  // `lib/languages.ts`, and a Windows path would silently never match,
+  // passing the forbidden-import checks without checking anything.
   const seen = new Map<string, string[]>([[norm(ENTRY), [norm(ENTRY)]]]);
   const queue = [ENTRY];
   while (queue.length) {
@@ -89,7 +88,7 @@ function walk(): Map<string, string[]> {
     const trail = seen.get(norm(file))!;
     for (const spec of staticImports(readFileSync(file, "utf8"))) {
       const next = resolveLocal(spec, file);
-      const key = norm(next ?? spec);
+      const key = next ? norm(next) : spec;
       if (seen.has(key)) continue;
       seen.set(key, [...trail, key]);
       if (next) queue.push(next);
@@ -98,10 +97,13 @@ function walk(): Map<string, string[]> {
   return seen;
 }
 
-const srcNorm = src.replace(/\\/g, "/");
+function norm(p: string) {
+  return p.replaceAll("\\", "/");
+}
 
 function rel(p: string) {
-  return p.startsWith(srcNorm) ? p.slice(srcNorm.length + 1) : p;
+  const root = norm(src);
+  return p.startsWith(root) ? p.slice(root.length + 1) : p;
 }
 
 describe("main chunk", () => {

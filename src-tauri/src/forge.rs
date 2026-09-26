@@ -17,7 +17,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -176,14 +175,8 @@ fn resolve_bin(name: &str) -> Option<String> {
 }
 
 fn resolve_bin_uncached(name: &str) -> Option<String> {
-    for dir in shell_env::resolved_path().split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let cand = Path::new(dir).join(name);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().into_owned());
-        }
+    if let Some(p) = shell_env::which(name) {
+        return Some(p.to_string_lossy().into_owned());
     }
     let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     [
@@ -205,7 +198,7 @@ fn reprobe_bin(name: &str) -> Option<String> {
 }
 
 fn run(bin: &str, args: &[&str], cwd: Option<&Path>) -> std::io::Result<std::process::Output> {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::proc_ctl::command(bin);
     cmd.args(args)
         // Login-shell PATH so the CLI can find its own helpers (git,
         // credential managers) even when termic launched from Finder.

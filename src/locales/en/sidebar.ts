@@ -32,7 +32,7 @@ export default {
   removeFromGroup: "Remove from group",
   spotlightEnable: "Enable spotlight",
   spotlightDisable: "Disable spotlight",
-  revealInFinder: "Reveal in Finder",
+  revealInFinder: "Reveal in {{manager}}",
   copyPath: "Copy path",
   removeProjectTitle: "Remove \"{{name}}\"?",
   removeProjectMessage: "All tasks will be archived and their worktrees removed from disk. The repo folder is kept. This cannot be undone from inside Termic.",

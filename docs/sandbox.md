@@ -2,6 +2,18 @@
 
 `src-tauri/src/sandbox.rs` + `TaskSandboxDialog`. Per-task macOS sandbox-exec (Seatbelt) + per-task in-process HTTPS CONNECT proxy (`src-tauri/src/proxy.rs`).
 
+## Off macOS (Windows, Linux)
+
+Seatbelt is macOS-only, so there the only sandbox is Docker mode. A stored
+Seatbelt mode (a Mac teammate's committed `.termic.yaml`, a project default,
+`--sandbox enforce` from the CLI) reads as **Off** everywhere:
+`Task::effective_sandbox_mode` in Rust and `effectiveSandboxMode` in
+`src/lib/types.ts`, keyed off `sandbox::available()` and `SEATBELT_AVAILABLE`.
+Before that, such a task reached `pty_spawn`, `provision` failed, and it
+spawned uncaged while the frontend counted it caged and turned YOLO on. The
+pickers show only Off and Docker there. Windows specifics of Docker mode:
+[windows.md](windows.md).
+
 ## Scope
 
 ONLY the agent CLI's PTY is sandboxed. AuxTerminal, setup script, run script, and archive script run unsandboxed by design — they're user-authored shell needing full reach. The carve-out is enforced by not passing `task_id` in `pty_spawn` / routing scripts through `run_script` which never calls `sandbox::provision`.

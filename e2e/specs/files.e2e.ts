@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { archiveTask, dismissOverlays, ensureActiveTask, openTask, requireTermicApi, snap, waitForAppShell } from "../helpers";
 
@@ -644,7 +644,7 @@ describe("file tree", () => {
   const resetUnreadable = (dir: string) => {
     if (!existsSync(dir)) return;
     try { execSync(`chmod -R u+rwx "${dir}"`); } catch { /* already readable */ }
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   };
 
   it("keeps a folder's contents when a settle reload cannot read it", async () => {
@@ -693,11 +693,12 @@ describe("file tree", () => {
     } finally {
       execSync(`chmod 755 "${dir}"`);
     }
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     rmSync(path.join(fixture, "e2e-unreadable-sibling.txt"), { force: true });
   });
 
-  it("offers a retry when a folder cannot be read at all", async () => {
+  // `chmod 000` does not make a folder unreadable on Windows.
+  (process.platform === "win32" ? it.skip : it)("offers a retry when a folder cannot be read at all", async () => {
     await waitForAppShell();
     await requireTermicApi();
     taskId = taskId ?? (await openTask("e2e-tree"));
@@ -753,7 +754,7 @@ describe("file tree", () => {
       });
     } finally {
       execSync(`chmod 755 "${dir}"`);
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
     }
   });
 
@@ -771,7 +772,11 @@ describe("file tree", () => {
     const link = path.join(fixture, "e2e-escaped");
     mkdirSync(outside, { recursive: true });
     writeFileSync(path.join(outside, "secret.txt"), "s\n");
-    execSync(`ln -sfn "${outside}" "${link}"`);
+    // From Node rather than `ln -s`: Git Bash's ln copies the folder unless
+    // told otherwise, and a copy escapes nothing. A junction on Windows
+    // needs no privilege, unlike a directory symlink.
+    try { unlinkSync(link); } catch { try { rmdirSync(link); } catch { /* none */ } }
+    symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
     try {
       await browser.execute(
         (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
@@ -800,8 +805,10 @@ describe("file tree", () => {
       expect(reason.title).toContain("path escapes task");
       expect(reason.title).toContain("e2e-outside-target");
     } finally {
-      rmSync(link, { force: true });
-      rmSync(outside, { recursive: true, force: true });
+      // A directory symlink is a directory to Windows: unlink refuses it
+      // (EISDIR / EPERM) and rmdir removes the link without its target.
+      try { unlinkSync(link); } catch { try { rmdirSync(link); } catch { /* gone */ } }
+      rmSync(outside, { recursive: true, force: true, maxRetries: 10 });
     }
   });
 
@@ -989,21 +996,21 @@ describe("open a file in its default app", () => {
   it("opens a binary the editor cannot render", async () => {
     // .blend is not valid UTF-8, so clicking it only ever gets the "it looks
     // binary" editor message. The case with no in-app answer at all.
-    const paths = await openExternally("e2e-model.blend");
+    const paths = (await openExternally("e2e-model.blend")).map((p: string) => p.replace(/\\/g, "/"));
     expect(paths.some((p) => p.endsWith("/e2e-model.blend"))).toBe(true);
     // Absolute, not task-relative: the backend shells out with no task context.
-    expect(paths[paths.length - 1].startsWith("/")).toBe(true);
+    expect(/^(\/|[A-Za-z]:\/)/.test(paths[paths.length - 1])).toBe(true);
   });
 
   it("opens a text file the editor renders perfectly well", async () => {
-    const paths = await openExternally("e2e-part.scad");
+    const paths = (await openExternally("e2e-part.scad")).map((p: string) => p.replace(/\\/g, "/"));
     expect(paths.some((p) => p.endsWith("/e2e-part.scad"))).toBe(true);
   });
 
   it("opens an image that has its own in-app viewer", async () => {
     // A PNG already previews in the app, so the external open is an ADDITION
     // here. "termic can show it" is not a reason to withhold the real editor.
-    const paths = await openExternally("e2e-shot.png");
+    const paths = (await openExternally("e2e-shot.png")).map((p: string) => p.replace(/\\/g, "/"));
     expect(paths.some((p) => p.endsWith("/e2e-shot.png"))).toBe(true);
   });
 

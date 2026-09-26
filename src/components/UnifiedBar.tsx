@@ -36,11 +36,13 @@ import {
 import { usePromptLibrary, promptTitle } from "@/store/prompts";
 import { useUI } from "@/store/ui";
 import { usePrefs, resolveTheme } from "@/store/prefs";
-import { bindingGlyphs } from "@/lib/shortcuts";
+import { bindingGlyphs, bindingText } from "@/lib/shortcuts";
 import { useIsFullscreen } from "@/hooks/useIsFullscreen";
 import { RunControls } from "@/components/task/RunControls";
 import { CommandPaletteButton } from "@/components/CommandPaletteButton";
 import { cn } from "@/lib/utils";
+import { IS_MAC, IS_WINDOWS, appRegionStyle } from "@/lib/platform";
+import { WindowControls } from "@/components/WindowControls";
 
 // Reserve enough room for the 3 traffic lights + breathing room before the
 // first interactive control. 16 (x offset) + ~58 (3 buttons + gaps) + 10 pad.
@@ -89,7 +91,7 @@ export function UnifiedBar() {
   // tooltip with no key at all.
   const binds = usePrefs(s => s.shortcuts);
   const tipWithKey = (text: string, id: import("@/lib/shortcuts").ShortcutId) => {
-    const g = binds[id] ? bindingGlyphs(binds[id]).join("") : "";
+    const g = binds[id] ? bindingText(binds[id]) : "";
     return g ? `${text} (${g})` : text;
   };
   const isAuto = themeMode === "auto";
@@ -98,7 +100,7 @@ export function UnifiedBar() {
 
   return (
     <header
-      data-tauri-drag-region
+      data-tauri-drag-region={IS_MAC || undefined}
       // Which task the chrome has actually RENDERED, which is not the same
       // fact as useApp's activeTaskId. The store setter is synchronous but
       // React 19 renders concurrently, so between the two the archive button
@@ -111,13 +113,26 @@ export function UnifiedBar() {
       // ignores both. onMouseDown → startDragging() is the bulletproof escape
       // hatch. Guarded so we only drag on a primary click that hits the bar
       // itself (or a non-interactive descendant like the breadcrumb text).
+      // This bar IS the title bar on macOS (hidden, overlay title bar) and on
+      // Windows (no native frame, WindowControls draws the buttons). Linux
+      // keeps its native title bar, which already drags.
+      //
+      // Windows reads a double click off the mousedown's click count, not
+      // from onDoubleClick: startDragging hands the mouse to the system's
+      // move loop, which swallows the mouseup a dblclick event needs.
       onMouseDown={(e) => {
+        if (!IS_MAC && !IS_WINDOWS) return;
         if (e.button !== 0) return;
         const t = e.target as HTMLElement;
         if (t.closest("[data-no-drag]") || t.closest("button") || t.closest("input")) return;
+        if (IS_WINDOWS && e.detail === 2) {
+          getCurrentWindow().toggleMaximize().catch(() => {});
+          return;
+        }
         getCurrentWindow().startDragging().catch(() => {});
       }}
       onDoubleClick={(e) => {
+        if (!IS_MAC) return;
         const t = e.target as HTMLElement;
         if (t.closest("[data-no-drag]") || t.closest("button") || t.closest("input")) return;
         // macOS convention: double-click title bar zooms the window.
@@ -127,8 +142,9 @@ export function UnifiedBar() {
       style={{
         // px-2 (8px) already pads the left in full-screen; only reserve the
         // wide traffic-light gap when the lights are actually there.
-        paddingLeft: isFullscreen ? undefined : TRAFFIC_LIGHT_WIDTH,
-        WebkitAppRegion: "drag",
+        // No traffic lights off macOS at all.
+        paddingLeft: IS_MAC && !isFullscreen ? TRAFFIC_LIGHT_WIDTH : undefined,
+        ...appRegionStyle("drag"),
         // The profile's accent, washed in from the left and gone by the first
         // third (GH #280). Backed by a real product: JetBrains tints this
         // exact strip per project, and it works because the bar is the one
@@ -149,7 +165,7 @@ export function UnifiedBar() {
       <div
         data-tauri-drag-region="false"
         className="flex items-center gap-2"
-        style={{ WebkitAppRegion: "no-drag" } as any}
+        style={appRegionStyle("no-drag")}
       >
         <Tip content={compact ? t("unifiedBar.expandSidebar") : t("unifiedBar.collapseSidebar")} side="bottom">
           <Button size="icon" variant="icon" onClick={() => {
@@ -243,7 +259,7 @@ export function UnifiedBar() {
       <div
         data-tauri-drag-region="false"
         className="flex items-center gap-0.5"
-        style={{ WebkitAppRegion: "no-drag" } as any}
+        style={appRegionStyle("no-drag")}
       >
         {/* Command palette. First in the cluster and outside the task guard:
             it is the only control here that is never task-scoped, and the
@@ -380,6 +396,12 @@ export function UnifiedBar() {
             </Tip>
           </>
         )}
+      </div>
+      {/* Windows: minimize / maximize / close, flush with the window's
+          top-right corner (the bar's own right padding is undone), as on
+          every Windows title bar. Nothing elsewhere. */}
+      <div className="-mr-2 ml-1 flex self-stretch">
+        <WindowControls />
       </div>
     </header>
   );

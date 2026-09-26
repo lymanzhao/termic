@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# A newer push supersedes the run still going for the same branch or PR:
+# its results would be stale on arrival, and the three e2e jobs hold a
+# macOS, a Linux and (in windows.yml) a Windows runner for ~20 minutes.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   typescript:
     name: TypeScript (Vitest)
@@ -46,6 +53,61 @@ jobs:
         # termic-cli exit-code + output goldens) run alongside the app's
         # lib tests. The behavioral sandbox tests self-skip off macOS.
         run: cargo test --workspace --lib
+
+  e2e-linux:
+    # The same WebdriverIO suite on Linux (WebKitGTK under Xvfb), so a change
+    # is checked on all three platforms: this, the macOS job below, and the
+    # Windows job in windows.yml. Reporting, not gating, like the other two.
+    name: E2E (WebdriverIO, Linux)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
+            xvfb dbus-x11 at-spi2-core xclip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      # Specs commit in the fixture repo; a fresh runner has no identity.
+      - run: |
+          git config --global user.name "termic e2e"
+          git config --global user.email "e2e@termic.dev"
+      - name: Seed e2e fixture profile
+        run: node scripts/e2e-seed.mjs
+      - name: Build e2e binary
+        run: npm run e2e:build
+      - name: Run e2e suite
+        timeout-minutes: 75
+        env:
+          TERMIC_E2E_FAIL_CAPTURE: "1"
+        run: dbus-run-session -- xvfb-run -a -s "-screen 0 1440x900x24" npm run test:e2e
+      - name: Collect the debug log
+        if: always()
+        run: |
+          mkdir -p .e2e/artifacts
+          cp /tmp/termic-debug.log .e2e/artifacts/ 2>/dev/null || true
+          cp .e2e/profile/e2e-*.log .e2e/artifacts/ 2>/dev/null || true
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-linux
+          path: .e2e/artifacts
+          if-no-files-found: ignore
+          include-hidden-files: true
 
   e2e:
     # Written WebdriverIO suite driving the real macOS WKWebView window

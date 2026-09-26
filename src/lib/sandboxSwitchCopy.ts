@@ -7,6 +7,7 @@
 // only way to phrase these prompts, and `sandboxSwitchCopy.test.ts` pins the
 // invariant.
 
+import { THIS_MACHINE } from "./platform";
 /**
  * Crossing into or out of Docker moves where the agent keeps its sessions:
  * in Docker mode that is termic's own mounted config dir
@@ -32,7 +33,7 @@ export function dockerToggleMessage(toDocker: boolean): string {
 /** Confirm body for leaving Docker and landing on a Seatbelt mode (or none). */
 export function leaveDockerMessage(to: "off" | "seatbelt"): string {
   const base = to === "off"
-    ? "The container will be stopped and the agent relaunched on your Mac with NO sandbox. Any agent currently running in this task will be terminated and relaunched."
+    ? `The container will be stopped and the agent relaunched on ${THIS_MACHINE} with NO sandbox. Any agent currently running in this task will be terminated and relaunched.`
     : "The container will be stopped and the agent relaunched under the Seatbelt sandbox instead. Any agent currently running in this task will be terminated and relaunched.";
   return `${base} ${SESSION_LOSS_NOTE}`;
 }

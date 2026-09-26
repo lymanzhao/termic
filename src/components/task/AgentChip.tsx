@@ -677,12 +677,21 @@ function UsageUnknown({ agentId, sources, show, onNavigate }: {
   // Settings refreshes this right after it installs or removes hooks, and the
   // chip already reads the same flag to decide whether a dismissal holds.
   const hooksActive = useApp(s => s.agentHooksInstalled[agentId] === true);
+  // Unknown counts as supported: the status read may not have landed yet.
+  const hooksSupported = useApp(s => s.agentHooksSupported[agentId] !== false);
   const dismissed = useUsageUnknownDismissed(s => s.byAgent[agentId] === true);
   const setDismissed = useUsageUnknownDismissed(s => s.setDismissed);
 
   // Decided by where the readouts come from, not by agent name: it used to be
   // `base !== "claude"`, which told a grok user to wait for a poll that does
   // not exist when what they needed was the hooks install.
+  if (footerNeedsHooks(sources, show) && !hooksSupported) {
+    return (
+      <div data-testid="usage-unknown-detail" data-usage-hooks="unavailable" className="flex flex-col gap-1 text-[var(--color-fg-dim)]">
+        <p>{display} reports its usage through agent hooks, which are not available for it on this system yet.</p>
+      </div>
+    );
+  }
   if (!footerNeedsHooks(sources, show)) {
     return (
       <div data-testid="usage-unknown-detail" data-usage-hooks="n/a" className="flex flex-col gap-1 text-[var(--color-fg-dim)]">
@@ -1144,6 +1153,8 @@ function ContextRow({ entry }: { entry: ContextEntry }) {
 function ContextMissing({ agentId, onNavigate }: { agentId: string; onNavigate: () => void }) {
   const hooksActive = useApp(s => s.agentHooksInstalled[agentId] === true);
   const { t } = useTranslation("task");
+  // Unknown counts as supported: the status read may not have landed yet.
+  const hooksSupported = useApp(s => s.agentHooksSupported[agentId] !== false);
   return (
     <div data-testid="context-missing" data-context-hooks={hooksActive ? "active" : "missing"}
       className="flex items-center justify-between gap-3 border-b border-[var(--color-border-soft)] px-3 py-2.5">

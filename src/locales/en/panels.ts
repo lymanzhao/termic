@@ -10,7 +10,7 @@ export default {
     markViewed: "Mark as viewed",
     markNotViewed: "Mark as not viewed",
     openFile: "Open file",
-    openFileTip: "Open the file (⌥-click the row)",
+    openFileTip: "Open the file ({{combo}}-click the row)",
     inlineCommentOne: "1 inline comment",
     inlineCommentMany: "{{count}} inline comments",
     fileOne: "1 file",

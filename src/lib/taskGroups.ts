@@ -61,6 +61,32 @@ export function nextGroupColor(tasks: Task[]): string {
   return order.find(k => !used.has(k)) ?? order[live.size % order.length];
 }
 
+/** Tasks whose group the sidebar does NOT draw: the only live member of
+ *  their group in their project, while other members sit in another project.
+ *
+ *  Groups stay within one project now (Rust `apply_spawn_link`), but before
+ *  that an agent spawning into another project put both tasks in one group,
+ *  and the sidebar, split by project, drew it as two unrelated groups of one,
+ *  both captioned with the lead's name. Those draw as plain rows linked by
+ *  `spawned_by` instead, with no migration: the data is left as it was. */
+export function crossProjectStrays(tasks: Task[]): Set<string> {
+  const byGroup = new Map<string, Map<string, string[]>>();
+  for (const t of tasks) {
+    if (t.archived || !t.group) continue;
+    let projects = byGroup.get(t.group.id);
+    if (!projects) byGroup.set(t.group.id, (projects = new Map()));
+    const ids = projects.get(t.project_id);
+    if (ids) ids.push(t.id);
+    else projects.set(t.project_id, [t.id]);
+  }
+  const out = new Set<string>();
+  for (const projects of byGroup.values()) {
+    if (projects.size < 2) continue;
+    for (const ids of projects.values()) if (ids.length === 1) out.add(ids[0]);
+  }
+  return out;
+}
+
 export type TaskListSegment =
   | { kind: "task"; task: Task }
   | { kind: "group"; group: TaskGroup; tasks: Task[] };

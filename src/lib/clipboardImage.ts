@@ -21,6 +21,7 @@
 // or a PTY.
 
 import { shellEscapePath } from "./terminalDrop";
+import { toContainerPath } from "@/lib/osPath";
 
 /** What we are willing to write to disk, matching what agents accept. */
 export const PASTEABLE_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -62,5 +63,7 @@ export function imageFromClipboard(dt: DataTransfer | null | undefined): File | 
  * the image.
  */
 export function pastePathText(path: string): string {
-  return `${shellEscapePath(path)} `;
+  // Only Docker tasks paste an image as a path (TerminalPane), so this is
+  // always the container's view of it: `/c/...` on a Windows host.
+  return `${shellEscapePath(toContainerPath(path))} `;
 }

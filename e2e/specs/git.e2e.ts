@@ -1485,7 +1485,7 @@ describe("git commit & push", () => {
       }
     }
     execGit(`git -C "${fixture}" clean -fd`);
-    rmSync(bare, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("commits and pushes to the remote", async () => {
@@ -1508,9 +1508,12 @@ describe("git commit & push", () => {
     }, taskId);
 
     // The bare remote received the commit.
-    const log = execSync(
-      `git -C "${bare}" log --oneline main 2>/dev/null || true`,
-    ).toString();
+    // No shell redirection: execSync runs cmd.exe on Windows, which has no
+    // /dev/null and no `true`.
+    let log = "";
+    try {
+      log = execSync(`git -C "${bare}" log --oneline main`, { stdio: ["ignore", "pipe", "ignore"] }).toString();
+    } catch { /* no main on the remote yet */ }
     expect(log).toContain("e2e push commit");
     await snap("commit-push.png");
   });
@@ -1719,7 +1722,7 @@ describe("git multi-repo panel", () => {
         await window.__termic!.useApp.getState().loadAll();
       }, projectId);
     }
-    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    if (tmp) rmSync(tmp, { recursive: true, force: true, maxRetries: 10 });
   });
 
   /** The repo pills, in render order. There is exactly one Git panel in the
@@ -2191,7 +2194,7 @@ describe("pr card (#21)", () => {
       status: "cli-missing",
       message: "",
       pr: null,
-    }, ["need the gh CLI", "brew install gh"]);
+    }, ["need the gh CLI", process.platform === "win32" ? "winget install GitHub.cli" : "brew install gh"]);
   });
 
   it("tells the user to sign in when the CLI is unauthenticated", async () => {
@@ -2204,19 +2207,37 @@ describe("pr card (#21)", () => {
     }, ["Sign in to GitLab", "glab auth login"]);
   });
 
+  const NO_PR = {
+    provider: "github",
+    remote_url: "https://github.com/acme/widgets.git",
+    status: "ok",
+    message: "",
+    pr: null,
+  };
+
+  // Held in place like the others (seedPrAndWaitForText): a real lookup, now
+  // also fired on window focus, answers "unsupported-remote" for the fixture
+  // and takes the card away between the seed and the assertion.
   it("offers to create one when the branch has no PR", async () => {
-    await seedPr({
-      provider: "github",
-      remote_url: "https://github.com/acme/widgets.git",
-      status: "ok",
-      message: "",
-      pr: null,
-    });
-    await waitForText("No pull request yet");
+    await seedPrAndWaitForText(NO_PR, ["No pull request yet"]);
   });
 
   it("opens the create dialog from the card, prefilled", async () => {
-    await clickByText("Create");
+    // Re-seed and click in one step, until the dialog is up: the card's
+    // Create button only exists while the seeded lookup does.
+    await browser.waitUntil(async () => {
+      await browser.execute((id, lk) => {
+        window.__termic!.usePr.setState((s: any) => ({
+          byTask: { ...s.byTask, [id!]: { lookup: lk, loading: false, fetchedAt: Date.now() } },
+        }));
+      }, taskId, NO_PR);
+      return browser.execute(() => {
+        if (document.body.innerText.includes("Create pull request")) return true;
+        const btn = [...document.querySelectorAll("button")].find(b => b.textContent?.trim() === "Create");
+        (btn as HTMLElement | undefined)?.click();
+        return false;
+      });
+    }, { timeout: 15_000, interval: 300, timeoutMsg: "the card's Create never opened the dialog" });
     await waitForText("Create pull request");
     // Seeded from the fixture's last commit subject, not left blank.
     const title = await browser.execute(

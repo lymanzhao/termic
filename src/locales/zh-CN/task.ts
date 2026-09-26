@@ -16,9 +16,9 @@ export default {
   },
 
   tabBar: {
-    broadcastTip: "向此任务的所有智能体广播消息（⇧⌘B）",
-    splitRightTip: "向右分屏（⌘D）",
-    splitBelowTip: "向下分屏（⇧⌘D）",
+    broadcastTip: "向此任务的所有智能体广播消息（{{combo}}）",
+    splitRightTip: "向右分屏（{{combo}}）",
+    splitBelowTip: "向下分屏（{{combo}}）",
     restartRunTip: "重新运行",
     stopTip: "停止",
     runTip: "运行",
@@ -53,11 +53,11 @@ export default {
 
   // 标签栏下的编辑器面包屑（TaskView）以及底部分屏的工具条控件。
   breadcrumb: {
-    scratchHint: "便签尚未保存到项目中。按 ⌘S 选择保存位置。",
+    scratchHint: "便签尚未保存到项目中。按 {{combo}} 选择保存位置。",
     setSyntaxTip: "设置语法",
     readOnly: "只读",
     copyPathTip: "复制路径",
-    revealInFinderTip: "在 Finder 中显示",
+    revealInFinderTip: "在 {{manager}} 中显示",
     locateTip: "在文件树中定位",
     revealTip: "在文件树中显示 {{rel}}",
     openInFileManagerTip: "在文件管理器中打开",
@@ -87,7 +87,7 @@ export default {
     revealFailed: "无法显示该路径",
     noAppRevealed: "没有可打开该文件类型的应用，已改为在 Finder 中显示",
     openFailed: "无法打开该文件",
-    revealInFinder: "在 Finder 中显示",
+    revealInFinder: "在 {{manager}} 中显示",
     openInDefaultApp: "用默认应用打开",
     copyPath: "复制路径",
     noMatches: "无匹配项",

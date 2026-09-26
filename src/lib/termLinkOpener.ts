@@ -18,6 +18,7 @@
 // registerPathLinkProvider below uses xterm's link API directly.
 
 import type { Terminal, ILink, IDisposable } from "@xterm/xterm";
+import { IS_WINDOWS } from "./platform";
 
 // Slightly looser than the WebLinksAddon regex; trailing punctuation that
 // prose tends to glue onto a URL is trimmed after matching.
@@ -54,22 +55,33 @@ export const PATH_TOKEN_RE = /(?:~?\/)?(?:[\w.@-]{1,255}\/){0,64}[\w.@-]{1,255}\
 //          path char (not `:line:col`, not a `(path): prose` colon). Consumed
 //          so neither the host nor the path half underlines.
 //   path - PATH_TOKEN_RE.
-const PATH_SCAN_RE_G = new RegExp(
-  "(?<url>[a-zA-Z][\\w+.-]{0,15}:\\/\\/\\S+)" +
-  "|(?<junk>[\\w.@-]{1,255}:(?=[A-Za-z_~./])[\\w.@:/-]*)" +
-  "|(?<path>" + PATH_TOKEN_RE.source + ")",
-  "g",
-);
+// Windows: a drive-rooted path, either separator (`C:\\repo\\src\\a.ts:12`,
+// `C:/repo/a.ts`). Scanned BEFORE `junk`, which would otherwise read the
+// drive letter as an scp host and swallow the whole path. Same extension and
+// bound rules as PATH_TOKEN_RE.
+export const WIN_PATH_TOKEN_RE = /[A-Za-z]:[\\/](?:[\w.@ -]{1,255}[\\/]){0,64}[\w.@-]{1,255}\.[A-Za-z]\w{0,9}(?::\d+(?::\d+)?)?/;
+
+function scanRegex(windows: boolean): RegExp {
+  return new RegExp(
+    "(?<url>[a-zA-Z][\\w+.-]{0,15}:\\/\\/\\S+)" +
+    (windows ? "|(?<wpath>" + WIN_PATH_TOKEN_RE.source + ")" : "") +
+    "|(?<junk>[\\w.@-]{1,255}:(?=[A-Za-z_~./])[\\w.@:/-]*)" +
+    "|(?<path>" + PATH_TOKEN_RE.source + ")",
+    "g",
+  );
+}
+const PATH_SCAN_RE_G = scanRegex(IS_WINDOWS);
 
 /** File-path tokens in `text`, skipping URLs and scp `host:path` compounds.
  *  Each result carries the token's start index so callers can hit-test a click
  *  or build a hover range; `raw` has trailing prose punctuation trimmed. */
-export function scanPathTokens(text: string): { raw: string; index: number }[] {
-  PATH_SCAN_RE_G.lastIndex = 0;
+export function scanPathTokens(text: string, windows: boolean = IS_WINDOWS): { raw: string; index: number }[] {
+  const re = windows === IS_WINDOWS ? PATH_SCAN_RE_G : scanRegex(windows);
+  re.lastIndex = 0;
   const out: { raw: string; index: number }[] = [];
   let m: RegExpExecArray | null;
-  while ((m = PATH_SCAN_RE_G.exec(text))) {
-    if (m.groups?.path === undefined) continue; // url / junk: not ours
+  while ((m = re.exec(text))) {
+    if (m.groups?.path === undefined && m.groups?.wpath === undefined) continue; // url / junk: not ours
     const raw = m[0].replace(TRAILING_PUNCT_RE, "");
     if (raw) out.push({ raw, index: m.index });
   }
@@ -87,8 +99,8 @@ export type ClickTarget =
  *  through the suffix matcher: it exists to resolve a FRAGMENT an agent
  *  printed, and applying it to a path that already says exactly where it
  *  lives is how `~/notes/todo.md` opened `docs/notes/todo.md` (GH #240). */
-export function isAbsoluteToken(p: string): boolean {
-  return p.startsWith("/") || p.startsWith("~/");
+export function isAbsoluteToken(p: string, windows: boolean = IS_WINDOWS): boolean {
+  return p.startsWith("/") || p.startsWith("~/") || (windows && /^[A-Za-z]:[\\/]/.test(p));
 }
 
 /** Split "src/file.ts:123:5" into { path, line, col }. */

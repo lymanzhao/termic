@@ -146,3 +146,20 @@ describe("isAbsoluteToken", () => {
     expect(isAbsoluteToken("~other/a.ts")).toBe(false);
   });
 });
+
+describe("Windows paths", () => {
+  it("scans a drive-rooted path, either separator, with line and column", () => {
+    const toks = scanPathTokens("error at C:\\repo\\src\\a.ts:12:3 and C:/repo/b.rs", true).map(t => t.raw);
+    expect(toks).toEqual(["C:\\repo\\src\\a.ts:12:3", "C:/repo/b.rs"]);
+  });
+  it("does not read the drive letter as an scp host", () => {
+    expect(scanPathTokens("C:\\x\\y.ts", true).map(t => t.raw)).toEqual(["C:\\x\\y.ts"]);
+  });
+  it("treats a drive-rooted token as absolute", () => {
+    expect(isAbsoluteToken("C:\\a.ts", true)).toBe(true);
+    expect(isAbsoluteToken("C:\\a.ts", false)).toBe(false);
+  });
+  it("leaves the macOS scan unchanged", () => {
+    expect(scanPathTokens("git@github.com:org/repo.git", false)).toEqual([]);
+  });
+});

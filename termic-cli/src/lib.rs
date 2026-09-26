@@ -16,6 +16,49 @@ use std::io::Read as _;
 use termic_proto as proto;
 use termic_proto::exit_code;
 
+/// `termic hook-emit <target>`: copy stdin (an agent hook's OSC report) to
+/// `target`, the terminal the hook reports to.
+///
+/// Exists for Windows, where `target` is the named pipe the app serves in
+/// place of a PTY slave (src-tauri/src/hook_pipe.rs): Git Bash's `>` cannot
+/// open a named pipe, and this opens it for writing the ordinary way. Also
+/// correct for a plain file or a tty on unix, though the scripts only use it
+/// on Windows. Exit 0 when written, 1 otherwise; never prints (a hook's
+/// output is the agent's to render).
+pub fn hook_emit(target: Option<&std::path::Path>) -> i32 {
+    use std::io::Read;
+    /// A report is a few OSC sequences; anything larger is not one.
+    const MAX: u64 = 64 * 1024;
+    let Some(target) = target else { return 1 };
+    let mut body = Vec::new();
+    if std::io::stdin().lock().take(MAX).read_to_end(&mut body).is_err() || body.is_empty() {
+        return 1;
+    }
+    i32::from(write_report(target, &body).is_err())
+}
+
+/// Write one hook report to `target`. A named pipe reports "all instances
+/// busy" (ERROR_PIPE_BUSY, 231) for the moment between the server accepting
+/// one hook and listening for the next, so two hooks firing together would
+/// otherwise lose one report: retry that, briefly, and nothing else.
+pub fn write_report(target: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    const PIPE_BUSY: i32 = 231;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(target) {
+            Ok(mut f) => {
+                f.write_all(body)?;
+                return f.flush();
+            }
+            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub mod attach;
 pub mod client;
 pub mod output;
@@ -99,7 +142,8 @@ right now. Termic runs coding agents side by side, each in its own task (a git \
 worktree, or the project's main checkout, with its own terminal), listed in the \
 app's sidebar; this CLI drives the app around you. From your task you can: \
 start another agent beside you (`tab`); launch new tasks with their own agents \
-(`new`), which join YOUR task's group in the sidebar, a block you name for the \
+(`new`), which join YOUR task's group in the sidebar (in your project; one in \
+another project is linked to yours instead), a block you name for the \
 batch of work with `group --name`; prompt another task's agent (`send`) and \
 read what it produced (`logs`, `result`); retitle your own task \
 (`rename`); and keep notes, plans, findings, logs and reports the user \
@@ -840,13 +884,28 @@ Prints the tab on stdout. With --output-format json, one object: \
 stream-json under -p, NDJSON events (queued, prompt_delivered, state, \
 heartbeat) ending in one result line.
 
+--title names the tab, for every kind. It is set the way a double-click \
+rename sets it, so the agent retitling itself mid-turn cannot replace it and \
+it survives a relaunch, which makes it a selector a script can key on: \
+`termic tab fix-auth --agent claude --title reviewer -p \"...\"`, then \
+`termic send fix-auth --tab reviewer`. A title must be unique among the \
+task's tabs (compared case-insensitively, and against their agent ids \
+too, since --tab matches those), and cannot be a bare number, which --tab \
+reads as a position.
+
+--tab <TAB> --title <TITLE> renames an OPEN tab instead of opening one \
+(any tab: agent, shell or custom terminal). --title \"\" clears the rename, \
+and the tab goes back to its automatic, agent-driven title. None of the \
+open-a-tab flags apply there.
+
 `termic tab close` is the other half: the tab strip's close button as a \
 verb, for cleaning up the tabs a script opened. See \
 `termic tab close --help`.
 
-Exit codes: 0 opened (with --wait: settled done), 1 error (unknown or \
-ambiguous task, unusable agent id, prompt on a non-agent tab, --wait \
-without -p/-P), 3 agent stopped needing input, 4 app not running, 5 CLI \
+Exit codes: 0 opened or renamed (with --wait: settled done), 1 error \
+(unknown or ambiguous task or tab, unusable agent id, prompt on a \
+non-agent tab, --wait without -p/-P, a title already in use or not \
+allowed), 3 agent stopped needing input, 4 app not running, 5 CLI \
 disabled, 6 refused, 7 --timeout expired, 8 connection lost, 9 prompt \
 never delivered."
     )]
@@ -894,6 +953,16 @@ never delivered."
         /// Give up waiting after this long (exit 7). E.g. 90, 30s, 5m, 1h.
         #[arg(long, requires = "wait", value_name = "DURATION")]
         timeout: Option<String>,
+        /// Title for the tab, kept even when the agent retitles itself.
+        /// With --tab, renames that open tab instead. "" = the automatic
+        /// title (clears a rename).
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
+        /// Rename this OPEN tab instead of opening one: a tab id, a 1-based
+        /// strip index, or a title. Needs --title.
+        #[arg(long, value_name = "TAB", requires = "title",
+              conflicts_with_all = ["agent", "terminal", "shell", "prompt", "library", "resume", "wait", "timeout"])]
+        tab: Option<String>,
     },
 
     /// Scratchpads in a task: notes an agent writes for the human to read.
@@ -973,8 +1042,10 @@ lost."
         after_help = "Tasks you create with `new` from inside a task join YOUR task's group: \
 the sidebar draws them as one coloured block, captioned, with your task as \
 its lead, so the user sees which tasks you started. A worker that creates \
-tasks in turn adds them to the same (top-level) group. Pass --no-group to \
-`new` to keep a task out.
+tasks in turn adds them to the same (top-level) group. A task created in \
+ANOTHER project joins no group (a group lives in one project's list): the \
+sidebar links it to your task instead. Pass --no-group to `new` to keep a \
+task out.
 
 Without --name or --color, prints the group: its name, colour and members. \
 --name gives it a name the user will read (say what the batch of work is, \
@@ -1390,6 +1461,14 @@ fn pre_connect_guard(cmd: &Cmd) -> Result<(), CliError> {
     if let Cmd::Tab { wait: true, prompt: None, library: None, .. } = cmd {
         return Err(CliError::new(exit_code::ERROR, "--wait needs a prompt to wait on"));
     }
+    // A title a selector could never reach fails here, before a usage
+    // mistake can auto-launch the app. Uniqueness needs the live strip and
+    // is the webview's call.
+    if let Cmd::Tab { close: None, title: Some(t), .. } = cmd {
+        if let Some(why) = proto::tab_title_problem(t) {
+            return Err(CliError::new(exit_code::ERROR, why));
+        }
+    }
     Ok(())
 }
 
@@ -1462,7 +1541,12 @@ outside.",
     // open"), yet a missing tab is not the same success "nothing to quit"
     // is, so it stays exit 4 rather than inventing a second silent-success
     // verb. Every other verb keeps auto-launch.
-    let closing_tab = matches!(cli.cmd, Cmd::Tab { close: Some(TabCmd::Close { .. }), .. });
+    // Renaming a tab (`tab --tab X --title Y`) is the same case: a fresh app
+    // has no open tab to rename.
+    let closing_tab = matches!(
+        cli.cmd,
+        Cmd::Tab { close: Some(TabCmd::Close { .. }), .. } | Cmd::Tab { tab: Some(_), .. }
+    );
     let mut conn = match client::connect_or_launch(&paths, cli.no_launch || quitting || closing_tab)
     {
         // "Nothing to quit" is success, so a teardown script does not need
@@ -1646,9 +1730,33 @@ outside.",
             };
             Ok(Output::ok(final_stdout(format, &output::tab_close_text(&c), &c)))
         }
+        // `tab --tab X --title Y` renames an open tab; clap has already
+        // refused every open-a-tab flag beside --tab.
+        Cmd::Tab { close: None, tab: Some(tab), title, task, project, .. } => {
+            let data = client::request(
+                &mut conn,
+                proto::Command::TabRename {
+                    // Without <TASK>, the caller's own task, like `tab`.
+                    task: task.clone().or_else(|| {
+                        std::env::var("TERMIC_TASK_ID").ok().filter(|s| !s.is_empty())
+                    }),
+                    project: project.clone(),
+                    tab: tab.clone(),
+                    title: title.clone().unwrap_or_default(),
+                    cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+                },
+                &token,
+            )?;
+            let proto::ReplyData::Tab(t) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to tab rename"));
+            };
+            let reset = title.as_deref() == Some("");
+            Ok(Output::ok(final_stdout(format, &output::tab_rename_text(&t, reset), &t)))
+        }
         Cmd::Tab {
             close: None,
             task, project, agent, terminal, shell, prompt: _, library, resume, wait, timeout,
+            title, tab: None,
         } => {
             let kind = if let Some(id) = agent {
                 proto::TabKind::Agent { id: id.clone() }
@@ -1681,6 +1789,8 @@ outside.",
                 wait: *wait,
                 timeout_ms,
                 resume: resume.clone(),
+                // "" is "no title" on open; the wire carries only a real one.
+                title: title.clone().filter(|t| !t.is_empty()),
                 cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
             };
             // A prompt streams (queued/prompt_delivered/state events, the
@@ -2878,6 +2988,77 @@ mod tests {
         assert!(Cli::try_parse_from(["termic", "project", "list"]).is_ok());
         assert!(Cli::try_parse_from(["termic", "project", "remove", "web", "--yes"]).is_ok());
         assert!(Cli::try_parse_from(["termic", "project"]).is_err(), "a subcommand is required");
+    }
+
+    #[test]
+    fn tab_title_opens_named_or_renames_an_open_tab() {
+        // Open mode: --title rides every kind.
+        for open in [
+            vec!["termic", "tab", "fix-auth", "--title", "reviewer"],
+            vec!["termic", "tab", "fix-auth", "--agent", "claude", "--title", "reviewer", "-p", "go"],
+            vec!["termic", "tab", "fix-auth", "--shell", "--title", "logs"],
+            vec!["termic", "tab", "fix-auth", "--terminal", "lazygit", "--title", "git"],
+        ] {
+            let cli = Cli::try_parse_from(open.clone())
+                .unwrap_or_else(|e| panic!("{open:?} must parse: {e}"));
+            let Cmd::Tab { close: None, tab: None, title: Some(_), .. } = &cli.cmd else {
+                panic!("{open:?} is a titled open")
+            };
+        }
+
+        // Rename mode: --tab + --title, and "" is a real value (the reset).
+        let cli = Cli::try_parse_from(["termic", "tab", "fix-auth", "--tab", "2", "--title", "impl"])
+            .expect("rename parses");
+        let Cmd::Tab { close: None, tab: Some(tab), title: Some(title), .. } = &cli.cmd else {
+            panic!("not a rename")
+        };
+        assert_eq!((tab.as_str(), title.as_str()), ("2", "impl"));
+        let cli = Cli::try_parse_from(["termic", "tab", "--tab", "impl", "--title", ""])
+            .expect("reset parses");
+        let Cmd::Tab { title: Some(title), .. } = &cli.cmd else { panic!("not tab") };
+        assert_eq!(title, "", "an empty title survives parsing as the reset");
+
+        // --tab without --title would rename to nothing in particular.
+        assert!(Cli::try_parse_from(["termic", "tab", "fix-auth", "--tab", "2"]).is_err());
+        // Every open-a-tab flag is refused beside --tab: a rename opens nothing.
+        for extra in [
+            vec!["--agent", "claude"],
+            vec!["--terminal", "lazygit"],
+            vec!["--shell"],
+            vec!["-p", "go"],
+            vec!["-P", "builtin:review"],
+            vec!["--resume", "abc"],
+            vec!["--wait"],
+        ] {
+            let mut argv = vec!["termic", "tab", "fix-auth", "--tab", "2", "--title", "x"];
+            argv.extend(extra.iter().copied());
+            assert!(Cli::try_parse_from(argv.clone()).is_err(), "{argv:?} must be refused");
+        }
+
+        // `tab close --tab` still belongs to the subcommand.
+        let cli = Cli::try_parse_from(["termic", "tab", "close", "fix-auth", "--tab", "2"])
+            .expect("close parses");
+        assert!(matches!(&cli.cmd, Cmd::Tab { close: Some(TabCmd::Close { .. }), tab: None, .. }));
+    }
+
+    #[test]
+    fn tab_titles_a_selector_could_not_reach_fail_before_the_socket() {
+        for (argv, why) in [
+            (vec!["termic", "tab", "t", "--title", "   "], "blank"),
+            (vec!["termic", "tab", "t", "--title", "2"], "number"),
+            (vec!["termic", "tab", "t", "--tab", "1", "--title", " 3 "], "number"),
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap();
+            let err = pre_connect_guard(&cli.cmd).unwrap_err();
+            assert!(err.message.contains(why), "{argv:?}: {}", err.message);
+        }
+        for ok in [
+            vec!["termic", "tab", "t", "--title", "reviewer"],
+            vec!["termic", "tab", "t", "--tab", "1", "--title", ""],
+        ] {
+            let cli = Cli::try_parse_from(ok.clone()).unwrap();
+            assert!(pre_connect_guard(&cli.cmd).is_ok(), "{ok:?}");
+        }
     }
 
     #[test]

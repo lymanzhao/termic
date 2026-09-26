@@ -220,6 +220,10 @@ pub fn new_created_text(t: &TaskSummary) -> String {
     // never names the group, and the user reads "grp-orchestrator" forever.
     if let Some(g) = &t.group {
         push("group:", format!("{} (name it: termic group --name \"...\")", g.name));
+    } else if let Some(p) = &t.spawned_by {
+        // Spawned into another project: groups stay within one project, so
+        // say where the link went rather than let the agent look for a group.
+        push("from:", format!("{p} (another project, so no shared group)"));
     }
     lines.join("\n")
 }
@@ -559,6 +563,16 @@ pub fn prompts_text(prompts: &[PromptEntry]) -> String {
 /// One line naming the tab and, crucially, its id: that id is the stable
 /// selector, so printing it is what lets a script address the tab it just
 /// made instead of racing an index or an agent-authored title.
+/// `tab --tab X --title Y`: what the tab is called now. `reset` is the
+/// `--title ""` form, where the title printed is the automatic one.
+pub fn tab_rename_text(t: &TabData, reset: bool) -> String {
+    if reset {
+        format!("Tab {} in {} is back to its automatic title ({}).", t.tab_id, t.task_id, t.title)
+    } else {
+        format!("Renamed tab {} in {} to \"{}\".", t.tab_id, t.task_id, t.title)
+    }
+}
+
 pub fn tab_text(t: &TabData) -> String {
     // `title` is what the tab shows in the GUI, and it is the only useful
     // label when it differs from the cli id: a custom-command task's tab is
@@ -770,6 +784,7 @@ mod tests {
             open_tabs: Some(2),
             diff: Some(DiffStat { files_changed: 3, insertions: 10, deletions: 2, untracked: 1 }),
             group: None,
+            spawned_by: None,
         }
     }
 
@@ -970,6 +985,18 @@ created web/fix-auth
         let out = new_created_text(&s);
         assert!(out.contains("main checkout"), "{out}");
         assert!(!out.contains("branch:"), "{out}");
+    }
+
+    #[test]
+    fn new_created_text_names_a_cross_project_parent_instead_of_a_group() {
+        let mut s = summary();
+        s.spawned_by = Some("api/orchestrate".into());
+        let out = new_created_text(&s);
+        assert!(out.contains("from:   api/orchestrate (another project"), "{out}");
+        // With a group, the group line is the one worth reading.
+        s.group = Some(termic_proto::TaskGroupInfo { id: "o".into(), name: "auth".into(), named: true, color: None, members: vec![] });
+        let out = new_created_text(&s);
+        assert!(out.contains("group:") && !out.contains("from:"), "{out}");
     }
 
     #[test]

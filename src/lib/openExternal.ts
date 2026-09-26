@@ -8,12 +8,12 @@
 
 import { openFileExternal } from "@/lib/ipc";
 import { useUI } from "@/store/ui";
-import { IS_MAC } from "@/lib/shortcuts";
+import { IS_MAC, IS_WINDOWS } from "@/lib/platform";
 
 /** What to call the OS file manager in user-visible copy. ONE definition:
  *  the context menu, the editor's binary notice and the fallback toast below
  *  all say the same word, and a Windows/Linux label changes in one place. */
-export const FILE_MANAGER = IS_MAC ? "Finder" : "File Manager";
+export const FILE_MANAGER = IS_MAC ? "Finder" : IS_WINDOWS ? "File Explorer" : "File Manager";
 
 /** Open `abs` in its default app. `name` is the basename, used in the toast.
  *  Never throws: a failure to open is reported to the user, not to the

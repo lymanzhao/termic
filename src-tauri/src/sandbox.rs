@@ -38,7 +38,7 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use crate::Task;
@@ -550,7 +550,7 @@ pub fn unregister_root_pid(ws_id: &str, pid: u32) {
 /// treats that as "not ours" — false negative is preferred over false
 /// positive (counting other apps' denies under our task).
 fn ppid_of(pid: u32) -> Option<u32> {
-    let out = Command::new("/bin/ps")
+    let out = crate::proc_ctl::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "ppid="])
         .output().ok()?;
     if !out.status.success() { return None; }
@@ -563,7 +563,7 @@ fn ppid_of(pid: u32) -> Option<u32> {
 /// log-line parse turns up a weird/empty/version-only string. Returns
 /// None if the process is already gone.
 fn comm_of(pid: u32) -> Option<String> {
-    let out = Command::new("/bin/ps")
+    let out = crate::proc_ctl::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output().ok()?;
     if !out.status.success() { return None; }
@@ -631,7 +631,7 @@ fn start_path_watcher(task_id: &str, task_path: &str, ws_dirs: Vec<String>, moni
     } else {
         "eventMessage CONTAINS \"Sandbox:\" AND eventMessage CONTAINS \"deny\""
     };
-    let mut child = Command::new("/usr/bin/log")
+    let mut child = crate::proc_ctl::command("/usr/bin/log")
         .args(["stream", "--predicate", predicate, "--style", "compact"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1567,7 +1567,10 @@ fn builtin_runtime_readonly_paths(home: &str) -> Vec<String> {
 /// short-circuits on non-macOS so a missed UI check can't crash the
 /// agent spawn.
 pub fn available() -> bool {
-    cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").exists()
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").exists()
+    })
 }
 
 /// Default host allowlist (regex per line) for a task, keyed off
@@ -1929,7 +1932,7 @@ pub fn recent_denials(task_path: &str, minutes: u32) -> Vec<String> {
         task_path.replace('\\', "\\\\").replace('"', "\\\""),
     );
     let last_arg = format!("{}m", minutes);
-    let out = Command::new("log")
+    let out = crate::proc_ctl::command("log")
         .args(["show", "--predicate", &predicate, "--last", &last_arg, "--style", "compact"])
         .output();
     let Ok(out) = out else { return Vec::new(); };
@@ -2065,7 +2068,7 @@ fn compute_home_denies(home: &str, user_allowed: &[String], runtime: &[String]) 
 /// Seatbelt evaluates the *canonical* path; a worktree symlinked
 /// somewhere else would otherwise fail writes through the symlink.
 pub(crate) fn canonicalize_or_keep(p: &str) -> String {
-    fs::canonicalize(p)
+    dunce::canonicalize(p)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| p.to_string())
 }
@@ -2614,8 +2617,8 @@ mod tests {
 
     // ── builtin_runtime_paths ─────────────────────────────────────────
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
-    #[cfg(unix)]
     fn the_login_store_allow_survives_the_control_plane_deny() {
         // ORDER, not presence. The control-plane deny covers the whole termic
         // data dir and is deliberately the FINAL filesystem rule, so an allow
@@ -2871,7 +2874,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn enforce_still_denies_network() {
         use crate::{Task, SandboxMode};
         let task = Task { cli: "claude".into(), ..Default::default() };
@@ -2895,8 +2897,6 @@ mod tests {
     // reachability is proven by running connect()/open() in the cage.
 
     use crate::{SandboxMode, Task};
-    #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -2947,18 +2947,13 @@ mod tests {
         std::fs::write(&control_file, "readable proof").unwrap();
         // A live control-plane socket + an unrelated peer socket.
         let socket_path = data_dir.join(termic_proto::SOCKET_FILE);
-        #[cfg(unix)]
-        let _sock = UnixListener::bind(&socket_path).unwrap();
+        let _sock = termic_proto::local::bind(&socket_path).unwrap();
         let control_socket = root.join("peer.sock");
-        #[cfg(unix)]
-        let _peer = UnixListener::bind(&control_socket).unwrap();
+        let _peer = termic_proto::local::bind(&control_socket).unwrap();
         // Leak the listeners for the test's lifetime (dropping would unlink
         // the socket files). The TempDir cleans everything on drop.
-        #[cfg(unix)]
-        {
-            std::mem::forget(_sock);
-            std::mem::forget(_peer);
-        }
+        std::mem::forget(_sock);
+        std::mem::forget(_peer);
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
         Fixture {
             tmp,

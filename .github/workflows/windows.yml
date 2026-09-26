@@ -1,0 +1,161 @@
+name: Windows
+
+# The Windows port (docs/ideas/windows.md). Experimental and NOT a required
+# check: it exists so the port cannot silently rot, and so a Windows tester
+# gets an installer from every push without owning a Rust toolchain.
+#
+# Runs on pushes to main, on PRs, and by hand.
+
+on:
+  # A docs-only push changes nothing this builds or tests, and because of the
+  # concurrency group below it would also cancel the run that does.
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+
+# A newer push supersedes an older run of the same ref: Windows runners are
+# the scarce resource here, and a stale e2e run can hold one for an hour.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Windows (vitest + cargo test)
+    runs-on: windows-latest
+    steps:
+      # .gitattributes pins LF, this is belt and braces for the checkout
+      # itself (Git for Windows defaults core.autocrlf to true).
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm test
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --workspace --lib
+      # A measurement, not a gate: does ConPTY pass the escape sequences
+      # agent hooks and prompt marks rely on through to the app?
+      # (docs/ideas/windows.md, "Measure first", M1.)
+      - name: ConPTY escape-sequence passthrough (measurement)
+        working-directory: src-tauri
+        continue-on-error: true
+        run: cargo run --example conpty_osc_probe
+
+  installer:
+    # `make install` end to end, the way a Windows developer runs it from Git
+    # Bash: build the NSIS installer, install it silently per user, launch
+    # it. Then check the app is actually running, and uninstall. The
+    # installer is uploaded for manual testing (unsigned, no updater).
+    name: Windows make install (+ unsigned installer)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: GNU make
+        run: choco install make -y --no-progress
+      # The setup a developer runs on a fresh machine: it must find every
+      # tool the runner already has, install nothing, and still do the repo
+      # steps (npm install, cargo check).
+      - name: make setup
+        run: make setup
+      - run: make doctor
+      - name: make install
+        run: make install
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termic-windows-x64-setup
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+      - name: The installed app is running
+        run: |
+          sleep 15
+          powershell -NoProfile -Command "Get-Process | Where-Object { \$_.Path -like \"\$env:LOCALAPPDATA\\Termic\\*\" } | Format-Table Id, Path -AutoSize"
+          powershell -NoProfile -Command "if (-not (Get-Process | Where-Object { \$_.Path -like \"\$env:LOCALAPPDATA\\Termic\\*\" })) { exit 1 }"
+      - name: make uninstall
+        if: always()
+        run: |
+          powershell -NoProfile -Command "Get-Process | Where-Object { \$_.Path -like \"\$env:LOCALAPPDATA\\Termic\\*\" } | Stop-Process -Force" || true
+          make uninstall
+
+  e2e:
+    # The WebdriverIO suite on WebView2 (the embedded WebDriver supports it).
+    # Experimental like the rest of this workflow: it reports, it does not
+    # gate. Screenshots are skipped in CI (CI=true).
+    name: Windows e2e (WebdriverIO, WebView2)
+    runs-on: windows-latest
+    continue-on-error: true
+    # The suite takes ~20 min on macOS; a hang must not hold a runner for
+    # GitHub's default six hours. The run step has its own, shorter limit so
+    # the artifact steps below still get to run.
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      # Specs commit in the fixture repo; a fresh runner has no identity.
+      - run: |
+          git config --global user.name "termic e2e"
+          git config --global user.email "e2e@termic.dev"
+      - name: Seed e2e fixture profile
+        run: node scripts/e2e-seed.mjs
+      - name: Build e2e binary
+        run: npm run e2e:build
+      - name: Run e2e suite
+        timeout-minutes: 75
+        env:
+          TERMIC_E2E_FAIL_CAPTURE: "1"
+          # Screenshots of the window chrome, which only exists on Windows,
+          # for a person to look at in the uploaded artifacts.
+          TERMIC_E2E_SNAP: "^window-"
+        run: npm run test:e2e
+      # always(): a timed-out or cancelled run is exactly the one whose app
+      # log is needed, and failure() is false for both.
+      - name: Collect the debug log
+        if: always()
+        run: |
+          mkdir -p .e2e/artifacts
+          cp "$TEMP/termic-debug.log" .e2e/artifacts/ 2>/dev/null || true
+          cp "$(cygpath -u "$LOCALAPPDATA")/Temp/termic-debug.log" .e2e/artifacts/localtemp-termic-debug.log 2>/dev/null || true
+          cp .e2e/profile/e2e-*.log .e2e/artifacts/ 2>/dev/null || true
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-windows
+          path: .e2e/artifacts
+          if-no-files-found: ignore
+          include-hidden-files: true

@@ -9,7 +9,7 @@ export default {
     markViewed: "标记为已查看",
     markNotViewed: "标记为未查看",
     openFile: "打开文件",
-    openFileTip: "打开文件（按住 ⌥ 点击此行）",
+    openFileTip: "打开文件（按住 {{combo}} 点击此行）",
     inlineCommentOne: "1 条行内评论",
     inlineCommentMany: "{{count}} 条行内评论",
     fileOne: "1 个文件",

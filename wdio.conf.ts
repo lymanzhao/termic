@@ -14,7 +14,7 @@ import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFile
 // invasive, flake-prone app-side port→datadir mapping. Stability wins.
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
-const appBinary = path.join(repoRoot, "src-tauri", "target", "debug", "termic");
+const appBinary = path.join(repoRoot, "src-tauri", "target", "debug", process.platform === "win32" ? "termic.exe" : "termic");
 /** Exported so specs that need the control socket agree with the launcher. */
 export const dataDir = path.join(repoRoot, ".e2e", "profile");
 /** Where `TERMIC_E2E_TIMING=1` writes per-test durations. */
@@ -26,6 +26,13 @@ export const config: WebdriverIO.Config = {
   tsConfigPath: path.join(repoRoot, "e2e", "tsconfig.json"),
 
   specs: [path.join(repoRoot, "e2e", "specs", "**", "*.e2e.ts")],
+  // Specs for features a platform does not have: Touch ID for sudo is
+  // macOS only, and the Activity monitor (procmon) is macOS / Linux, not
+  // Windows (docs/windows.md).
+  exclude: [
+    ...(process.platform === "darwin" ? [] : ["sudo-touchid"]),
+    ...(process.platform === "win32" ? ["activity"] : []),
+  ].map(n => path.join(repoRoot, "e2e", "specs", `${n}.e2e.ts`)),
   maxInstances: 1,
 
   // `tauri:options` is a VENDOR capability extension that the embedded
@@ -102,7 +109,19 @@ export const config: WebdriverIO.Config = {
    *  which case costs the minutes is how you end up optimising a 300ms
    *  sleep in a seven minute file. Off by default: it writes a file and
    *  nobody needs it on a normal run. */
-  afterTest(test, _context, result) {
+  async afterTest(test, _context, result) {
+    // Opt-in failure capture (`TERMIC_E2E_FAIL_CAPTURE=1`, set by the Windows
+    // workflow): a screenshot and the visible text of the window at the
+    // moment a case failed, into the artifacts dir CI uploads. On a runner
+    // nobody can look at, it is the only record of what the screen showed.
+    if (process.env.TERMIC_E2E_FAIL_CAPTURE && !(result as { passed?: boolean }).passed) {
+      const slug = `${test.parent} ${test.title}`.replace(/[^A-Za-z0-9]+/g, "-").slice(0, 120);
+      try { await browser.saveScreenshot(path.join(artifactsDir, `FAIL-${slug}.png`)); } catch { /* no display */ }
+      try {
+        const text = await browser.execute(() => document.body?.innerText?.slice(0, 20_000) ?? "");
+        writeFileSync(path.join(artifactsDir, `FAIL-${slug}.txt`), String(text));
+      } catch { /* app gone */ }
+    }
     if (!process.env.TERMIC_E2E_TIMING) return;
     const ms = (result as { duration?: number }).duration ?? 0;
     appendFileSync(timingLog, `${String(ms).padStart(7)}  ${test.parent} > ${test.title}\n`);

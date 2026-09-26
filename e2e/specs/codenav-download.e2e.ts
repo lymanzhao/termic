@@ -124,7 +124,7 @@ describe("code intelligence: server downloads", function () {
     // The fixture repo is shared with every other spec file, and a dirty tree
     // fails git.e2e's "clean working tree" plus two layout specs.
     for (const rel of ["broken.ts", "download.tf"]) rmSync(path.join(root, rel), { force: true });
-    rmSync(path.join(root, "pysrc"), { recursive: true, force: true });
+    rmSync(path.join(root, "pysrc"), { recursive: true, force: true, maxRetries: 10 });
     await browser.execute(() => window.__termic!.useCodeIntel.setState({ grants: {} }));
     await browser.execute(async () => {
       const servers: any[] = await window.__termic!.invoke("lsp_list");

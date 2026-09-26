@@ -28,6 +28,7 @@ import DOMPurify from "dompurify";
 export { lspOffer, lspInstall, type LspOffer } from "./install";
 import { choiceForRoot } from "./install";
 import { LSP_PAGE_ID } from "./pageSession";
+import { pathToFileUri } from "@/lib/osPath";
 
 const lspStart = (root: string, language: string, channel: Channel<string>, options?: any) =>
   // Stamped with this page load, so a reload's orphans can be told apart from
@@ -58,17 +59,7 @@ export const lspList = () => invoke<LspServerInfo[]>("lsp_list");
 
 /** file:// URI for an absolute path, matching the Rust side's encoding. */
 export function fileUri(absPath: string): string {
-  return (
-    "file://" +
-    [...new TextEncoder().encode(absPath)]
-      .map(b =>
-        (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || (b >= 0x30 && b <= 0x39) ||
-        b === 0x2f || b === 0x2d || b === 0x5f || b === 0x2e || b === 0x7e
-          ? String.fromCharCode(b)
-          : "%" + b.toString(16).toUpperCase().padStart(2, "0"),
-      )
-      .join("")
-  );
+  return pathToFileUri(absPath);
 }
 
 type Entry = {

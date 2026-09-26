@@ -9,11 +9,15 @@
 // through here.
 
 import { isTaskCaged, selectionToFields, type Project, type SandboxSelection } from "@/lib/types";
+import { SEATBELT_AVAILABLE } from "@/lib/platform";
 
 /** The project's default engine in the picker's own vocabulary. */
 export function projectSandboxDefault(p: Project | null | undefined): SandboxSelection {
   if (!p) return "off";
   if (p.default_docker) return "docker";
+  // A Seatbelt default (from a Mac teammate's project config) is not a
+  // choice this OS has.
+  if (!SEATBELT_AVAILABLE) return "off";
   // `default_sandbox_mode` is the precise answer; the older boolean only says
   // "on", which has always meant Enforce.
   return (p.default_sandbox_mode as SandboxSelection | undefined)

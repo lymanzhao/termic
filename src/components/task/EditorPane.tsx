@@ -43,6 +43,7 @@ import { createLangSwitch } from "@/lib/langSwitch";
 import { forceParsing } from "@codemirror/language";
 import { navHint } from "@/lib/lsp/navHint";
 import { gotoLocation as revealLine } from "@/lib/gotoLocation";
+import { isPureCrlf } from "@/lib/lineEndings";
 
 /** How long after the last keystroke a scratchpad's buffer is flushed to the
  *  scratch store and its title re-derived. Both ride the TYPING path, so both
@@ -480,6 +481,8 @@ export function EditorPane({ task, tab, active, onContent }: {
               // Tab indents (and Shift-Tab dedents) instead of moving DOM
               // focus to the next button. High precedence so it wins.
               keymap.of([{ key: "Mod-s", preventDefault: true, run: saveDoc }, indentWithTab]),
+              // Keep a CRLF file CRLF on save (lib/lineEndings.ts).
+              ...(isPureCrlf(content) ? [EditorState.lineSeparator.of("\r\n")] : []),
               // basicSetup: line numbers, fold gutter, history, indentOnInput,
               // bracket matching, close-brackets, autocomplete, active-line +
               // selection-match highlight, and the default/search/history keymaps.

@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, cliRpc, dashboardBadge, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, requireWorkBadges, keysIn, setWindowPresence, snap, submitToAgent, waitForAgentReady, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
+import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, cliRpc, dashboardBadge, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, requireWorkBadges, keysIn, rmTree, setWindowPresence, snap, submitToAgent, waitForAgentReady, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -24,7 +24,7 @@ describe("project add/remove", () => {
         await window.__termic!.useApp.getState().loadAll();
       }, projectId);
     }
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("adds a git repo as a project", async () => {
@@ -54,7 +54,7 @@ describe("project add/remove", () => {
   it("adds the typed repository root when Enter is pressed", async () => {
     // realpath: the app stores the canonical root, and macOS tmpdir is a
     // symlink (/var -> /private/var), so the raw mkdtemp path never matches.
-    const dir2 = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-proj-enter-")));
+    const dir2 = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "e2e-proj-enter-")));
     execSync(
       `git -C "${dir2}" init -q && git -C "${dir2}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
     );
@@ -100,7 +100,7 @@ describe("project add/remove", () => {
       } else {
         await browser.execute(() => window.__termic!.useUI.getState().closeNewProject());
       }
-      rmSync(dir2, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true, maxRetries: 10 });
     }
   });
 
@@ -233,7 +233,7 @@ describe("discover repos", () => {
       `git -C "${sub}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
     );
   });
-  after(() => rmSync(dir, { recursive: true, force: true }));
+  after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10 }));
 
   it("finds a git repo inside a folder", async () => {
     await waitForAppShell();
@@ -347,7 +347,11 @@ describe("import worktree", () => {
           await window.__termic!.useApp.getState().loadAll();
         }, projectId);
       }
-      rmSync(bare, { recursive: true, force: true });
+      // Best effort: on the Windows runner this repo is sometimes still held
+      // by a process outside termic's tree (none of its children is in it;
+      // Defender or the indexer on a fresh .git is the likely owner), and
+      // the case is about the import row, not the cleanup.
+      rmTree(bare, { bestEffort: true });
     }
   });
 });
@@ -626,8 +630,8 @@ describe("branch new tasks from", () => {
         }, projectId)
         .catch(() => {});
     }
-    for (const r of remotes) rmSync(remotePath(r), { recursive: true, force: true });
-    rmSync(dir, { recursive: true, force: true });
+    for (const r of remotes) rmSync(remotePath(r), { recursive: true, force: true, maxRetries: 10 });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("adds the repo and reports its branch context", async () => {
@@ -933,7 +937,7 @@ describe("sidebar project drag", () => {
       }, id);
     }
     await browser.execute(() => window.__termic!.useApp.getState().loadAll());
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    for (const d of dirs) rmSync(d, { recursive: true, force: true, maxRetries: 10 });
   });
 
   // Project ids in sidebar order.
@@ -1310,7 +1314,7 @@ describe("dashboard", () => {
       window.__termic!.useApp.getState().setView("dashboard");
     }, GROUP);
     await browser.execute(() => window.__termic!.useApp.getState().loadAll());
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    for (const d of dirs) rmSync(d, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("renders a group folder with its members inside it", async () => {
@@ -1620,7 +1624,7 @@ describe("multi member modes (New Task dialog)", () => {
         await window.__termic!.useApp.getState().loadAll();
       }
     }, projectId);
-    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    if (tmp) rmSync(tmp, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("seeds every git member row on Worktree when nothing is remembered", async () => {
@@ -1744,7 +1748,9 @@ describe("multi main checkout (New Task dialog)", () => {
         await window.__termic!.useApp.getState().loadAll();
       }
     }, projectId, savedMode);
-    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    // Longer than the others: on Windows a member repo stays busy for a few
+    // seconds after its task and project are gone.
+    if (tmp) rmTree(tmp);
   });
 
   it("shows the host-level toggle; Main checkout replaces the member rows with a run-live note", async () => {
@@ -2045,7 +2051,7 @@ describe("multi files to copy (GH #264)", () => {
   }, PROJECT_NAME);
 
   before(() => {
-    tmp = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-multi-copy-")));
+    tmp = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "e2e-multi-copy-")));
     // Host: gitignored secrets only the project's own list names.
     seedRepo(path.join(tmp, "host"), {
       ".env": "HOST=1",
@@ -2074,7 +2080,7 @@ describe("multi files to copy (GH #264)", () => {
     await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
     if (taskId) await archiveTask(taskId);
     await sweepProjects();
-    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    if (tmp) rmSync(tmp, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("copies the host list into the task root and each member's own list into its worktree", async () => {
@@ -2087,7 +2093,7 @@ describe("multi files to copy (GH #264)", () => {
         const t = window.__termic!;
         const member = (root_path: string, files_to_copy: string[]) => ({
           root_path,
-          name: root_path.split("/").pop()!,
+          name: root_path.split(/[\\/]/).pop()!,
           base_branch: "main",
           setup_script: "", run_script: "", archive_script: "",
           files_to_copy,
@@ -2275,7 +2281,33 @@ describe("quick-create sandbox note", () => {
     if (saved) await setDefault(saved);
   });
 
-  it("names the mode, with its icon, when the project defaults to one", async () => {
+  // Seatbelt is macOS only: elsewhere a Seatbelt default reads as Off, and
+  // the note says nothing (see the Windows case below).
+  const seatbeltIt = process.platform === "darwin" ? it : it.skip;
+
+  it("names Docker, with its icon, when the project defaults to it", async () => {
+    await setDefault({ default_sandbox: false, default_sandbox_mode: null, default_docker: true });
+    await openMenu();
+    await waitVisible(NOTE);
+    const [kind, text, hasIcon] = await browser.execute((sel) => {
+      const el = document.querySelector(sel)!;
+      return [el.getAttribute("data-sandbox-default"), el.textContent ?? "", !!el.querySelector("svg")];
+    }, NOTE) as [string, string, boolean];
+    expect(kind).toBe("docker");
+    expect(text).toContain("Docker");
+    expect(hasIcon).toBe(true);
+    await browser.keys("Escape");
+  });
+
+  (process.platform === "darwin" ? it.skip : it)("says nothing for a Seatbelt default, which this OS does not have", async () => {
+    await setDefault({ default_sandbox: true, default_sandbox_mode: "enforce", default_docker: false });
+    await openMenu();
+    const present = await browser.execute((sel) => !!document.querySelector(sel), NOTE);
+    expect(present).toBe(false);
+    await browser.keys("Escape");
+  });
+
+  seatbeltIt("names the mode, with its icon, when the project defaults to one", async () => {
     await setDefault({ default_sandbox: true, default_sandbox_mode: "monitor", default_docker: false });
     await openMenu();
     await waitVisible(NOTE);
@@ -2292,7 +2324,7 @@ describe("quick-create sandbox note", () => {
     await browser.keys("Escape");
   });
 
-  it("follows the project to a different mode", async () => {
+  seatbeltIt("follows the project to a different mode", async () => {
     await setDefault({ default_sandbox: true, default_sandbox_mode: "enforce", default_docker: false });
     await openMenu();
     await waitVisible(NOTE);
@@ -2393,9 +2425,14 @@ describe("quick-create YOLO note", () => {
 
   it("stays quiet when the project's cage already turns YOLO on", async () => {
     await setAppDefault(true);
-    await setProject({ default_sandbox: true, default_sandbox_mode: "enforce" });
+    // Seatbelt is macOS only (off it, a Seatbelt default reads as Off);
+    // Docker is a cage on every OS.
+    const cage = process.platform === "darwin"
+      ? { default_sandbox: true, default_sandbox_mode: "enforce" }
+      : { default_docker: true };
+    await setProject(cage);
     expect(await noteShown()).toBe(false);
-    await setProject({ default_sandbox: false, default_sandbox_mode: null });
+    await setProject({ default_sandbox: false, default_sandbox_mode: null, default_docker: false });
   });
 });
 
@@ -2415,8 +2452,8 @@ describe("new project from a git URL", () => {
   let addedId: string | null = null;
 
   before(() => {
-    origin = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-origin-")));
-    const work = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-work-")));
+    origin = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-origin-")));
+    const work = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-work-")));
     // A bare repo with one real commit: an EMPTY remote clones into something
     // indistinguishable from a clone still running, which is the exact case
     // the Add gate cannot resolve on its own.
@@ -2425,8 +2462,8 @@ describe("new project from a git URL", () => {
       + `&& git -C "${work}" -c user.email=e2e@termic.dev -c user.name=alice commit -q --allow-empty -m init `
       + `&& git -C "${work}" clone -q --bare . "${origin}/repo.git"`,
     );
-    rmSync(work, { recursive: true, force: true });
-    parent = realpathSync(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-into-")));
+    rmSync(work, { recursive: true, force: true, maxRetries: 10 });
+    parent = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "e2e-clone-into-")));
   });
 
   after(async () => {
@@ -2437,8 +2474,8 @@ describe("new project from a git URL", () => {
       }, addedId);
     }
     // Both are this spec's own temp dirs; the clone lands inside `parent`.
-    rmSync(origin, { recursive: true, force: true });
-    rmSync(parent, { recursive: true, force: true });
+    rmSync(origin, { recursive: true, force: true, maxRetries: 10 });
+    rmSync(parent, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("proposes a destination from the URL and refuses to guess without one", async () => {
@@ -2459,7 +2496,7 @@ describe("new project from a git URL", () => {
     await waitVisible('[data-testid="clone-dest"]');
     const dest = await browser.execute(() =>
       document.querySelector('[data-testid="clone-dest"]')!.textContent);
-    expect(dest).toBe(`${parent}/repo`);
+    expect(dest).toBe(path.join(parent, "repo"));
   });
 
   // Both of these shipped broken and neither was caught, because the spec fed
@@ -2473,7 +2510,7 @@ describe("new project from a git URL", () => {
     // a cwd that does not exist, the shell fell back to home, and the clone
     // landed somewhere the user never picked.
     expect(shown.startsWith("~")).toBe(false);
-    expect(shown.endsWith("/repo")).toBe(true);
+    expect(shown.endsWith(`${path.sep}repo`)).toBe(true);
   });
 
   it("refuses a folder that does not exist rather than cloning somewhere else", async () => {
@@ -2518,7 +2555,7 @@ describe("new project from a git URL", () => {
         const p = (await browser.execute(
           (d) => window.__termic!.useApp.getState()
             .projects.find((x: any) => x.root_path === d) ?? null,
-          `${parent}/repo`,
+          path.join(parent, "repo"),
         )) as any;
         if (!p) return false;
         addedId = p.id;

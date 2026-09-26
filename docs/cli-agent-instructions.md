@@ -169,6 +169,11 @@ caption, led by your task, so the user can see which tasks you started.
 A worker that creates tasks adds them to the same group (groups do not
 nest). `new --no-group` keeps a task out.
 
+A group lives in one project's list, so a task you create in ANOTHER
+project joins no group. It is still linked to yours: its summary carries
+`spawned_by` (your task, as `project/name`), and the sidebar draws the
+link when the user hovers either task.
+
 Name the group for the batch of work, the way you would title a PR:
 
     "$TERMIC_CLI" group --name "Auth refactor" --color teal
@@ -193,7 +198,13 @@ task you run in (the headers helper sends your `$TERMIC_TASK_ID`).
 - A task can hold SEVERAL agent tabs. `"$TERMIC_CLI" tab <task>
   --agent <id> -p "<text>"` opens one and prompts it; record the
   printed tab id and pass `--tab <id>` to `send`/`wait`/`logs` to keep
-  addressing that tab (ids are stable; indexes and titles shift).
+  addressing that tab (ids are stable; indexes shift, and a title the
+  agent sets for itself changes mid-turn).
+- Name the tab when you open it with `--title <name>` (unique in the
+  task, not a bare number) and `--tab <name>` works just as well: a
+  title you set survives the agent retitling itself and a relaunch.
+  `"$TERMIC_CLI" tab <task> --tab <tab> --title <name>` renames an open
+  tab, and `--title ""` gives it back its automatic title.
   `status --json` lists every tab with its id, state and queue.
 - Without a task, `tab` opens the new agent in YOUR task:
   `"$TERMIC_CLI" tab --agent codex -p "..."` starts a second agent

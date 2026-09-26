@@ -52,6 +52,7 @@ import { CopyPathItems } from "./CopyPathItems";
 import { fileIconUrl, folderIconUrl } from "@/lib/explorer/iconResolver";
 import { flattenRows, type FlatRow, type ViewMode } from "./GitPanel";
 import { SC, COL, INK, LBL } from "@/lib/gitStatus";
+import { kbd } from "@/lib/platform";
 
 /** Whether the compare runs from the merge base. Global rather than per task:
  *  it expresses how someone reads a diff, not anything about one branch. */
@@ -540,7 +541,7 @@ function FileRow({ file, label, depth, taskId, root, repoDir, selected, onOpen, 
           )}
           <Churn added={file.added} removed={file.removed} />
           {canView && (
-            <Tip side="left" content={t("shared.openFileTip")}>
+            <Tip side="left" content={t("shared.openFileTip", { combo: kbd("⌥") })}>
               <button
                 onClick={e => { e.stopPropagation(); onOpenWholeFile(file.path); }}
                 aria-label={t("shared.openFile")}

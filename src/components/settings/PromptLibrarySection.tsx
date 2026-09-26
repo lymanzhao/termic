@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/Button";
 import { AppDialog } from "@/components/ui/Dialog";
 import { cn } from "@/lib/utils";
 import { GripVertical, Copy, Trash2, RotateCcw, Eye, EyeOff, Plus, Pencil } from "lucide-react";
+import { kbd } from "@/lib/platform";
 
 interface DragState {
   id: string;
@@ -186,7 +187,7 @@ export function PromptLibrarySection() {
         <div>
           <h2 className="text-[15px] font-semibold text-[var(--color-fg)]">{t("rail.prompts")}</h2>
           <p className="mt-0.5 max-w-xl text-[12.5px] text-[var(--color-fg-dim)]">
-            {t("prompts.desc")}
+            {t("prompts.desc", { combo: kbd("⌥⌘P") })}
           </p>
         </div>
         <Button variant="primary" size="sm" className="shrink-0 gap-1.5" onClick={openNewPrompt}>

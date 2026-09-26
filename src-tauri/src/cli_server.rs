@@ -31,12 +31,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
+use termic_proto::local::{Listener as LocalListener, Stream as LocalStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-use termic_proto::transport::{Listener, Stream};
 
 use tauri::{Emitter, Manager};
 use termic_proto as proto;
@@ -44,8 +43,7 @@ use termic_proto::{Command, ErrorCode, Reply, ReplyData, Request, StreamEvent, W
 
 use crate::{dlog, Project, Task};
 
-/// Darwin's sockaddr_un.sun_path is 104 bytes including the NUL. Unix
-/// only: named pipes have no path-length limit in this range.
+/// Darwin's sockaddr_un.sun_path is 104 bytes including the NUL.
 #[cfg(unix)]
 const MAX_SUN_PATH: usize = 103;
 
@@ -177,7 +175,7 @@ pub fn raise_owner(deep_link: Option<&str>) -> bool {
 /// file left by a crash), ask it to raise its window (and take over any
 /// deep link we were launched with) and report true.
 fn raise_existing(sock: &Path, deep_link: Option<&str>) -> bool {
-    let Ok(stream) = Stream::connect(sock) else { return false };
+    let Ok(stream) = proto::local::connect(sock) else { return false };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let Ok(mut writer) = stream.try_clone() else { return false };
@@ -219,7 +217,7 @@ fn server_main(app: tauri::AppHandle) {
     };
     let sock = dir.join(proto::SOCKET_FILE);
     #[cfg(unix)]
-    if sock.as_os_str().as_bytes().len() > MAX_SUN_PATH {
+    if std::os::unix::ffi::OsStrExt::as_bytes(sock.as_os_str()).len() > MAX_SUN_PATH {
         dlog(&format!(
             "[cli] socket path exceeds the {MAX_SUN_PATH}-byte unix limit, control socket disabled: {}",
             sock.display()
@@ -227,10 +225,9 @@ fn server_main(app: tauri::AppHandle) {
         return;
     }
     // Stale socket from a previous boot (or a crashed instance): unlink
-    // before bind, the standard unix-daemon dance. Windows needs no
-    // cleanup (pipe instances vanish with the owning process).
-    proto::transport::prepare_bind(&sock);
-    let listener = match Listener::bind(&sock) {
+    // before bind, the standard unix-daemon dance.
+    let _ = std::fs::remove_file(&sock);
+    let listener = match proto::local::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
             dlog(&format!("[cli] bind {} failed: {e}", sock.display()));
@@ -244,12 +241,6 @@ fn server_main(app: tauri::AppHandle) {
     }) {
         dlog(&format!("[cli] chmod 0600 on {} failed: {e}", sock.display()));
         return;
-    }
-    #[cfg(windows)]
-    {
-        // The default pipe DACL already restricts the endpoint to
-        // creator-owner, SYSTEM and admins; there is no chmod to apply.
-        dlog(&format!("[cli] listening on pipe for {}", sock.display()));
     }
     // Write the token only AFTER the socket is bound, so at startup the two
     // appear together (we never advertise a token before a live socket).
@@ -270,7 +261,7 @@ fn server_main(app: tauri::AppHandle) {
 
 /// Accept loop, decomposed from `server_main` so integration tests can
 /// drive a real socket with a stub host.
-fn serve_listener(listener: Listener, host: Arc<dyn CliHost>) {
+fn serve_listener(listener: LocalListener, host: Arc<dyn CliHost>) {
     // A transient accept error (EMFILE when the app is fd-heavy with many
     // PTYs, ECONNABORTED, EINTR) must NOT kill the server thread: a dead
     // listener also silently breaks the release single-instance guard (a
@@ -300,10 +291,10 @@ fn serve_listener(listener: Listener, host: Arc<dyn CliHost>) {
     }
 }
 
-fn serve_conn(stream: Stream, host: Arc<dyn CliHost>) {
-    // Same-user peer check BEFORE reading anything. Root / admin is not
-    // exempted: there is no reason for another user to be here.
-    if !stream.peer_is_self_user() {
+fn serve_conn(stream: LocalStream, host: Arc<dyn CliHost>) {
+    // Same-uid peer check BEFORE reading anything. Root is not exempted:
+    // there is no reason for another uid, root included, to be here.
+    if !peer_is_current_user(&stream) {
         return;
     }
     // A client that connects and never sends must not pin this thread.
@@ -431,8 +422,8 @@ fn run_attach_session(
     task_id: String,
     attachment: crate::PtyAttachment,
     host: Arc<dyn CliHost>,
-    reader: BufReader<Stream>,
-    mut writer: Stream,
+    reader: BufReader<LocalStream>,
+    mut writer: LocalStream,
 ) {
     // Both directions can be legitimately silent for minutes; EOF is
     // the liveness signal, not a read timeout. (The socket options live
@@ -510,7 +501,7 @@ fn run_attach_session(
         &Reply::ok(req_id, ReplyData::Attach(proto::AttachData { task_id, reason })),
     );
     // Unblock the input thread's socket read so it can exit.
-    let _ = writer.shutdown();
+    let _ = writer.shutdown(std::net::Shutdown::Both);
     let _ = input_thread.join();
 }
 
@@ -525,7 +516,7 @@ pub(crate) trait EventSink {
 }
 
 struct SocketSink<'a> {
-    writer: &'a mut Stream,
+    writer: &'a mut LocalStream,
 }
 
 impl EventSink for SocketSink<'_> {
@@ -848,6 +839,15 @@ pub(crate) fn dispatch_authenticated(
         Command::Agents => handle_agents(req, host),
         Command::Prompts { .. } => handle_prompts(req, host),
         Command::Tab { .. } => handle_tab(req, host, sink),
+        Command::TabRename { task, project, tab, title, cwd } => handle_tab_rename(
+            &req.id,
+            host,
+            task.as_deref(),
+            project.as_deref(),
+            tab,
+            title,
+            cwd.as_deref(),
+        ),
         Command::TabClose { task, project, tab, yes, cwd } => handle_tab_close(
             &req.id,
             host,
@@ -2660,8 +2660,9 @@ fn handle_prompts(req: &Request, host: &dyn CliHost) -> Reply {
 /// the spawn-pending rule, i.e. exactly what `send` to a respawned agent
 /// does, so delivery stays confirmed (docs/plans/cli.md, Phase 1).
 fn handle_tab(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Reply {
-    let Command::Tab { task, project, kind, prompt, prompt_ref, wait, timeout_ms, resume, cwd } =
-        &req.cmd
+    let Command::Tab {
+        task, project, kind, prompt, prompt_ref, wait, timeout_ms, resume, title, cwd,
+    } = &req.cmd
     else {
         unreachable!("handle_tab called with a non-tab command")
     };
@@ -2721,6 +2722,12 @@ fn handle_tab(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
     if *wait && !has_prompt {
         return Reply::err(id, ErrorCode::BadRequest, "--wait needs a prompt to wait on");
     }
+    // A title a selector could never reach (GH #331). Uniqueness is the
+    // webview's check: it needs the live strip.
+    if let Some(why) = title.as_deref().and_then(proto::tab_title_problem) {
+        return Reply::err(id, ErrorCode::BadRequest, why);
+    }
+    let title = title.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let (projects, tasks) = host.projects_tasks();
     let t = match resolve_task_arg(
         &projects,
@@ -2764,10 +2771,18 @@ fn handle_tab(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
 
     let value = match host.rpc(
         "new_tab",
-        serde_json::json!({ "taskId": t.id, "kind": kind_str, "id": agent_id, "resume": resume }),
+        serde_json::json!({
+            "taskId": t.id, "kind": kind_str, "id": agent_id, "resume": resume, "title": title,
+        }),
         OPEN_TIMEOUT,
     ) {
         Ok(v) => v,
+        // A title already in use on this task is a Conflict, the task-name
+        // rule, so a script can tell it from an unusable agent id.
+        Err(e) if e.starts_with(TAB_TITLE_ERR) => {
+            let (code, msg) = parse_tab_title_error(&e);
+            return Reply::err(id, code, msg);
+        }
         // The webview owns the "which agents are usable" answer, so its
         // message is the useful one; pass it through rather than flattening
         // it into a generic failure.
@@ -2934,6 +2949,76 @@ fn parse_tab_close_error(e: &str) -> (ErrorCode, String) {
 /// Unlike archive this is scoped to one tab, which is the entire point:
 /// an orchestrator cleaning up the tabs it opened must not take down the
 /// session it is driving from.
+/// Sentinel prefix for the webview's typed tab-title failures (GH #331),
+/// the `cli_tab_close:` scheme: `cli_tab_title:<code>: <message>`.
+const TAB_TITLE_ERR: &str = "cli_tab_title:";
+
+fn parse_tab_title_error(e: &str) -> (ErrorCode, String) {
+    let Some(rest) = e.strip_prefix(TAB_TITLE_ERR) else {
+        return (ErrorCode::Internal, format!("could not set the tab title ({e})"));
+    };
+    let (code, msg) = rest.split_once(':').unwrap_or(("", rest));
+    let code = match code {
+        // Another tab of the task already answers to that title.
+        "conflict" => ErrorCode::Conflict,
+        "invalid" => ErrorCode::BadRequest,
+        // The resolver's cache trailed a tab that closed underneath us.
+        "unknown_tab" => ErrorCode::NotFound,
+        "task_stopped" | "not_renamable" => ErrorCode::Unsupported,
+        _ => ErrorCode::Internal,
+    };
+    (code, msg.trim().to_string())
+}
+
+/// `termic tab --tab X --title Y` (GH #331): set or clear an open tab's
+/// title, the tab strip's double-click rename as a verb. Reaches every
+/// strip tab (renaming is not driving, the `tab close` reach). The
+/// webview owns the uniqueness check, since only it has the live strip.
+fn handle_tab_rename(
+    id: &str,
+    host: &dyn CliHost,
+    task: Option<&str>,
+    project: Option<&str>,
+    tab: &str,
+    title: &str,
+    cwd: Option<&str>,
+) -> Reply {
+    if let Some(why) = proto::tab_title_problem(title) {
+        return Reply::err(id, ErrorCode::BadRequest, why);
+    }
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task, project, cwd) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    let rt = match resolve_tab_selector_with(host, &t, tab, TabReach::AnyStripTab) {
+        Ok(rt) => rt,
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    let value = match host.rpc(
+        "rename_tab",
+        serde_json::json!({ "taskId": t.id, "tabId": rt.id, "title": title.trim() }),
+        OPEN_TIMEOUT,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let (code, msg) = parse_tab_title_error(&e);
+            return Reply::err(id, code, msg);
+        }
+    };
+    // The webview reports the title the tab ends up with, which after a
+    // reset is the automatic one the resolver's snapshot cannot know yet.
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| title.trim().to_string());
+    Reply::ok(
+        id,
+        ReplyData::Tab(proto::TabData { task_id: t.id, tab_id: rt.id, cli: rt.cli, title, prompt: None }),
+    )
+}
+
 fn handle_tab_close(
     id: &str,
     host: &dyn CliHost,
@@ -3358,6 +3443,11 @@ fn summarize(
         open_tabs: info.filter(|i| i.hydrated).map(|i| i.tabs),
         diff,
         group: group_info(task, projects, tasks, false),
+        spawned_by: task
+            .spawned_by
+            .as_deref()
+            .and_then(|pid| tasks.iter().find(|t| t.id == pid))
+            .map(|t| qualified(projects, t)),
     }
 }
 
@@ -3531,17 +3621,27 @@ pub(crate) fn resolve_by_name<'a>(
 }
 
 fn canon(p: &str) -> String {
-    std::fs::canonicalize(p)
+    dunce::canonicalize(p)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| p.to_string())
 }
 
 fn under(path: &str, base: &str) -> bool {
+    // Windows paths use `\`, may arrive with `/` from a POSIX-ish shell,
+    // and are case-insensitive: normalize both sides before the prefix test.
+    if cfg!(windows) {
+        let norm = |s: &str| s.replace('/', "\\").to_lowercase();
+        return under_sep(&norm(path), norm(base).trim_end_matches('\\'), b'\\');
+    }
+    under_sep(path, base, b'/')
+}
+
+fn under_sep(path: &str, base: &str, sep: u8) -> bool {
     !base.is_empty()
         && (path == base
             || (path.len() > base.len()
                 && path.starts_with(base)
-                && path.as_bytes()[base.len()] == b'/'))
+                && path.as_bytes()[base.len()] == sep))
 }
 
 /// cwd resolution, worktree first then longest project-path prefix
@@ -3648,19 +3748,69 @@ pub(crate) fn mint_token() -> String {
 
 pub(crate) fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
     // Recreate rather than truncate so the 0600 mode is guaranteed even
-    // if an old file existed with different permissions. Windows gets the
-    // same guarantee from the user-profile DACL the file inherits.
+    // if an old file existed with different permissions. On Windows the
+    // file inherits the data dir's ACL (inside the user's profile: the
+    // user, SYSTEM and Administrators), the platform's equivalent.
     let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
-    opts.mode(0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     let mut f = opts.open(path)?;
     f.write_all(token.as_bytes())?;
     f.flush()
+}
+
+/// Unix: the peer's uid must be ours (root included, no exemption).
+#[cfg(unix)]
+fn peer_is_current_user(stream: &LocalStream) -> bool {
+    peer_uid(stream) == Some(unsafe { libc::geteuid() })
+}
+
+/// Windows: the listener is bound to 127.0.0.1, so a remote peer cannot
+/// reach it; refuse anything that is somehow not loopback anyway. There
+/// is no kernel peer-identity check on this transport, so the per-boot
+/// token is the credential (see termic_proto::local).
+#[cfg(windows)]
+fn peer_is_current_user(stream: &LocalStream) -> bool {
+    stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn peer_uid(stream: &LocalStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: valid fd from a live LocalStream; out-params are plain ints.
+        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0 {
+            Some(uid)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: valid fd; SO_PEERCRED fills a ucred of exactly this size.
+        let ok = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        } == 0;
+        if ok { Some(cred.uid) } else { None }
+    }
 }
 
 // ───────────────────────────── Tauri host ────────────────────────────
@@ -3775,8 +3925,7 @@ impl CliHost for TauriHost {
         // and what `result` reads back. Termination is still guaranteed, so
         // the worktree removal downstream is as safe as it was.
         let manager = self.app.state::<crate::PtyManager>();
-        (crate::stop_task_ptys(&manager, task_id) + crate::stop_task_role_ptys(&manager, task_id))
-            as u32
+        crate::stop_every_task_pty(&manager, task_id) as u32
     }
     fn git_toplevel(&self, cwd: &str) -> Option<String> {
         let out = crate::git(&["rev-parse", "--show-toplevel"], Path::new(cwd)).ok()?;
@@ -4589,9 +4738,7 @@ pub fn cli_rpc_progress(id: String, payload: String) -> Result<(), String> {
 pub(crate) fn bundled_cli_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("app binary has no parent dir")?;
-    // The bundler installs the sidecar as `termic-cli.exe` on Windows
-    // (build.rs / build-cli.mjs stage both spellings during the build).
-    let p = dir.join(if cfg!(windows) { "termic-cli.exe" } else { "termic-cli" });
+    let p = dir.join(format!("termic-cli{}", std::env::consts::EXE_SUFFIX));
     if p.is_file() {
         Ok(p)
     } else {
@@ -4655,21 +4802,10 @@ fn prune_legacy_links() {
     }
 }
 
-#[cfg(unix)]
 fn user_bin() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local/bin"))
 }
 
-/// The Windows analog of `~/.local/bin`: a directory inside the user's
-/// profile, created on demand. Deliberately NOT WindowsApps (reserved for
-/// app execution aliases) and never a machine location (writing there
-/// needs elevation, which a launch or a Settings click must not raise).
-#[cfg(windows)]
-fn user_bin() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("Programs").join("termic").join("bin"))
-}
-
-#[cfg(unix)]
 fn install_targets(name: &str) -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from(format!("/usr/local/bin/{name}"))];
     if let Some(bin) = user_bin() {
@@ -4678,69 +4814,18 @@ fn install_targets(name: &str) -> Vec<PathBuf> {
     v
 }
 
-/// User bin only. There is no system-wide location writable without the
-/// elevation machinery this platform port does not have; the `system`
-/// install button lands in the same user bin and adds it to the user
-/// PATH (see `install_at`).
-#[cfg(windows)]
-fn install_targets(name: &str) -> Vec<PathBuf> {
-    user_bin().map(|bin| vec![bin.join(format!("{name}.cmd"))]).unwrap_or_default()
-}
-
-/// First line of every shim we write. Both the recognition primitive
-/// (`replaceable`) and the Settings status read it: a file that does not
-/// carry it is somebody else's file and is never touched.
-#[cfg(windows)]
-const SHIM_MARKER: &str = "rem Added by Termic (termic-cli shim)";
-
-/// Second line of the shim: the absolute path of the sidecar it runs.
-#[cfg(windows)]
-fn shim_src(link: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(link).ok()?;
-    let mut lines = text.lines();
-    if lines.next()?.trim() != "@echo off" {
-        return None;
-    }
-    if lines.next()?.trim() != SHIM_MARKER {
-        return None;
-    }
-    let target = lines.next()?.trim().strip_prefix('"')?.strip_suffix("\" %*")?;
-    Some(PathBuf::from(target))
-}
-
-#[cfg(unix)]
+/// Is `dir` on the user's LOGIN-SHELL PATH (not the app's launchd PATH)?
+/// That is what a fresh terminal resolves commands against, so it is the
+/// honest "will `termic` be found" check. Uses the same resolved PATH the
+/// PTY spawn uses (shell_env), so the answer matches the real shell.
 fn dir_on_login_path(dir: &Path) -> bool {
     let path = crate::shell_env::resolved_path();
     std::env::split_paths(&path).any(|p| p == dir)
 }
 
-/// Is `dir` on the PATH a fresh terminal will resolve against? On
-/// Windows that is the process PATH (login-time user + machine Path;
-/// registry edits only reach NEW shells after the WM_SETTINGCHANGE
-/// broadcast, which this check does not see - same honesty as the Unix
-/// check, which reads the login shell's resolved PATH and not ours).
-#[cfg(windows)]
-fn dir_on_login_path(dir: &Path) -> bool {
-    let want = std::fs::canonicalize(dir)
-        .unwrap_or_else(|_| dir.to_path_buf())
-        .to_string_lossy()
-        .trim_end_matches(['/', '\\'])
-        .to_string();
-    std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p).any(|p| {
-                let p = std::fs::canonicalize(&p).unwrap_or(p);
-                p.to_string_lossy().trim_end_matches(['/', '\\']).eq_ignore_ascii_case(&want)
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// A link we may replace: Unix, anything whose target basename is
-/// `termic-cli` (a previous install, possibly from an older app path);
-/// Windows, a shim carrying our marker whose target names `termic-cli`.
-/// A real file or a foreign link is never touched.
-#[cfg(unix)]
+/// A symlink we may replace: anything whose target basename is
+/// `termic-cli` (a previous install, possibly from an older app path).
+/// A real file or a foreign symlink is never touched.
 fn replaceable(link: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(link) {
         Err(_) => Ok(true), // absent
@@ -4752,59 +4837,30 @@ fn replaceable(link: &Path) -> Result<bool, String> {
     }
 }
 
-#[cfg(windows)]
-fn replaceable(link: &Path) -> Result<bool, String> {
-    match shim_src(link) {
-        // Absent, or present and ours.
-        None => Ok(!link.exists()),
-        Some(target) => Ok(target.file_name().is_some_and(|n| {
-            n == "termic-cli" || n == "termic-cli.exe"
-        })),
-    }
+/// Installing `termic` onto PATH is unix-only for now: on Windows the
+/// right shape is a copy in a per-user bin dir plus an HKCU PATH entry,
+/// not a link (docs/ideas/windows.md, "Installing the CLI onto PATH").
+/// Agent terminals still get the CLI: pty_spawn puts the bundled binary's
+/// directory on their PATH and exports TERMIC_CLI.
+#[cfg(not(unix))]
+fn windows_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "installing the termic command onto PATH is not supported on Windows yet",
+    )
 }
 
-/// Does an installed link already point at `src`? (The "reinstall is a
-/// no-op" check in the launch reconcile.)
-#[cfg(unix)]
-fn installed_points_at(target: &Path, src: &Path) -> bool {
-    std::fs::read_link(target).ok().as_deref() == Some(src.as_path())
-}
-
-#[cfg(windows)]
-fn installed_points_at(target: &Path, src: &Path) -> bool {
-    match shim_src(target) {
-        Some(t) if t == src => true,
-        // Case-insensitive fallback: NTFS is case-preserving and the shim
-        // records exactly what we were given at write time, but a drive
-        // letter or profile case can drift between launches.
-        Some(t) => {
-            std::fs::canonicalize(&t).ok()
-                == std::fs::canonicalize(src).ok().map(|s| s)
-        }
-        None => false,
-    }
-}
-
-/// Write the shim: a `.cmd` that runs the sidecar. A real symlink needs
-/// privileges Windows does not grant by default; a shim needs neither
-/// privileges nor a PATH edit to resolve once its directory is on PATH.
-#[cfg(windows)]
-fn write_shim(src: &Path, link: &Path) -> std::io::Result<()> {
-    let body = format!("@echo off\n{SHIM_MARKER}\n\"{}\" %*\n", src.display());
-    std::fs::write(link, body)
-}
-
-#[cfg(unix)]
 fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(link).is_ok() {
         std::fs::remove_file(link)?;
     }
-    std::os::unix::fs::symlink(src, link)
-}
-
-#[cfg(windows)]
-fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
-    write_shim(src, link)
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(src, link);
+    #[cfg(not(unix))]
+    {
+        let _ = src;
+        Err(windows_unsupported())
+    }
 }
 
 /// Atomic replace: build the new link under a temp name in the SAME
@@ -4816,23 +4872,17 @@ fn symlink_replacing(src: &Path, link: &Path) -> std::io::Result<()> {
 /// the explicit install path, where the user clicked a button and gets
 /// the error. It is not tolerable on the silent launch reconcile, which
 /// would delete a working `termic` and say nothing.
-#[cfg(unix)]
 fn symlink_atomic(src: &Path, link: &Path) -> std::io::Result<()> {
     let base = link.file_name().and_then(|n| n.to_str()).unwrap_or("termic");
     let tmp = link.with_file_name(format!(".{base}.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(src, &tmp)?;
-    std::fs::rename(&tmp, link).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
-}
-
-#[cfg(windows)]
-fn symlink_atomic(src: &Path, link: &Path) -> std::io::Result<()> {
-    let base = link.file_name().and_then(|n| n.to_str()).unwrap_or("termic");
-    let tmp = link.with_file_name(format!(".{base}.{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    write_shim(src, &tmp)?;
+    #[cfg(not(unix))]
+    {
+        let _ = src;
+        return Err(windows_unsupported());
+    }
     std::fs::rename(&tmp, link).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -4978,7 +5028,7 @@ pub fn reconcile_link() {
         return;
     }
 
-    if !installed_points_at(&target, &src) {
+    if std::fs::read_link(&target).ok().as_deref() != Some(src.as_path()) {
         if let Err(e) = symlink_atomic(&src, &target) {
             // An unwritable /usr/local/bin is the expected failure. Say so
             // in the log and change nothing else: pruning the legacy link
@@ -5005,10 +5055,6 @@ pub fn reconcile_link() {
 /// macOS runs Terminal.app sessions as LOGIN shells, which is why bash gets
 /// `.bash_profile` rather than `.bashrc`: bash reads only the former for a
 /// login shell, so the usual Linux answer silently does nothing here.
-///
-/// Unix only. Windows has no rc files; its `cli_add_to_path` edits the
-/// registry user PATH instead.
-#[cfg(unix)]
 fn shell_rc_and_line(shell: &str, dir: &Path) -> (PathBuf, String) {
     let home = dirs::home_dir().unwrap_or_default();
     let d = dir.display();
@@ -5034,130 +5080,12 @@ fn shell_rc_and_line(shell: &str, dir: &Path) -> (PathBuf, String) {
 
 /// Marker written above our line, so a reader knows who put it there and a
 /// user can find and delete it. Also what makes the append IDEMPOTENT.
-#[cfg(unix)]
 const PATH_MARKER: &str = "# Added by Termic: put the termic command on PATH";
-
-/// Append `dir` to the user's registry PATH (HKCU\\Environment) and
-/// broadcast the change, so NEW shells (and the Start menu, and the run
-/// dialog) resolve `termic` without a logout. Already-running processes,
-/// including open terminals, keep their inherited copy: the message
-/// says to open a new terminal, exactly like the rc-file route does.
-#[cfg(windows)]
-fn win_add_to_user_path(dir: &Path) -> Result<(), String> {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
-        KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, RRF_RT_REG_SZ,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
-    };
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    // Current user Path (REG_EXPAND_SZ: it may contain %VAR% references
-    // that must survive the round trip untouched, so we read raw UTF-16
-    // and only ever APPEND).
-    let value_name = wide("Path");
-    let mut len: u32 = 0;
-    // SAFETY: null buffer + &mut len is the documented size probe; the
-    // second call gets a live allocation of the reported size.
-    unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            wide("Environment").as_ptr(),
-            value_name.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut len,
-        )
-    };
-    let mut current = String::new();
-    if len > 0 {
-        let mut buf = vec![0u16; (len as usize) / 2];
-        let mut got = len;
-        // SAFETY: buf/len are a live allocation of the probed size.
-        unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                wide("Environment").as_ptr(),
-                value_name.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buf.as_mut_ptr() as *mut _,
-                &mut got,
-            )
-        };
-        current = String::from_utf16_lossy(&buf[..(got as usize / 2).max(0)]);
-    }
-    // Idempotent: a dir already there (case-insensitive, matching how
-    // Windows compares PATH entries) is not appended again.
-    let want = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
-    let already = current
-        .split(';')
-        .map(|e| e.trim().trim_end_matches(['/', '\\']))
-        .any(|e| e.eq_ignore_ascii_case(&want));
-    if already {
-        return Ok(());
-    }
-    let mut next = current.trim_end_matches(';').to_string();
-    if !next.is_empty() {
-        next.push(';');
-    }
-    next.push_str(&dir.to_string_lossy());
-    let data = wide(&next);
-
-    // SAFETY: standard three-call registry pattern; the key handle is
-    // closed on every path below.
-    unsafe {
-        let mut hkey = std::ptr::null_mut();
-        let rc = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            wide("Environment").as_ptr(),
-            0,
-            KEY_QUERY_VALUE | KEY_SET_VALUE,
-            &mut hkey,
-        );
-        if rc != 0 {
-            return Err(format!("open HKCU\\Environment: error {rc}"));
-        }
-        let bytes_len = (data.len() * 2) as u32;
-        let rc = RegSetValueExW(
-            hkey,
-            value_name.as_ptr(),
-            0,
-            REG_EXPAND_SZ,
-            data.as_ptr() as *const u8,
-            bytes_len,
-        );
-        RegCloseKey(hkey);
-        if rc != 0 {
-            return Err(format!("write HKCU\\Environment\\Path: error {rc}"));
-        }
-        // Best-effort: shells started from an existing explorer keep the
-        // old PATH until that explorer relaunches even without this, and
-        // a declined broadcast must not fail the install.
-        let env = wide("Environment");
-        SendMessageTimeoutW(
-            HWND_BROADCAST as _,
-            WM_SETTINGCHANGE,
-            0,
-            env.as_ptr() as isize,
-            SMTO_ABORTIFHUNG,
-            2000,
-            std::ptr::null_mut(),
-        );
-    }
-    Ok(())
-}
 
 /// Is this dir already handled by `rc`? Checks for OUR marker and, more
 /// importantly, for any mention of the directory at all: a user who added it
 /// by hand, in their own wording, must not get a duplicate line appended
 /// underneath theirs.
-#[cfg(unix)]
 fn rc_already_has(existing: &str, dir: &Path) -> bool {
     let d = dir.display().to_string();
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
@@ -5170,27 +5098,6 @@ fn rc_already_has(existing: &str, dir: &Path) -> bool {
         !l.starts_with('#')
             && (l.contains(&d) || l.contains(&tilde) || l.contains(&dollar))
     }) || existing.contains(PATH_MARKER)
-}
-
-/// Windows half of `cli_add_to_path`: the user bin into the registry
-/// PATH (idempotent), with the same "already there is a success" shape
-/// the rc-file path returns.
-#[cfg(windows)]
-fn add_to_path_inner() -> Result<String, String> {
-    let dir = user_bin().ok_or("no home directory")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    win_add_to_user_path(&dir)?;
-    if dir_on_login_path(&dir) {
-        Ok(format!(
-            "{} is already on PATH. Open a new terminal for it to take effect.",
-            dir.display()
-        ))
-    } else {
-        Ok(format!(
-            "Added {} to your PATH. Open a new terminal for it to take effect.",
-            dir.display()
-        ))
-    }
 }
 
 /// Append the PATH line to the user's shell startup file.
@@ -5210,8 +5117,10 @@ pub async fn cli_add_to_path() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
-#[cfg(unix)]
 fn add_to_path_inner() -> Result<String, String> {
+    #[cfg(not(unix))]
+    return Err(windows_unsupported().to_string());
+    #[allow(unreachable_code)]
     let dir = user_bin().ok_or("no home directory")?;
     let shell = crate::shell_env::login_shell();
     let (rc, line) = shell_rc_and_line(&shell, &dir);
@@ -5225,7 +5134,6 @@ fn add_to_path_inner() -> Result<String, String> {
 ///
 /// Returns the message shown in Settings either way, because "already there"
 /// is a success the user needs to read, not an error.
-#[cfg(unix)]
 fn append_path_line(rc: &Path, line: &str, dir: &Path) -> Result<String, String> {
     let existing = match std::fs::read_to_string(rc) {
         Ok(s) => s,
@@ -5306,38 +5214,6 @@ fn install_inner(name: &str, system: bool) -> Result<String, String> {
 }
 
 fn install_at(name: &str, system: bool) -> Result<String, String> {
-    #[cfg(windows)]
-    { install_at_windows(name, system) }
-    #[cfg(not(windows))]
-    { install_at_unix(name, system) }
-}
-
-/// Windows install: there is no system-wide location without elevation,
-/// so both flavors land in the user bin. `system=true` additionally puts
-/// that bin on the user's registry PATH right away (the no-prompt flavor
-/// leaves PATH alone, matching the Unix split between the silent
-/// on-enable install and the explicit button).
-#[cfg(windows)]
-fn install_at_windows(name: &str, system: bool) -> Result<String, String> {
-    let src = bundled_cli_path()?;
-    let link = install_user(&src, name)?;
-    let dir = link.parent().unwrap_or(&link).to_path_buf();
-    if dir_on_login_path(&dir) {
-        return Ok(format!("installed at {}", link.display()));
-    }
-    if !system {
-        return Ok(format!("installed at {}{}", link.display(), on_path_suffix(&dir)));
-    }
-    win_add_to_user_path(&dir)
-        .map_err(|e| format!("could not add {} to your PATH: {e}", dir.display()))?;
-    Ok(format!(
-        "installed at {} (added to your user PATH; open a new terminal)",
-        link.display()
-    ))
-}
-
-#[cfg(not(windows))]
-fn install_at_unix(name: &str, system: bool) -> Result<String, String> {
     let src = bundled_cli_path()?;
 
     if system {
@@ -5378,7 +5254,7 @@ fn admin_symlink(src: &Path, name: &str) -> Result<(), String> {
         "do shell script \"{}\" with prompt \"Termic wants to install the {name} command.\" with administrator privileges",
         shell.replace('\\', "\\\\").replace('"', "\\\"")
     );
-    let ok = std::process::Command::new("osascript")
+    let ok = crate::proc_ctl::command("osascript")
         .args(["-e", &script])
         .output()
         .map(|o| o.status.success())
@@ -5400,34 +5276,24 @@ pub struct CliInstallStatus {
     pub on_path: bool,
 }
 
-/// "A link of ours that still resolves": the installed state the
-/// Settings UI reports. Unix, our symlink whose target basename is
-/// `termic-cli`; Windows, our shim whose recorded sidecar still exists.
-#[cfg(unix)]
-fn is_our_installed_link(link: &Path) -> bool {
-    std::fs::symlink_metadata(link).map(|md| md.file_type().is_symlink()).unwrap_or(false)
-        && std::fs::read_link(link)
-            .ok()
-            .is_some_and(|t| t.file_name().is_some_and(|n| n == "termic-cli"))
-        && link.exists()
-}
-
-#[cfg(windows)]
-fn is_our_installed_link(link: &Path) -> bool {
-    shim_src(link).is_some_and(|t| t.exists())
-}
-
 #[tauri::command]
 pub fn cli_install_status(_app: tauri::AppHandle) -> CliInstallStatus {
     let name = install_name();
     for link in install_targets(name) {
-        if is_our_installed_link(&link) {
-            let on_path = link.parent().is_some_and(dir_on_login_path);
-            return CliInstallStatus {
-                path: Some(link.to_string_lossy().into_owned()),
-                name: name.to_string(),
-                on_path,
-            };
+        if let Ok(md) = std::fs::symlink_metadata(&link) {
+            let ours = md.file_type().is_symlink()
+                && std::fs::read_link(&link)
+                    .ok()
+                    .is_some_and(|t| t.file_name().is_some_and(|n| n == "termic-cli"))
+                && link.exists();
+            if ours {
+                let on_path = link.parent().is_some_and(dir_on_login_path);
+                return CliInstallStatus {
+                    path: Some(link.to_string_lossy().into_owned()),
+                    name: name.to_string(),
+                    on_path,
+                };
+            }
         }
     }
     CliInstallStatus { path: None, name: name.to_string(), on_path: false }
@@ -5829,14 +5695,6 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use test_support::*;
-
-    // Socket tests run through the platform transport: the real
-    // UnixStream/UnixListener on macOS/Linux, the named-pipe Stream/
-    // Listener on Windows (same operation surface).
-    #[cfg(unix)]
-    use std::os::unix::net::{UnixListener, UnixStream};
-    #[cfg(not(unix))]
-    use termic_proto::transport::{Listener as UnixListener, Stream as UnixStream};
 
     fn handle(req: &Request, host: &dyn CliHost) -> Reply {
         handle_request(req, host, &mut VecSink::default())
@@ -6648,6 +6506,7 @@ mod tests {
             wait: false,
             timeout_ms: None,
             resume: None,
+            title: None,
             cwd: None,
         }
     }
@@ -7676,7 +7535,7 @@ mod tests {
             TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![], hydrated: true },
         )]);
         let (sock, _guard) = spawn_server(host);
-        let mut stream = UnixStream::connect(&sock).unwrap();
+        let mut stream = proto::local::connect(&sock).unwrap();
         proto::write_msg(&mut stream, &req(wait_cmd("solo", None), Some("tok"))).unwrap();
         let mut reader = BufReader::new(stream);
         let mut saw_state = false;
@@ -7793,14 +7652,14 @@ mod tests {
     fn spawn_server(host: StubHost) -> (PathBuf, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join(proto::SOCKET_FILE);
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = proto::local::bind(&sock).unwrap();
         let host: Arc<dyn CliHost> = Arc::new(host);
         std::thread::spawn(move || serve_listener(listener, host));
         (sock, dir)
     }
 
     fn roundtrip_on(sock: &Path, req: &Request) -> Reply {
-        let mut stream = UnixStream::connect(sock).unwrap();
+        let mut stream = proto::local::connect(sock).unwrap();
         proto::write_msg(&mut stream, req).unwrap();
         let mut reader = BufReader::new(stream);
         proto::read_msg::<_, Reply>(&mut reader).unwrap().unwrap()
@@ -7811,7 +7670,7 @@ mod tests {
     fn spawn_server_arc(host: StubHost) -> (PathBuf, tempfile::TempDir, Arc<StubHost>) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join(proto::SOCKET_FILE);
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = proto::local::bind(&sock).unwrap();
         let arc = Arc::new(host);
         let dynamic: Arc<dyn CliHost> = arc.clone();
         std::thread::spawn(move || serve_listener(listener, dynamic));
@@ -7879,7 +7738,7 @@ mod tests {
         // be mistaken for a live instance: connect() fails fast.
         let dir = tempfile::tempdir().unwrap();
         let stale = dir.path().join(proto::SOCKET_FILE);
-        let listener = UnixListener::bind(&stale).unwrap();
+        let listener = proto::local::bind(&stale).unwrap();
         drop(listener); // socket file may linger, but nothing listens
         assert!(!raise_existing(&stale, None));
     }
@@ -7898,7 +7757,7 @@ mod tests {
     #[test]
     fn socket_handles_multiple_requests_per_connection() {
         let (sock, _guard) = spawn_server(StubHost::default());
-        let mut stream = UnixStream::connect(&sock).unwrap();
+        let mut stream = proto::local::connect(&sock).unwrap();
         proto::write_msg(&mut stream, &req(Command::Hello, None)).unwrap();
         proto::write_msg(&mut stream, &req(Command::List { project: None, quiet: false }, Some("tok")))
             .unwrap();
@@ -7937,7 +7796,6 @@ mod tests {
     /// into a fish config is a syntax error the user meets in their next
     /// terminal rather than here, where we could have told them.
     #[test]
-    #[cfg(unix)]
     fn the_path_line_matches_the_shell_that_will_read_it() {
         let dir = Path::new("/Users/u/.local/bin");
 
@@ -7964,8 +7822,8 @@ mod tests {
 
     /// Appending twice is the failure this has to prevent, and "twice" has
     /// more spellings than our own.
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
-    #[cfg(unix)]
     fn an_rc_that_already_has_the_dir_is_left_alone() {
         let home = dirs::home_dir().unwrap_or_default();
         let dir = home.join(".local/bin");
@@ -7993,7 +7851,6 @@ mod tests {
     /// Against real files, because this writes into a dotfile the user wrote
     /// and the failure mode is silent corruption rather than an error.
     #[test]
-    #[cfg(unix)]
     fn appending_the_path_line_never_corrupts_the_users_rc() {
         let dir = std::env::temp_dir().join(format!("termic-rc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -8022,30 +7879,6 @@ mod tests {
         assert!(fresh.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_shim_round_trips_through_recognition() {
-        // The shim IS the install on Windows: write it, then verify every
-        // recognition primitive the reconcile/status paths rely on.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("app").join("termic-cli.exe");
-        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-        std::fs::write(&src, b"binary").unwrap();
-        let link = dir.path().join("bin").join("termic.cmd");
-        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-
-        symlink_replacing(&src, &link).unwrap();
-        assert!(replaceable(&link).unwrap(), "a shim of ours is replaceable");
-        assert!(shim_src(&link).is_some_and(|t| t == src), "the shim records its source");
-        assert!(installed_points_at(&link, &src), "reconcile sees it as current");
-        assert!(is_our_installed_link(&link), "install status reports it");
-
-        // A foreign .cmd is never ours to replace.
-        let foreign = dir.path().join("bin").join("other.cmd");
-        std::fs::write(&foreign, b"@echo off\r\nrem someone else\r\n").unwrap();
-        assert!(!replaceable(&foreign).unwrap(), "a foreign shim is not replaceable");
     }
 
     #[test]
@@ -8094,7 +7927,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn reconcile_prefers_an_existing_current_name_over_a_legacy_one() {
         let cur = PathBuf::from("/usr/local/bin/termic");
@@ -8102,7 +7934,7 @@ mod tests {
         assert_eq!(reconcile_target("termic", Some(cur.clone()), &legacy), Some(cur));
     }
 
-    #[cfg(unix)]
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
     fn symlink_atomic_replaces_without_a_gap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8150,7 +7982,6 @@ mod tests {
         assert!(!replaceable(&link).unwrap());
     }
 
-    #[cfg(unix)]
     #[test]
     fn install_targets_use_the_name() {
         let t = install_targets("termic-dev");
@@ -8161,7 +7992,7 @@ mod tests {
     #[test]
     fn socket_survives_garbage_lines() {
         let (sock, _guard) = spawn_server(StubHost::default());
-        let mut stream = UnixStream::connect(&sock).unwrap();
+        let mut stream = proto::local::connect(&sock).unwrap();
         stream.write_all(b"this is not json\n").unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let reply: Reply = proto::read_msg(&mut reader).unwrap().unwrap();
@@ -8226,6 +8057,164 @@ mod tests {
 
     fn w3(host: &StubHost) -> Task {
         host.tasks.iter().find(|t| t.id == "w3").unwrap().clone()
+    }
+
+    // ── tab titles (GH #331) ─────────────────────────────────────────
+
+    fn titled_tab_cmd(title: Option<&str>) -> Command {
+        Command::Tab {
+            task: Some("w3".into()),
+            project: None,
+            kind: proto::TabKind::Agent { id: "claude".into() },
+            prompt: None,
+            prompt_ref: None,
+            wait: false,
+            timeout_ms: None,
+            resume: None,
+            title: title.map(str::to_string),
+            cwd: None,
+        }
+    }
+
+    fn rename_req(tab: &str, title: &str) -> Request {
+        req(
+            Command::TabRename {
+                task: Some("w3".into()),
+                project: None,
+                tab: tab.into(),
+                title: title.into(),
+                cwd: None,
+            },
+            Some("tok"),
+        )
+    }
+
+    fn rpc_params(host: &StubHost, method: &str) -> serde_json::Value {
+        let calls = host.rpc_calls.lock().unwrap();
+        calls.iter().find(|(m, _)| m == method).map(|(_, p)| p.clone())
+            .unwrap_or_else(|| panic!("{method} was not called"))
+    }
+
+    #[test]
+    fn tab_title_rides_new_tab_trimmed_and_only_when_real() {
+        for (given, sent) in [
+            (Some("  reviewer "), serde_json::json!("reviewer")),
+            (Some(""), serde_json::Value::Null),
+            (None, serde_json::Value::Null),
+        ] {
+            let host = StubHost::default();
+            seed_strip(&host);
+            host.script_rpc(
+                "new_tab",
+                Ok(serde_json::json!({ "tabId": "tab-new", "cli": "claude", "title": "reviewer" })),
+            );
+            let reply = handle(&req(titled_tab_cmd(given), Some("tok")), &host);
+            assert!(reply.ok, "{given:?}: {:?}", reply.error);
+            assert_eq!(rpc_params(&host, "new_tab")["title"], sent, "{given:?}");
+            let Some(ReplyData::Tab(t)) = reply.data else { panic!("expected tab") };
+            // The reply carries what the webview says the tab is called.
+            assert_eq!(t.title, "reviewer");
+        }
+    }
+
+    #[test]
+    fn tab_titles_a_selector_could_not_reach_are_refused_before_any_rpc() {
+        for bad in ["   ", "2"] {
+            let host = StubHost::default();
+            seed_strip(&host);
+            let err = handle(&req(titled_tab_cmd(Some(bad)), Some("tok")), &host)
+                .error
+                .expect("refused");
+            assert_eq!(err.code, ErrorCode::BadRequest, "{bad:?}");
+            assert!(host.rpc_calls.lock().unwrap().is_empty(), "{bad:?} reached the webview");
+
+            let err = handle(&rename_req("1", bad), &host).error.expect("refused");
+            assert_eq!(err.code, ErrorCode::BadRequest, "rename {bad:?}");
+            assert!(host.rpc_calls.lock().unwrap().is_empty(), "rename {bad:?} reached the webview");
+        }
+    }
+
+    #[test]
+    fn tab_title_in_use_is_a_conflict_not_a_bad_agent() {
+        // Same code as a duplicate task name, so a script can tell "pick
+        // another title" from "that agent is not usable".
+        let host = StubHost::default();
+        seed_strip(&host);
+        host.script_rpc(
+            "new_tab",
+            Err("cli_tab_title:conflict: tab [2] is already called \"fixing tests\"".into()),
+        );
+        let err = handle(&req(titled_tab_cmd(Some("Fixing Tests")), Some("tok")), &host)
+            .error
+            .expect("conflict");
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("fixing tests"), "{}", err.message);
+        // Any other webview failure keeps the pre-title mapping.
+        let host = StubHost::default();
+        seed_strip(&host);
+        host.script_rpc("new_tab", Err("unknown agent: nope".into()));
+        let err = handle(&req(titled_tab_cmd(Some("x")), Some("tok")), &host).error.unwrap();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn tab_rename_resolves_every_selector_and_reaches_every_tab() {
+        // The tab-close reach: renaming is not driving, so the shell tab
+        // (write-only for send/attach) is renamable too.
+        for (sel, want) in [("2", "tab-b"), ("tab-b", "tab-b"), ("fixing tests", "tab-b"), ("3", "tab-c")] {
+            let host = StubHost::default();
+            seed_strip(&host);
+            host.script_rpc("rename_tab", Ok(serde_json::json!({ "title": "implementer" })));
+            let reply = handle(&rename_req(sel, " implementer "), &host);
+            assert!(reply.ok, "{sel:?}: {:?}", reply.error);
+            let p = rpc_params(&host, "rename_tab");
+            assert_eq!(p["taskId"], "w3");
+            assert_eq!(p["tabId"], want, "{sel:?}");
+            assert_eq!(p["title"], "implementer", "trimmed");
+            let Some(ReplyData::Tab(t)) = reply.data else { panic!("expected tab") };
+            assert_eq!(t.tab_id, want);
+            assert_eq!(t.title, "implementer");
+            assert!(t.prompt.is_none());
+            // A rename opens nothing.
+            assert!(host.rpc_calls.lock().unwrap().iter().all(|(m, _)| m == "rename_tab"));
+        }
+    }
+
+    #[test]
+    fn tab_rename_to_empty_is_the_reset_and_reports_the_automatic_title() {
+        let host = StubHost::default();
+        seed_strip(&host);
+        // The webview answers with the title the tab went back to, which
+        // the resolver's snapshot (still the custom one) cannot know.
+        host.script_rpc("rename_tab", Ok(serde_json::json!({ "title": "Codex" })));
+        let reply = handle(&rename_req("fixing tests", ""), &host);
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(rpc_params(&host, "rename_tab")["title"], "");
+        let Some(ReplyData::Tab(t)) = reply.data else { panic!("expected tab") };
+        assert_eq!(t.title, "Codex");
+    }
+
+    #[test]
+    fn tab_rename_maps_the_webviews_typed_failures() {
+        for (webview, code) in [
+            ("cli_tab_title:conflict: already called that", ErrorCode::Conflict),
+            ("cli_tab_title:unknown_tab: that tab no longer exists", ErrorCode::NotFound),
+            ("cli_tab_title:task_stopped: not open", ErrorCode::Unsupported),
+            ("cli_tab_title:not_renamable: split pane", ErrorCode::Unsupported),
+            ("webview gone", ErrorCode::Internal),
+        ] {
+            let host = StubHost::default();
+            seed_strip(&host);
+            host.script_rpc("rename_tab", Err(webview.into()));
+            let err = handle(&rename_req("2", "x"), &host).error.expect("error");
+            assert_eq!(err.code, code, "{webview}");
+            assert!(!err.message.starts_with("cli_tab_title"), "sentinel leaked: {}", err.message);
+        }
+        // An unknown selector never reaches the webview.
+        let host = StubHost::default();
+        seed_strip(&host);
+        assert!(handle(&rename_req("9", "x"), &host).error.is_some());
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
     }
 
     // ── tab close (GH #185) ──────────────────────────────────────────
@@ -9019,6 +9008,7 @@ mod tests {
             wait: false,
             timeout_ms: None,
             resume: None,
+            title: None,
             cwd: None,
         };
         let reply = handle(&req(cmd, Some("tok")), &host);
@@ -9053,6 +9043,7 @@ mod tests {
             wait,
             timeout_ms: None,
             resume: None,
+            title: None,
             cwd: None,
         };
         for cmd in [
@@ -9143,6 +9134,7 @@ mod tests {
             wait: false,
             timeout_ms: None,
             resume: None,
+            title: None,
             cwd: None,
         };
         let err = handle(&req(cmd, Some("tok")), &host).error.expect("error");
@@ -10175,7 +10167,7 @@ mod tests {
     #[test]
     fn attach_session_streams_both_ways_and_detaches_cleanly() {
         let (sock, _guard, host) = spawn_server_arc(attach_host());
-        let mut stream = UnixStream::connect(&sock).unwrap();
+        let mut stream = proto::local::connect(&sock).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -10224,7 +10216,7 @@ mod tests {
         // thread holds a sender clone).
         for reason in ["archived", "exited"] {
             let (sock, _guard, host) = spawn_server_arc(attach_host());
-            let mut stream = UnixStream::connect(&sock).unwrap();
+            let mut stream = proto::local::connect(&sock).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -10259,7 +10251,7 @@ mod tests {
         // No agent PTY registered: the attach errors as a normal Reply
         // and the SAME connection still serves requests.
         let (sock, _guard) = spawn_server(StubHost::default());
-        let mut stream = UnixStream::connect(&sock).unwrap();
+        let mut stream = proto::local::connect(&sock).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());

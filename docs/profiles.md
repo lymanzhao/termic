@@ -193,13 +193,27 @@ closed and reopening rebuilds it.
 **Windowless is app-wide.** It gates the drop to `ActivationPolicy::Accessory`,
 so hiding only `main` while another profile stayed visible would take the Dock
 icon out from under a window the user can still see. `enter_windowless` hides
-every profile window; `leave_windowless` restores them all and focuses one.
+every profile window; `leave_windowless` restores the ones the user had up
+(not a root they closed, see below) and focuses one.
 
 **Launch restores what was open.** `Profile::open_at_quit` is set when a window
 is built and cleared when the USER closes one; app quit does not clear it, which
 is what makes restore work. Least recently focused first, so the window the user
 was in ends up frontmost. Not under `feature = "e2e"`: the suite reuses one
 window across spec files and asserts on handle counts.
+
+**A closed root window is hidden, never destroyed, and that is the trap.** Its
+webview is the app's, so `setup` always builds it, and a root the user closed
+is still in `profile_windows`. Two bugs came from that. Building the hidden
+root stamped `open_at_quit = true`, so a launch that correctly left main closed
+wrote "main was open" and the NEXT launch (an update's relaunch) showed it;
+`keep_root_closed_at_launch` puts the flag back. And `leave_windowless` showed
+every profile window, so any dock click, `termic open`, second launch, deep
+link or profile switch resurrected the closed root. `ROOT_PUT_AWAY` marks the
+hide as the user's: `shown_profile_windows` leaves that root out of "which
+windows come back" and "is this the last window", unless it is the only one
+left. Reopening it from the profile menu (or a task or link that lives in it)
+clears the mark and sets the flag again.
 
 ## Event routing
 

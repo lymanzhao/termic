@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { dataDir } from "../../wdio.conf.js";
-import { archiveTask, clickByText, clickWhenVisible, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible } from "../helpers";
+import { archiveTask, clickByText, clickWhenVisible, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible, controlConnect } from "../helpers";
 
 const artifacts = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -83,9 +83,12 @@ describe("top-bar tooltips name their shortcut", () => {
     await waitForAppShell();
     await requireTermicApi();
     taskId = await openTask("e2e-bar-tips");
-    await expectTip('[data-testid="command-palette-button"]', "Command palette (\u21e7\u2318P)");
-    await expectTip('[data-testid="prompts-menu"]', "Prompts (\u2325\u2318P)");
-    await expectTip('[data-testid="toggle-right-panel"]', "Toggle right panel (\u2325\u2318B)");
+    // The keys as each platform writes them (lib/shortcuts.ts bindingText):
+    // glyphs on macOS, Ctrl+... on Windows and Linux alike.
+    const win = process.platform !== "darwin";
+    await expectTip('[data-testid="command-palette-button"]', `Command palette (${win ? "Ctrl+Shift+P" : "\u21e7\u2318P"})`);
+    await expectTip('[data-testid="prompts-menu"]', `Prompts (${win ? "Ctrl+Alt+P" : "\u2325\u2318P"})`);
+    await expectTip('[data-testid="toggle-right-panel"]', `Toggle right panel (${win ? "Ctrl+Alt+B" : "\u2325\u2318B"})`);
   });
 });
 
@@ -324,7 +327,7 @@ describe("command palette", () => {
         .querySelector('[data-testid="command-palette-button"]')
         ?.getAttribute("aria-label"),
     );
-    expect(ariaLabel).toBe("Command palette (\u21e7\u2318P)");
+    expect(ariaLabel).toBe(`Command palette (${process.platform !== "darwin" ? "Ctrl+Shift+P" : "\u21e7\u2318P"})`);
     await clickWhenVisible('[data-testid="command-palette-button"]');
     await browser.waitUntil(async () => (await paletteOpen()) === false, {
       timeout: 5_000,
@@ -566,6 +569,45 @@ describe("more dialogs open", () => {
     });
   });
 
+  // The hooks step switches "Keep every agent hooked up" ON by default: it
+  // installs the hook for every supported agent now and for any added later.
+  // Default, not decision: the box shows checked, and unticking turns it off.
+  it("turns hook auto-install on by default, and unticking turns it off", async () => {
+    const autoOn = () => browser.execute(() => window.__termic!.invoke("agent_hooks_auto_get")) as unknown as Promise<boolean>;
+    await browser.execute(async () => { await window.__termic!.invoke("agent_hooks_auto_set", { on: false }); });
+    expect(await autoOn()).toBe(false);
+    try {
+      await browser.execute(() => window.__termic!.useUI.getState().openWelcome());
+      await waitForText("Welcome to Termic");
+      await clickWhenVisible('[aria-label="Step 3"]');
+      await waitForText("Keep every agent hooked up");
+      await browser.waitUntil(async () => await autoOn(), {
+        timeout: 30_000, timeoutMsg: "arriving on the hooks step did not turn auto-install on",
+      });
+      await browser.waitUntil(
+        () => browser.execute(() => (document.querySelector('[data-testid="welcome-hooks-auto"]') as HTMLInputElement | null)?.checked === true),
+        { timeout: 5_000, timeoutMsg: "the box did not show auto-install on" },
+      );
+      await snap("welcome-hooks-default-on.png");
+      await browser.execute(() => (document.querySelector('[data-testid="welcome-hooks-auto"]') as HTMLInputElement).click());
+      await browser.waitUntil(async () => !(await autoOn()), {
+        timeout: 10_000, timeoutMsg: "unticking the box did not turn auto-install off",
+      });
+    } finally {
+      // Back to the profile's default, and nothing left installed: later
+      // specs assert on hook state from a clean slate.
+      await browser.execute(async () => {
+        const t = window.__termic!;
+        await t.invoke("agent_hooks_auto_set", { on: false });
+        for (const a of t.useApp.getState().agents) {
+          try { await t.invoke("agent_hooks_remove", { agentId: a.id }); } catch { /* unsupported */ }
+        }
+        await t.useApp.getState().refreshAgentHooks();
+        t.useUI.getState().closeWelcome();
+      });
+    }
+  });
+
   // The wizard opens on the LAYOUT step, and its last step is still the
   // project picker that carries Finish. Both halves matter: the step was
   // inserted at the front, which renumbers every other one, and an off-by-one
@@ -626,7 +668,11 @@ describe("more dialogs open", () => {
 // Cases: close goes windowless without killing the task; panes sit at zero
 // geometry while windowless; agent output still flows while windowless
 // (the whole point of a daemon); raise restores window + panes.
-describe("windowless mode", () => {
+// macOS only: closing the window keeps the app running in the menu bar
+// there. On Windows and Linux closing the window quits, by design (the close
+// handler is macOS-only, docs/windows.md), so this suite would close the app
+// under every later case.
+(process.platform !== "darwin" ? describe.skip : describe)("windowless mode", () => {
   let taskId!: string;
 
   // Same constant wdio launches the app with, rather than a second hard-coded
@@ -636,9 +682,8 @@ describe("windowless mode", () => {
   /** Unauthenticated `raise` over the control socket (cli_server.rs handles it
    *  before the auth gate, so it works with the CLI setting off). */
   async function raiseOverSocket(): Promise<void> {
-    const net = await import("node:net");
     await new Promise<void>((resolve, reject) => {
-      const c = net.createConnection(socketPath);
+      const c = controlConnect(socketPath);
       c.on("error", reject);
       c.on("connect", () => c.write(JSON.stringify({ id: "e2e", cmd: "raise" }) + "\n"));
       const t = setTimeout(() => { c.destroy(); reject(new Error("raise timed out")); }, 10_000);

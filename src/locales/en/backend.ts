@@ -56,7 +56,7 @@ export default {
 
   closeTab: {
     unsavedTitle: "Close without saving?",
-    unsavedMessage: "\"{{name}}\" has unsaved changes. Closing the tab will discard them. ⌘S to save first.",
+    unsavedMessage: "\"{{name}}\" has unsaved changes. Closing the tab will discard them. {{combo}} to save first.",
     unsavedConfirm: "Discard & close",
     scheduledTitle: "Delete scheduled messages?",
     scheduledPhraseOne: "{{count}} scheduled message",

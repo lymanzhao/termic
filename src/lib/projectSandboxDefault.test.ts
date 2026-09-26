@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import { setSeatbeltAvailableForTests } from "@/lib/platform";
 import { projectSandboxDefault, projectYoloDefault, yoloForCreate, mergeLists } from "./projectSandboxDefault";
 import type { Project } from "@/lib/types";
 
@@ -80,5 +81,16 @@ describe("mergeLists", () => {
   it("drops blanks and handles absent sides", () => {
     expect(mergeLists(undefined, ["a", "", "a"])).toEqual(["a"]);
     expect(mergeLists()).toEqual([]);
+  });
+});
+
+describe("projectSandboxDefault off macOS", () => {
+  afterEach(() => setSeatbeltAvailableForTests(true));
+
+  it("drops a Seatbelt default (say, a Mac teammate's) to off but keeps Docker", () => {
+    setSeatbeltAvailableForTests(false);
+    expect(projectSandboxDefault({ default_sandbox_mode: "enforce" } as Project)).toBe("off");
+    expect(projectSandboxDefault({ default_sandbox: true } as Project)).toBe("off");
+    expect(projectSandboxDefault({ default_docker: true } as Project)).toBe("docker");
   });
 });

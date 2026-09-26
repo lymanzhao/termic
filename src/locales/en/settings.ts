@@ -77,6 +77,7 @@ export default {
     },
     tray: {
       label: "Show Termic in the menu bar",
+      labelSystem: "Show Termic in the system tray",
       hint: "A small icon that's always there while Termic is running: a badge and dropdown for tasks that need your input or just finished, and Show/Quit.",
       hintMac: " Turning it off also means closing to the menu bar (above) falls back to the dock icon as your way back in.",
     },
@@ -213,7 +214,7 @@ export default {
     title: "Termic CLI",
     enable: {
       label: "Enable CLI",
-      hint: "Let the {{name}} command drive this app from any shell: create tasks and stream their setup, wait for an agent to go quiet, list and check tasks, archive them, and add or remove projects. On by default, and access needs a token only this Mac's user can read. Agents in an enforced sandbox never get access. Turning this off refuses every command immediately (the command stays installed).",
+      hint: "Let the {{name}} command drive this app from any shell: create tasks and stream their setup, wait for an agent to go quiet, list and check tasks, archive them, and add or remove projects. On by default, and access needs a token only your user account on this computer can read. Agents in an enforced sandbox never get access. Turning this off refuses every command immediately (the command stays installed).",
     },
     installedAt: "<1>{{name}}</1> is installed at <3>{{path}}</3>.",
     runList: "Run <1>{{command}}</1> from any shell.",
@@ -437,7 +438,7 @@ export default {
   },
 
   prompts: {
-    desc: "Reusable prompts for the Prompts menu in the top bar. When you fire one, you pick where it goes: an existing agent (queued if it is busy) or a new agent. Drag to reorder. Built-ins can be edited and reset. Open the palette with ⌥⌘P to search and fire them by keyboard.",
+    desc: "Reusable prompts for the Prompts menu in the top bar. When you fire one, you pick where it goes: an existing agent (queued if it is busy) or a new agent. Drag to reorder. Built-ins can be edited and reset. Open the palette with {{combo}} to search and fire them by keyboard.",
     new: "New prompt",
     empty: "No prompts. Add one, or restore the built-ins below.",
     dragTip: "Drag to reorder",

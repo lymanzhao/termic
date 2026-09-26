@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatTerminalTitle } from "./terminalTitle";
+import { formatTerminalTitle, isConsoleHostTitle } from "./terminalTitle";
 
 describe("formatTerminalTitle", () => {
   it("removes Claude's idle brand glyph when hiding is enabled", () => {
@@ -35,5 +35,21 @@ describe("formatTerminalTitle", () => {
 
   it("does not modify ordinary Claude titles", () => {
     expect(formatTerminalTitle("Task name", "claude", true)).toBe("Task name");
+  });
+});
+
+describe("isConsoleHostTitle", () => {
+  it("recognizes the path ConPTY announces as the title", () => {
+    expect(isConsoleHostTitle("C:\\Program Files\\nodejs\\node.exe")).toBe(true);
+    expect(isConsoleHostTitle("C:\\Windows\\system32\\cmd.exe")).toBe(true);
+    expect(isConsoleHostTitle("D:\\a\\termic\\scripts\\fake-agent.cmd")).toBe(true);
+    expect(isConsoleHostTitle("Administrator: C:\\Program Files\\PowerShell\\7\\pwsh.exe")).toBe(true);
+  });
+
+  it("leaves a program's own title alone", () => {
+    expect(isConsoleHostTitle("\u2733 fakeagent")).toBe(false);
+    expect(isConsoleHostTitle("vim C:\\notes\\a.md")).toBe(false);
+    expect(isConsoleHostTitle("C:\\repo")).toBe(false);
+    expect(isConsoleHostTitle("~/src/app")).toBe(false);
   });
 });

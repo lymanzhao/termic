@@ -1,3 +1,4 @@
+import { relUnder, baseName } from "@/lib/osPath";
 // What a usages row calls its file (GH #174).
 //
 // Naming every row by its basename alone is what the popup did, and it is
@@ -23,13 +24,12 @@ export interface UsagePath {
  *  becoming one, and it is what PyCharm shows. */
 const MAX_SEGMENTS = 3;
 
-const basename = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+const basename = (p: string) => baseName(p);
 
 /** Path relative to its checkout, or the absolute path when it has none. */
 function relative(entry: UsagePath): string {
   const { path, root } = entry;
-  if (root && path.startsWith(root + "/")) return path.slice(root.length + 1);
-  return path;
+  return (root && relUnder(path, root)) || path;
 }
 
 /** Shorten a path to first segment, ellipsis, name. Leaves anything already

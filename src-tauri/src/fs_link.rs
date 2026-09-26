@@ -1,0 +1,146 @@
+//! Symlinks across platforms.
+//!
+//! Unix: a plain symlink. Windows has to be told up front whether the
+//! target is a directory or a file, and creating either kind needs
+//! Developer Mode (or SeCreateSymbolicLinkPrivilege). Without it the
+//! call fails, so a directory falls back to a junction (no privilege
+//! needed, same-machine absolute targets, which is every link the app
+//! makes) and a file to a hard link (same volume only; an editor that
+//! saves by rename breaks the sharing, which a symlink would not).
+
+use std::io;
+use std::path::Path;
+
+/// Create `link` pointing at `target`.
+pub fn symlink_any(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    imp::symlink_any(target.as_ref(), link.as_ref())
+}
+
+#[cfg(unix)]
+mod imp {
+    use super::*;
+
+    pub fn symlink_any(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::*;
+
+    pub fn symlink_any(target: &Path, link: &Path) -> io::Result<()> {
+        if target.is_dir() {
+            match std::os::windows::fs::symlink_dir(target, link) {
+                Ok(()) => Ok(()),
+                Err(e) => junction(target, link).map_err(|_| e),
+            }
+        } else {
+            match std::os::windows::fs::symlink_file(target, link) {
+                Ok(()) => Ok(()),
+                Err(e) => std::fs::hard_link(target, link).map_err(|_| e),
+            }
+        }
+    }
+
+    /// `mklink /J` is a cmd.exe builtin; there is no std API for
+    /// junctions. The target must be absolute.
+    fn junction(target: &Path, link: &Path) -> io::Result<()> {
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(target)
+        };
+        let out = crate::proc_ctl::command("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(&target)
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_a_directory_and_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("x.txt"), "hi").unwrap();
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "yo").unwrap();
+
+        let dl = dir.path().join("dl");
+        symlink_any(&d, &dl).unwrap();
+        assert_eq!(std::fs::read_to_string(dl.join("x.txt")).unwrap(), "hi");
+
+        let fl = dir.path().join("fl.txt");
+        symlink_any(&f, &fl).unwrap();
+        assert_eq!(std::fs::read_to_string(&fl).unwrap(), "yo");
+    }
+
+    #[test]
+    fn removes_a_link_and_leaves_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("x.txt"), "hi").unwrap();
+        let dl = dir.path().join("dl");
+        symlink_any(&d, &dl).unwrap();
+
+        remove_link(&dl).unwrap();
+        assert!(std::fs::symlink_metadata(&dl).is_err());
+        assert_eq!(std::fs::read_to_string(d.join("x.txt")).unwrap(), "hi");
+    }
+}
+
+/// Remove a link made by `symlink_any` without touching its target. On
+/// Windows a directory link (a junction, or a directory symlink) is a
+/// directory entry that `remove_file` refuses with "Access is denied", and
+/// `remove_dir` removes the link alone; everywhere else it is `remove_file`.
+pub fn remove_link(link: &Path) -> io::Result<()> {
+    match std::fs::remove_file(link) {
+        Err(e) if cfg!(windows) && link.is_dir() => std::fs::remove_dir(link).map_err(|_| e),
+        other => other,
+    }
+}
+
+/// `fs::remove_dir_all`, patient on Windows.
+///
+/// Windows refuses to delete a directory while any process still has a
+/// handle or its working directory inside it (os error 32, a sharing
+/// violation, or 5 for a file mid-delete). Archive stops the task's agents
+/// and scripts first, but a killed process lets go of its handles slightly
+/// AFTER TerminateProcess returns, so the first attempt can lose that race.
+/// Retry for a few seconds on exactly those errors. Unix deletes open
+/// directories fine, so there it is a single call.
+pub fn remove_dir_all_settled(path: &Path) -> io::Result<()> {
+    if !cfg!(windows) {
+        return std::fs::remove_dir_all(path);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut wait = std::time::Duration::from_millis(50);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e)
+                if matches!(e.raw_os_error(), Some(32) | Some(5) | Some(145))
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_millis(500));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}

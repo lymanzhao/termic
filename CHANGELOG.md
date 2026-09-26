@@ -4,6 +4,58 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.9.1] - 2026-09-25
+
+Termic now runs on Windows, and tasks show which agent started them.
+
+### Features
+- **Windows (experimental).** Releases now include a Windows 11 x64
+  installer, `Termic_<version>_x64-setup.exe`. It installs per user, needs
+  no admin rights, and updates itself like the macOS and Linux builds. It is
+  not code-signed yet, so SmartScreen asks first: More info, then Run
+  anyway. The sandbox on Windows is Docker only, and agent hooks report
+  working and done for claude only for now. What differs from macOS:
+  [docs/windows.md](https://github.com/simion/termic/blob/main/docs/windows.md).
+- **Spawn links.** A task an agent starts in another project carries a small
+  mark naming the task that started it; click it to go there. Hovering a
+  task draws lines to its parent and to the tasks it started, wherever the
+  group rail does not already show it. `termic new` prints a `from:` line
+  for a cross-project spawn.
+
+### Improvements
+- Task groups stay within one project. A task an agent starts in another
+  project is linked to it instead of joining its group, which the sidebar
+  drew as two unrelated groups of one.
+- **Windows: one title bar.** The app's own top bar is now the window's
+  title bar: drag it to move the window, double-click it to maximize, and
+  minimize, maximize and close sit at its right, as in any Windows app.
+- **The welcome wizard turns agent hooks on for every agent**, including
+  agents you install later. Untick "Keep every agent hooked up" to turn it
+  off.
+
+### Bug fixes
+- A `git commit` in a terminal no longer fails now and then with "Unable to
+  create index.lock": Termic's background git status no longer takes the
+  lock.
+- Archiving a task no longer waits on Docker when the task does not use it.
+  With Docker Desktop slow or asleep, every archive stalled for minutes.
+- Archiving a task now also stops its shell and command tabs, which kept
+  running in the deleted worktree.
+- Dragging a task into a group could put it back in its old group a moment
+  later.
+- Emptying History no longer re-runs each task's archive script.
+- Archiving with "delete branch" no longer reports an error when the branch
+  is already gone.
+- A main window closed while another profile is open stays closed across a
+  relaunch, including the one after an update.
+- Windows: a tool installed while Termic runs (Git, an agent CLI) is found
+  without restarting Termic.
+- Windows: agents installed outside the PATH are found, including Claude
+  Code from its PowerShell installer.
+- Adding a repo that git cannot open now says why, instead of "not a git
+  repo": git is missing, or git's ownership check refuses the folder (with
+  the command that trusts it).
+
 ## [1.8.3] - 2026-09-25
 
 Tasks your agents start now group together in the sidebar.

@@ -12,6 +12,7 @@ import { useApp } from "@/store/app";
 import { useNavHistory, type NavPoint } from "@/store/navHistory";
 import { gotoLocation } from "@/lib/gotoLocation";
 import { uriToPath } from "./workspace";
+import { relUnder } from "@/lib/osPath";
 
 /**
  * Which task owns a file on disk.
@@ -24,8 +25,8 @@ import { uriToPath } from "./workspace";
 export function taskForPath(abs: string) {
   const app = useApp.getState();
   const active = app.tasks.find(t => t.id === app.activeTaskId);
-  if (active && abs.startsWith(active.path + "/")) return active;
-  return app.tasks.find(t => abs.startsWith(t.path + "/")) ?? active ?? null;
+  if (active && relUnder(abs, active.path) !== null) return active;
+  return app.tasks.find(t => relUnder(abs, t.path) !== null) ?? active ?? null;
 }
 
 /** Where the cursor is right now, as a point the history can return to. */
@@ -49,11 +50,11 @@ export function pointFor(
   line: number,
   col?: number,
 ): NavPoint {
-  const inside = abs.startsWith(taskPath + "/");
+  const rel = relUnder(abs, taskPath);
   return {
     taskId,
-    path: inside ? abs.slice(taskPath.length + 1) : abs,
-    external: !inside,
+    path: rel ?? abs,
+    external: rel === null,
     line,
     col,
   };

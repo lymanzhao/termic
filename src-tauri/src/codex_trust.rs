@@ -38,7 +38,7 @@
 //! termic's own entries are identifiable by prefix alone.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde_json::Value;
 
@@ -135,7 +135,7 @@ fn filter_ours(
 /// join timeout rather than inline, because a child that never answers would
 /// otherwise hang the install with the pipe still open.
 fn hooks_list(codex_bin: &str, codex_home: &Path, cwd: &Path) -> Result<Value, String> {
-    let mut child = Command::new(codex_bin)
+    let mut child = crate::proc_ctl::command(codex_bin)
         .arg("app-server")
         // The LOGIN-shell PATH. Same trap `agent_usage` hit in a release
         // build: the GUI hands a packaged app

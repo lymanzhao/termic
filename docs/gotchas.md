@@ -457,6 +457,44 @@ Whenever you add a window LABEL, add it to a capability in the same change, and
 remember `tauri.conf.json` / capabilities changes need a quit + relaunch, not a
 reload.
 
+## A window built inside a command hangs on Windows
+
+A `#[tauri::command]` without `async` runs on the main thread. Building a
+webview window there works on macOS and hangs on Windows: WebView2 creation
+needs the message loop that the command is blocking (wry#583). Nothing errors;
+the command just never returns and the window never appears.
+
+`profile_open` and `procmon_open_window` shipped like that, and nothing on
+macOS could show it. The first Windows e2e run did: "creating a profile did
+not open its window", then every later profile case timed out.
+
+Making them `(async)` was NOT enough, and the next run showed it: the
+window builds on the worker thread and the command returns, but the window
+is not usable, and the next window command hangs. What works is what the
+startup window does: build it on the main thread from the event loop.
+Both commands stay `(async)` and hand the window work to `on_main_thread`
+(`run_on_main_thread` plus a channel), waiting on their worker thread for
+the result. Never call `on_main_thread` FROM the main thread (the tray
+handler, `setup`): it waits on itself. The tray row calls `profile_open`
+from the blocking pool for that reason.
+
+## ConPTY gives the reader no EOF when the child exits
+
+On unix, the PTY reader hits EOF when the last process holding the slave
+exits, and the waiter fires `pty-exit` once the reader has drained. ConPTY
+keeps its output pipe open until the pseudoconsole itself is closed, so on
+Windows a child that exits by itself left the reader blocked forever and
+`pty-exit` never fired. Nothing errors: a failed `--resume` never retried
+and never opened the picker, and an agent that quit never showed its
+exited banner. A killed PTY was fine, because `pty_kill` drops the slot,
+which closes the pseudoconsole.
+
+Seen in the Windows e2e debug log: `child exited code=Some(1)` for a dead
+resume, then no `pty-exit` and no respawn. The waiter now does what
+`pty_kill` does after a 200 ms drain. `conpty_osc_probe` measures both
+halves (EOF or not with the pseudoconsole open, then once it is closed),
+with macOS as the control.
+
 ## Docker is a SECOND REALM, and it does not inherit host fixes
 
 Three separate bugs in one feature, all the same shape: a rule implemented for

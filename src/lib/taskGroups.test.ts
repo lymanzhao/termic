@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flattenSegments, groupBadgeKinds, groupColorCss, groupLabel, layoutTaskList, liveGroups, nextGroupColor, GROUP_FALLBACK_COLOR } from "./taskGroups";
+import { crossProjectStrays, flattenSegments, groupBadgeKinds, groupColorCss, groupLabel, layoutTaskList, liveGroups, nextGroupColor, GROUP_FALLBACK_COLOR } from "./taskGroups";
 import type { Tab } from "./types";
 import type { Task, TaskGroup } from "./types";
 
@@ -19,6 +19,23 @@ describe("liveGroups", () => {
       t("x"),
     ]);
     expect(gs).toEqual([G("o", { color: "teal" }), G("solo")]);
+  });
+});
+
+describe("crossProjectStrays", () => {
+  it("drops a group's lone member in a project when the group spans projects", () => {
+    const q = { project_id: "q" };
+    const strays = crossProjectStrays([
+      // The reported case: lead in one project, its one child in another.
+      t("lead", G("lead")), t("child", G("lead"), q),
+      // Two here and one there: the pair is still a group, the one is not.
+      t("a1", G("a")), t("a2", G("a")), t("a3", G("a"), q),
+      // A group of one in ONE project is a real group (Move to group > New).
+      t("solo", G("solo")),
+      // An archived member does not make a group span.
+      t("b1", G("b")), t("b2", G("b"), { ...q, archived: true }),
+    ]);
+    expect([...strays].sort()).toEqual(["a3", "child", "lead"]);
   });
 });
 

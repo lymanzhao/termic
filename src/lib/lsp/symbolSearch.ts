@@ -13,6 +13,7 @@ import type { LSPClient } from "@codemirror/lsp-client";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { clientsForRoot } from "./host";
 import { uriToPath } from "./workspace";
+import { relUnder } from "@/lib/osPath";
 
 /** LSP SymbolKind → the word a reader recognises. Exported so the
  *  real-server fixture test labels rows the way production does. */
@@ -161,7 +162,7 @@ async function askOne(
       kind: KIND_LABEL[sym.kind] ?? "symbol",
       kindCode: sym.kind,
       path,
-      file: path.startsWith(root + "/") ? path.slice(root.length + 1) : path,
+      file: relUnder(path, root) ?? path,
       line: (sym.location?.range?.start.line ?? 0) + 1,
       container: sym.containerName || undefined,
       server,

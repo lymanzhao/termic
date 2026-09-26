@@ -180,17 +180,47 @@ if [ -n "$picker" ]; then
   # device-attribute and focus queries this way), so an ESC followed at once
   # by more bytes is one of those and is skipped; a lone ESC is the key.
   esc="$(printf '\033')"
+  picker_log() {
+    [ -n "${TERMIC_DATA_DIR:-}" ] && printf '%s\t%s\n' "${TERMIC_TASK_ID:-}" "$1" \
+      >> "${TERMIC_DATA_DIR}/e2e-picker.log" 2>/dev/null
+    return 0
+  }
+  # Listening from here on. A spec waits for this line before typing: a
+  # key sent while Git Bash is still starting can be dropped when read
+  # puts the console into raw mode.
+  picker_log "<ready>"
   while :; do
-    IFS= read -r -n1 first || exit 1
+    IFS= read -r -n1 first || { picker_log "<eof>"; exit 1; }
     [ "$first" != "$esc" ] && break
     if IFS= read -r -n1 -t 0.15 _next; then
-      while IFS= read -r -n1 -t 0.05 _more; do :; done
+      # Skip exactly ONE reply, not everything that follows it: a focus-in
+      # report (ESC [ I, which ConPTY turns on for every console) lands right
+      # before the keys typed after focusing the terminal, and draining by
+      # timing swallowed the whole typed line with it. CSI runs to a final
+      # byte in @..~; OSC to BEL or ESC \; anything else is ESC plus one.
+      _seq="$_next"
+      case "$_next" in
+        "[") while IFS= read -r -n1 -t 0.15 _more; do
+               _seq="$_seq$_more"
+               case "$_more" in [@-~]) break ;; esac
+             done ;;
+        "]") while IFS= read -r -n1 -t 0.15 _more; do
+               case "$_more" in $'\a'|"$esc") break ;; esac
+             done
+             [ "${_more:-}" = "$esc" ] && IFS= read -r -n1 -t 0.15 _more ;;
+      esac
+      picker_log "<skipped ESC$(printf '%q' "$_seq")>"
       continue
     fi
+    picker_log "<esc>"
     exit 1
   done
+  picker_log "<first $(printf '%q' "$first")>"
   IFS= read -r rest || true
   choice="${first}${rest}"
+  # What the picker read, escaped, for a spec that fails on one platform
+  # only: the line is the whole story and the terminal is a canvas.
+  picker_log "$(printf '%q' "$choice")"
   case "$choice" in
     "pick "*)
       osc777 "termic;agent ready for input"

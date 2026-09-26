@@ -5,9 +5,11 @@
 // users were locked out entirely (issue #13). The backend resolves
 // `$SHELL` (with a zsh → bash → fish → sh fallback); this caches the
 // answer for the session and builds the right argv per shell.
-import { defaultShell } from "./ipc";
+import { defaultShell, scriptShell } from "./ipc";
+import { IS_WINDOWS } from "./platform";
 
 let cached: Promise<string> | null = null;
+let cachedScript: Promise<string> | null = null;
 
 /** Path to the user's login shell, resolved once on the backend and
  *  cached for the session. Falls back to `/bin/sh` if the IPC call ever
@@ -15,15 +17,26 @@ let cached: Promise<string> | null = null;
  *  would reintroduce the #13 lockout (spawn a non-existent binary, dead
  *  PTY) on a machine without zsh. */
 export function loginShell(): Promise<string> {
-  return (cached ??= defaultShell().catch(() => "/bin/sh"));
+  return (cached ??= defaultShell().catch(() => (IS_WINDOWS ? "cmd.exe" : "/bin/sh")));
+}
+
+/** The shell that runs a COMMAND tab (custom commands, Run / Setup
+ *  pop-outs). The same as `loginShell` except on Windows, where the user's
+ *  interactive shell is PowerShell or cmd but these commands are POSIX
+ *  shell: `.termic.yaml` scripts are committed to repos a Mac teammate
+ *  also runs. There it is Git Bash, the same one the backend runs setup and
+ *  archive scripts with (shell_env::script_bash). */
+export function commandShell(): Promise<string> {
+  if (!IS_WINDOWS) return loginShell();
+  return (cachedScript ??= scriptShell().catch(() => "bash.exe"));
 }
 
 /** The shell's basename, e.g. "fish" for "/opt/homebrew/bin/fish".
  *  Used only to branch on shell family for argv quirks. */
 export function shellName(shellPath: string): string {
-  const base = shellPath.split("/").pop() || shellPath;
-  // Strip a trailing major-version digit some distros append (bash5).
-  return base.toLowerCase();
+  const base = shellPath.split(/[\\/]/).pop() || shellPath;
+  // Windows executables carry `.exe`: `pwsh.exe` is the pwsh family.
+  return base.toLowerCase().replace(/\.exe$/, "");
 }
 
 /** Build the PTY argv for an interactive login shell.
@@ -51,6 +64,18 @@ export function shellName(shellPath: string): string {
  *  top-bar run status key off "PTY alive", so a finished setup must not
  *  linger at an interactive prompt reading as "still running". */
 export function loginShellArgs(shellPath: string, command?: string, exitWhenDone = false): string[] {
+  const family = shellName(shellPath);
+  // Windows' own shells take neither `-l` nor `-c`. Command tabs never get
+  // here with one on Windows (commandShell is Git Bash there), so these
+  // only need the plain interactive case, plus a sane command shape.
+  if (family === "pwsh" || family === "powershell") {
+    if (!command) return ["-NoLogo"];
+    return exitWhenDone ? ["-NoLogo", "-Command", command] : ["-NoLogo", "-NoExit", "-Command", command];
+  }
+  if (family === "cmd") {
+    if (!command) return [];
+    return [exitWhenDone ? "/C" : "/K", command];
+  }
   if (!command) return ["-l"];
   const interactive = shellName(shellPath) === "sh" ? [] : ["-i"];
   if (exitWhenDone) return ["-l", ...interactive, "-c", command];

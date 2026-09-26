@@ -267,12 +267,21 @@ export function seed(o = {}) {
   }
   try { sh("git worktree prune", fixture); } catch { /* not a repo yet */ }
   mkdirSync(tasksPath, { recursive: true });
-  const fill = (s) =>
-    s
-      .replaceAll("__REPO__", repoRoot)
-      .replaceAll("__HOME__", home)
-      .replaceAll("__FIXTURE__", fixture)
-      .replaceAll("__TASKS__", tasksPath);
+  // The seed files are JSON, so a substituted path must be JSON-escaped:
+  // a Windows path's backslashes are otherwise escape sequences.
+  const j = (p) => JSON.stringify(p).slice(1, -1);
+  const fill = (s) => {
+    // Windows cannot exec a bash script: the fake agent runs through its
+    // .cmd launcher, which starts it with Git Bash.
+    if (process.platform === "win32") {
+      s = s.replaceAll("__REPO__/scripts/fake-agent.sh", j(path.join(repoRoot, "scripts", "fake-agent.cmd")));
+    }
+    return s
+      .replaceAll("__REPO__", j(repoRoot))
+      .replaceAll("__HOME__", j(home))
+      .replaceAll("__FIXTURE__", j(fixture))
+      .replaceAll("__TASKS__", j(tasksPath));
+  };
   // Profiles are OFF for every spec but profiles.e2e.ts, which turns them on
   // and turns them back off in its own teardown. When that spec dies before
   // the teardown runs (a dropped session, a crash), the profile is left

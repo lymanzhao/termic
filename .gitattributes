@@ -1,0 +1,18 @@
+# LF in the working tree on every platform. Git for Windows installs with
+# core.autocrlf=true, which would check text out as CRLF: every shell script
+# then fails on `set -u\r`, and files the app embeds with include_str! (the
+# default Dockerfile, hook scripts) change bytes, and with them the Docker
+# image tag hash. See docs/ideas/windows.md.
+* text=auto eol=lf
+
+# Windows-native scripts keep CRLF.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.caf binary
+*.woff2 binary
+*.iip binary

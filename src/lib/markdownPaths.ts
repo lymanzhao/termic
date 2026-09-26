@@ -83,13 +83,22 @@ export function resolveExternalHref(filePath: string, href: string): string | nu
   } catch {
     return null;
   }
-  const parts: string[] = decoded.startsWith("/") ? [] : dirnamePosix(filePath).split("/");
-  for (const seg of decoded.split("/")) {
+  // A Windows file (`C:\notes\a.md`): resolve with either separator and
+  // answer in the file's own spelling, drive first, so the tab it opens is
+  // the same path the file tree and the backend use. A leading slash is the
+  // drive's root.
+  const drive = /^[A-Za-z]:[\\/]/.test(filePath) ? filePath.slice(0, 2) : "";
+  const sep = drive ? /[\\/]/ : "/";
+  const base = drive ? filePath.slice(2).replace(/\\/g, "/") : filePath;
+  const rooted = drive ? /^[\\/]/.test(decoded) : decoded.startsWith("/");
+  const parts: string[] = rooted ? [] : dirnamePosix(base).split("/");
+  for (const seg of decoded.split(sep)) {
     if (seg === "" || seg === ".") continue;
     if (seg === "..") parts.pop();
     else parts.push(seg);
   }
-  return "/" + parts.filter(Boolean).join("/");
+  const kept = parts.filter(Boolean);
+  return drive ? `${drive}\\${kept.join("\\")}` : "/" + kept.join("/");
 }
 
 /** GitHub-style heading slug for `#anchor` matching: lowercase, collapse

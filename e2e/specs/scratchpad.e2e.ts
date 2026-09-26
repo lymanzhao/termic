@@ -65,7 +65,7 @@ describe("scratchpads", () => {
     // untracked file left here survives into the next run and the git spec's
     // "Working tree is clean" boots red for a reason that has nothing to do
     // with git. Untracked dirt is the spec's to clean.
-    rmSync(path.join(fixture, "notes"), { recursive: true, force: true });
+    rmSync(path.join(fixture, "notes"), { recursive: true, force: true, maxRetries: 10 });
   });
 
   it("opens from the + menu as an untitled, permanently-dirty tab", async () => {
@@ -230,7 +230,7 @@ describe("scratchpads", () => {
 
     await browser.execute(() => {
       document.querySelector(".cm-content")!.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "s", metaKey: true, bubbles: true }),
+        new KeyboardEvent("keydown", { key: "s", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }),
       );
     });
     await browser.waitUntil(
@@ -291,7 +291,7 @@ describe("scratchpads", () => {
     for (let i = 0; i < 3; i++) {
       await browser.execute(() => {
         window.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "n", metaKey: true, altKey: true, bubbles: true,
+          key: "n", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, altKey: true, bubbles: true,
         }));
       });
       await browser.waitUntil(async () => (await pads(taskId)).length === i + 1, {
@@ -359,7 +359,7 @@ describe("scratchpads", () => {
     // A fresh pad, straight through the shortcut path this time.
     await browser.execute(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "n", metaKey: true, altKey: true, bubbles: true,
+        key: "n", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, altKey: true, bubbles: true,
       }));
     });
     await browser.waitUntil(async () => (await pads(taskId)).length === 1, {

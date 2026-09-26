@@ -1,5 +1,6 @@
 // Matching a file-path fragment from terminal output against the workspace
 // file list, on segment boundaries (not raw string suffix).
+import { relUnder } from "./osPath";
 
 export function normalizePath(p: string): string {
   // Strip every leading "./" and "/" (but not "../", which is meaningful).
@@ -72,8 +73,9 @@ export function resolveAbsoluteClick(abs: string, roots: TaskRoot[]): AbsoluteCl
   for (const r of ordered) {
     // Segment boundary, not raw prefix: `/repo-old/a.ts` must not resolve
     // against a root of `/repo`.
-    if (abs !== r.path && !abs.startsWith(r.path + "/")) continue;
-    const rest = abs.slice(r.path.length).replace(/^\/+/, "");
+    // (relUnder: on Windows also either separator and any case.)
+    const rest = abs === r.path ? "" : relUnder(abs, r.path);
+    if (rest === null) continue;
     const rel = r.prefix ? (rest ? `${r.prefix}/${rest}` : r.prefix) : rest;
     // The root directory itself is not a file to open; let it read as outside
     // so the menu offers Reveal instead of opening an empty editor tab.

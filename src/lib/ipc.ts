@@ -124,6 +124,10 @@ export const taskReorder  = (ids: string[]) => invoke<void>("task_reorder", { id
  *  ungrouped task that becomes the lead of a new one coloured `color`. */
 export const taskGroupJoin = (taskId: string, targetId: string, color?: string | null) =>
   invoke<void>("task_group_join", { taskId, targetId, color: color ?? null });
+/** `taskId` was created by `parentId`'s agent: records the link, and joins
+ *  the parent's group when both are in one project (Rust `apply_spawn_link`). */
+export const taskLinkSpawn = (taskId: string, parentId: string, color?: string | null) =>
+  invoke<void>("task_link_spawn", { taskId, parentId, color: color ?? null });
 /** A new group holding just this task (Move to group > New group). */
 export const taskGroupNew = (taskId: string, color?: string | null) =>
   invoke<void>("task_group_new", { taskId, color: color ?? null });
@@ -1050,6 +1054,9 @@ export const procmonOpenWindow = () => invoke<void>("procmon_open_window");
 // The user's login shell ($SHELL, falling back to zsh/bash/fish/sh).
 // See lib/loginShell.ts for the cached wrapper used by the terminals.
 export const defaultShell = () => invoke<string>("default_shell");
+// The bash that runs POSIX command tabs and `.termic.yaml` scripts: plain
+// `bash` off Windows, Git for Windows' own bash on Windows.
+export const scriptShell = () => invoke<string>("script_shell");
 
 /**
  * Listen for PTY output chunks. Rust emits a `PtyChunk { data: Vec<u8> }`

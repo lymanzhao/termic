@@ -755,7 +755,7 @@ fn rpc_response(server: &McpServer, req: &HttpRequest) -> (u16, Vec<u8>) {
 /// (`agent_overview!` in termic-cli/src/lib.rs): keep the two in step. The
 /// point is the first sentence: an agent that does not realise it is running
 /// INSIDE a Termic task never thinks to start siblings or report back.
-const MCP_INSTRUCTIONS: &str = "Termic runs coding agents side by side, each in its own task (a git worktree, or the project's main checkout, with its own terminal), listed in the app's sidebar. If your environment has TERMIC_TASK_ID, you are one of those agents, running INSIDE a Termic task right now, and these tools drive the app around you. From there you can: launch new tasks with their own agents (task_new; they join your task's group in the sidebar, which you name for the batch of work with task_group); prompt another task's agent (task_send) and read what it produced (task_log, task_result); open another agent tab in a task (task_tab); retitle your own task (task_rename); and keep notes, plans, findings, logs and reports the user should READ in scratchpads (scratchpad_new, scratchpad_write): a tab in your task that updates live and stays out of git, so use one instead of dropping temporary .md files into the repo. Coordinate by prompting each other rather than blocking: end a prompt with how the other agent should report back to you (a task_send to your task id). Sign every prompt you send another agent, first line and last: [message from agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>] ... -- agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>, with the values written out (there is no shell here to fill them in; TERMIC_TASK holds your task name). A prompt that arrives WITH that header came from another agent, not the user: the id is where to reply. When Termic set this client up, it tells the server which task you run in, so task_rename, task_group and task_tab default to your own task, exactly like the CLI; name other tasks explicitly. Without TERMIC_TASK_ID you are driving Termic from outside it.";
+const MCP_INSTRUCTIONS: &str = "Termic runs coding agents side by side, each in its own task (a git worktree, or the project's main checkout, with its own terminal), listed in the app's sidebar. If your environment has TERMIC_TASK_ID, you are one of those agents, running INSIDE a Termic task right now, and these tools drive the app around you. From there you can: launch new tasks with their own agents (task_new; in your project they join your task's group in the sidebar, in another they are linked to your task instead; you name the group for the batch of work with task_group); prompt another task's agent (task_send) and read what it produced (task_log, task_result); open another agent tab in a task (task_tab); retitle your own task (task_rename); and keep notes, plans, findings, logs and reports the user should READ in scratchpads (scratchpad_new, scratchpad_write): a tab in your task that updates live and stays out of git, so use one instead of dropping temporary .md files into the repo. Coordinate by prompting each other rather than blocking: end a prompt with how the other agent should report back to you (a task_send to your task id). Sign every prompt you send another agent, first line and last: [message from agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>] ... -- agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>, with the values written out (there is no shell here to fill them in; TERMIC_TASK holds your task name). A prompt that arrives WITH that header came from another agent, not the user: the id is where to reply. When Termic set this client up, it tells the server which task you run in, so task_rename, task_group and task_tab default to your own task, exactly like the CLI; name other tasks explicitly. Without TERMIC_TASK_ID you are driving Termic from outside it.";
 
 /// UnsupportedProtocolVersionError. The `supported` list has to be
 /// machine-readable in `data`: that is what a client retries from, and
@@ -1340,24 +1340,45 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "task_tab",
         cli_verb: "tab",
-        description: "Open a tab inside a running task (the app's \"+\" menu as a tool), optionally delivering a first prompt to it. Returns the new tab's id, which is the stable selector other tools take.",
+        description: "Open a tab inside a running task (the app's \"+\" menu as a tool), optionally delivering a first prompt to it. Returns the new tab's id, which is the stable selector other tools take. With `tab`, renames an open tab instead.",
         params: &[
             P_TASK_SELF,
             P_PROJECT,
             // The kind is explicit rather than free text because the
             // kinds differ in sandbox, resume and YOLO behaviour, and a
             // typo must not land the caller in the wrong semantics.
-            ParamDef { name: "kind", json_type: "string", required: true, description: "\"agent\" (needs agentId), \"terminal\" (needs agentId naming a terminal entry), \"shell\" for a plain login shell, or \"default\" for another tab of whatever the task already runs.", cli_flag: None },
+            ParamDef { name: "kind", json_type: "string", required: false, description: "When opening: \"agent\" (needs agentId), \"terminal\" (needs agentId naming a terminal entry), \"shell\" for a plain login shell, or \"default\" for another tab of whatever the task already runs.", cli_flag: None },
             ParamDef { name: "agentId", json_type: "string", required: false, description: "Registry id for the agent and terminal kinds; see task_agents. Ignored by the other kinds.", cli_flag: Some("--agent") },
             ParamDef { name: "prompt", json_type: "string", required: false, description: "Deliver this prompt into the tab just opened (agent kinds only).", cli_flag: Some("--prompt") },
             P_LIBRARY,
             ParamDef { name: "resume", json_type: "string", required: false, description: "Session id the new agent tab resumes (agents with id-resume support only).", cli_flag: Some("--resume") },
             P_WAIT,
             P_TIMEOUT,
+            ParamDef { name: "title", json_type: "string", required: false, description: "The tab's title; the agent retitling itself does not replace it, so it works as a selector. Unique in the task, not a bare number. \"\" = the automatic title.", cli_flag: Some("--title") },
+            ParamDef { name: "tab", json_type: "string", required: false, description: "Rename this open tab (id, 1-based index or title) to `title` instead of opening one.", cli_flag: Some("--tab") },
         ],
         destructive: false,
         read_only: false,
         build: |a| {
+            // Rename mode (GH #331): a tab selector turns the call into the
+            // tab strip's rename, which opens nothing.
+            if let Some(tab) = arg_str(a, "tab")? {
+                for open_only in ["kind", "agentId", "prompt", "library", "resume", "wait", "timeoutMs"] {
+                    if a.get(open_only).is_some_and(|v| !v.is_null()) {
+                        return Err(format!(
+                            "\"{open_only}\" applies to opening a tab; with \"tab\" the call renames an open one"
+                        ));
+                    }
+                }
+                return Ok(Command::TabRename {
+                    task: Some(need_str(a, "task")?),
+                    project: arg_str(a, "project")?,
+                    tab,
+                    title: arg_str(a, "title")?
+                        .ok_or("\"title\" is required with \"tab\" (\"\" for the automatic title)")?,
+                    cwd: None,
+                });
+            }
             let kind = need_str(a, "kind")?;
             let agent_id = arg_str(a, "agentId")?;
             let need_id = |k: &str| -> Result<String, String> {
@@ -1383,6 +1404,8 @@ const TOOLS: &[ToolDef] = &[
                 wait: arg_bool(a, "wait")?,
                 timeout_ms: arg_u64(a, "timeoutMs")?,
                 resume: arg_str(a, "resume")?,
+                // "" is "no title" on open; the wire carries only a real one.
+                title: arg_str(a, "title")?.filter(|t| !t.is_empty()),
                 cwd: None,
             })
         },
@@ -1714,19 +1737,16 @@ fn url_for(port: u16) -> String {
 /// (see the mint-per-bind note in apply_enabled).
 fn token_from_file(dir: &Path) -> Option<String> {
     let path = dir.join(MCP_TOKEN_FILE);
-    let meta = std::fs::metadata(&path).ok()?;
-    // The 0600 check (group/other bits clear) is the Unix part of the
-    // token-file trust model. Windows files inherit the profile DACL,
-    // which already excludes other users; there is no bit to check.
+    // Unix: refuse a token file anyone else could read. Windows has no
+    // mode bits; the file inherits the per-user data dir's ACL.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&path).ok()?;
         if meta.permissions().mode() & 0o077 != 0 {
             return None;
         }
     }
-    #[cfg(not(unix))]
-    let _ = &meta;
     let token = std::fs::read_to_string(&path).ok()?;
     let token = token.trim().to_string();
     if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2102,7 +2122,7 @@ fn install_client_inner(client: &str) -> Result<String, String> {
             .to_string();
             // Passed as one argv entry, so no shell quoting is involved
             // here; claude_command() renders the copy-paste form.
-            let out = std::process::Command::new("claude")
+            let out = crate::proc_ctl::command("claude")
                 .args(["mcp", "add-json", "termic", &json, "-s", "user"])
                 .env("PATH", crate::shell_env::resolved_path())
                 .output()
@@ -3136,7 +3156,11 @@ mod tests {
         // keeps it that way.
         // 17100: the two lines above meeting in one tree (parity plus
         // `checkout`, which landed in parallel).
-        const RECORDED: usize = 17100;
+        // 17500: task_tab's `title` and `tab` (GH #331), parity with
+        // `termic tab --title` / `--tab`: name a tab so it is a selector
+        // that survives the agent retitling itself, and rename an open one
+        // without a sixth tab tool. Descriptions cut to one clause each.
+        const RECORDED: usize = 17500;
         assert!(
             size <= RECORDED,
             "serialized tools/list grew to {size} bytes (recorded {RECORDED}); grow it consciously"
@@ -3266,6 +3290,42 @@ mod tests {
     }
 
     #[test]
+    fn task_tab_titles_a_new_tab_or_renames_an_open_one() {
+        let tab = TOOLS.iter().find(|t| t.name == "task_tab").unwrap();
+        let build = |v: serde_json::Value| (tab.build)(v.as_object().unwrap());
+        // Open mode: the title rides the open; "" is no title on the wire.
+        let c = build(serde_json::json!({ "task": "t", "kind": "shell", "title": "logs" })).unwrap();
+        assert!(matches!(&c, Command::Tab { title: Some(t), .. } if t == "logs"));
+        let c = build(serde_json::json!({ "task": "t", "kind": "shell", "title": "" })).unwrap();
+        assert!(matches!(c, Command::Tab { title: None, .. }));
+        // Opening still needs a kind.
+        assert!(build(serde_json::json!({ "task": "t", "title": "x" })).unwrap_err().contains("kind"));
+
+        // Rename mode: `tab` + `title`, and "" survives as the reset.
+        let c = build(serde_json::json!({ "task": "t", "tab": "2", "title": "impl" })).unwrap();
+        assert!(matches!(&c, Command::TabRename { tab, title, .. } if tab == "2" && title == "impl"));
+        let c = build(serde_json::json!({ "task": "t", "tab": "impl", "title": "" })).unwrap();
+        assert!(matches!(&c, Command::TabRename { title, .. } if title.is_empty()));
+        // A rename needs a title to rename to.
+        assert!(build(serde_json::json!({ "task": "t", "tab": "2" })).unwrap_err().contains("title"));
+        // And opens nothing: every open-only param is refused beside `tab`.
+        for (k, v) in [
+            ("kind", serde_json::json!("agent")),
+            ("agentId", serde_json::json!("claude")),
+            ("prompt", serde_json::json!("go")),
+            ("library", serde_json::json!("builtin:review")),
+            ("resume", serde_json::json!("abc")),
+            ("wait", serde_json::json!(true)),
+            ("timeoutMs", serde_json::json!(1000)),
+        ] {
+            let mut args = serde_json::json!({ "task": "t", "tab": "2", "title": "x" });
+            args[k] = v;
+            let err = build(args).unwrap_err();
+            assert!(err.contains(k), "{k}: {err}");
+        }
+    }
+
+    #[test]
     fn closing_a_tab_needs_an_explicit_target_and_guards_the_default_one() {
         let close = TOOLS.iter().find(|t| t.name == "task_tab_close").unwrap();
         let build = |v: serde_json::Value| (close.build)(v.as_object().unwrap());
@@ -3338,6 +3398,7 @@ mod tests {
             wait,
             timeout_ms: ms,
             resume: None,
+            title: None,
             cwd: None,
         };
         let mut c = tab_cmd(true, None);
@@ -3863,8 +3924,8 @@ command = \"/bin/true\"\n";
     /// A restart must not invalidate configs holding the last token, so
     /// the copy affordance only reads a file this server would have
     /// written, so a hand-made or loosened one is not handed out.
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn token_from_file_accepts_only_a_file_this_server_wrote() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

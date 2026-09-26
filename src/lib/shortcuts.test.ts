@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_BINDINGS, FIXED_SHORTCUTS, GROUP_ORDER, NON_CONFLICTING_GROUPS, SHORTCUT_DEFS,
-  bindingSignature, bindingToCmKey, bindingsEqual, isValidBinding, isReservedKey,
+  bindingMatches, bindingSignature, bindingText, bindingToCmKey, bindingsEqual, isValidBinding, isReservedKey,
 } from "./shortcuts";
 
 // `SHORTCUT_DEFS` is the single source of truth for every bindable key, and it
@@ -205,5 +205,32 @@ describe("the code-navigation group", () => {
       "go-to-implementation", "go-to-type-definition",
     ]);
     expect(SHORTCUT_DEFS.find(d => d.id === "nav-back")?.group).toBe("Navigation");
+  });
+});
+
+describe("AltGr", () => {
+  const ev = (o: Partial<KeyboardEvent> & { altGraph?: boolean }) => ({
+    key: "p", code: "KeyP", metaKey: false, ctrlKey: false, shiftKey: false, altKey: false,
+    getModifierState: (m: string) => m === "AltGraph" && !!o.altGraph,
+    ...o,
+  }) as unknown as KeyboardEvent;
+  const ctrlAltP = { key: "p", cmd: true, shift: false, alt: true };
+
+  it("does not fire a Ctrl+Alt binding from an AltGr key", () => {
+    expect(bindingMatches(ev({ ctrlKey: true, altKey: true, altGraph: true }), ctrlAltP)).toBe(false);
+  });
+  it("still fires it from a real Ctrl+Alt", () => {
+    expect(bindingMatches(ev({ ctrlKey: true, altKey: true }), ctrlAltP)).toBe(true);
+  });
+});
+
+describe("bindingText", () => {
+  it("uses the Windows / Linux modifier order off macOS", () => {
+    expect(bindingText({ key: "p", cmd: true, shift: true, alt: false }, false)).toBe("Ctrl+Shift+P");
+    expect(bindingText({ key: "p", cmd: true, shift: false, alt: true }, false)).toBe("Ctrl+Alt+P");
+    expect(bindingText({ key: "ArrowUp", cmd: false, shift: false, alt: true }, false)).toBe("Alt+Up");
+  });
+  it("keeps the glyph run on macOS", () => {
+    expect(bindingText({ key: "p", cmd: true, shift: true, alt: false }, true)).toBe("⇧⌘P");
   });
 });

@@ -23,16 +23,11 @@ import { useApp } from "@/store/app";
 import { applyDiagnostics } from "./diagnosticsSink";
 import { attribution, severityOf } from "./diagnosticMap";
 import { useCodeIntel, checkoutRoot, grantKey } from "@/store/codeIntel";
+import { pathToFileUri, fileUriToPath, relUnder, baseName } from "@/lib/osPath";
 
 /** Encode an absolute path as a `file://` URI, matching the Rust side. */
 export function pathToUri(abs: string): string {
-  return "file://" + [...new TextEncoder().encode(abs)]
-    .map(b =>
-      (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || (b >= 0x30 && b <= 0x39) ||
-      b === 0x2f || b === 0x2d || b === 0x5f || b === 0x2e || b === 0x7e
-        ? String.fromCharCode(b)
-        : "%" + b.toString(16).toUpperCase().padStart(2, "0"))
-    .join("");
+  return pathToFileUri(abs);
 }
 
 /**
@@ -46,10 +41,10 @@ export function pathToUri(abs: string): string {
  */
 export async function readAnyFile(abs: string): Promise<string | null> {
   const app = useApp.getState();
-  const task = app.tasks.find(t => abs.startsWith(t.path + "/"));
+  const task = app.tasks.find(t => relUnder(abs, t.path) !== null);
   try {
     return task
-      ? await taskFileRead(task.id, abs.slice(task.path.length + 1))
+      ? await taskFileRead(task.id, relUnder(abs, task.path)!)
       : await fileReadExternal(abs);
   } catch {
     return null;
@@ -58,12 +53,7 @@ export async function readAnyFile(abs: string): Promise<string | null> {
 
 /** Decode a `file://` URI back into a filesystem path. */
 export function uriToPath(uri: string): string | null {
-  if (!uri.startsWith("file://")) return null;
-  try {
-    return decodeURIComponent(uri.slice("file://".length));
-  } catch {
-    return null;
-  }
+  return fileUriToPath(uri);
 }
 
 class MultiViewFile implements WorkspaceFile {
@@ -224,12 +214,12 @@ export class TermicWorkspace extends Workspace {
     const task = taskFor(app.activeTaskId) ?? holders.map(taskFor).find(Boolean) ?? null;
     if (!abs || !task) return null;
 
-    const inside = abs.startsWith(task.path + "/");
-    app.openPreviewTab(task.id, inside
-      ? { type: "edit", path: abs.slice(task.path.length + 1), title: abs.split("/").pop() ?? abs }
+    const rel = relUnder(abs, task.path);
+    app.openPreviewTab(task.id, rel !== null
+      ? { type: "edit", path: rel, title: baseName(abs) }
       // Absolute path, read-only, and titled by the file rather than by a
       // trail nobody can click: the tab is outside every root this task has.
-      : { type: "external", path: abs, title: abs.split("/").pop() ?? abs });
+      : { type: "external", path: abs, title: baseName(abs) });
 
     // The pane mounts asynchronously (file read + grammar chunk), and the
     // client dispatches its selection into whatever this resolves to. Give the

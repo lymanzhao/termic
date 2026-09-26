@@ -7,7 +7,7 @@
 // some Tauri 2 builds only apply build.devUrl from file-based overrides,
 // not from inline JSON strings.
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, dirname } from "node:path";
@@ -23,6 +23,21 @@ const devUrl = `http://localhost:${port}/`;
 
 const tmpConf = resolve(tmpdir(), `termic-dev-override-${port}.json`);
 writeFileSync(tmpConf, JSON.stringify({ build: { devUrl } }));
+
+// Windows: node_modules/.bin/tauri is a POSIX shell shim, and spawning
+// tauri.cmd without a shell is refused since Node 20.12.2, so run the CLI's
+// JS entry point with this node. The unix teardown below (a ps tree walk
+// fixing a tcsetpgrp problem) has no Windows counterpart: Ctrl+C reaches
+// every process attached to the console.
+if (process.platform === "win32" && !process.env.TERMIC_TAURI_BIN) {
+  const tauriJs = resolve(__dirname, "../node_modules/@tauri-apps/cli/tauri.js");
+  const r = spawnSync(process.execPath, [tauriJs, "dev", "--config", tmpConf, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: { ...process.env, PORT: String(port) },
+  });
+  try { unlinkSync(tmpConf); } catch {}
+  process.exit(r.status ?? 1);
+}
 
 const child = spawn(TAURI_BIN, ["dev", "--config", tmpConf, ...process.argv.slice(2)], {
   // OWN SESSION (detached) + no stdin. This is the actual Ctrl+C fix:

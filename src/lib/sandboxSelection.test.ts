@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { selectionFor, selectionToFields, isTaskCaged, type SandboxMode } from "@/lib/types";
+import { afterEach, describe, it, expect } from "vitest";
+import { selectionFor, selectionToFields, isTaskCaged, effectiveSandboxMode, type SandboxMode } from "@/lib/types";
+import { setSeatbeltAvailableForTests } from "@/lib/platform";
 
 describe("selectionFor", () => {
   it("reports docker regardless of the underlying mode when docker is enabled", () => {
@@ -62,5 +63,23 @@ describe("isTaskCaged", () => {
 
   it("is true for Docker mode combined with any Seatbelt mode field (belt and suspenders)", () => {
     expect(isTaskCaged({ sandbox_mode: "monitor", docker_sandbox_enabled: true })).toBe(true);
+  });
+});
+
+describe("off macOS (no Seatbelt)", () => {
+  afterEach(() => setSeatbeltAvailableForTests(true));
+
+  it("reads every stored Seatbelt mode as off, so nothing auto-enables YOLO", () => {
+    setSeatbeltAvailableForTests(false);
+    for (const m of ["monitor", "enforce", "enforce-fs"] as SandboxMode[]) {
+      expect(effectiveSandboxMode({ sandbox_mode: m })).toBe("off");
+      expect(isTaskCaged({ sandbox_mode: m })).toBe(false);
+    }
+    expect(isTaskCaged({ sandbox_enabled: true })).toBe(false);
+  });
+
+  it("still treats a Docker task as caged", () => {
+    setSeatbeltAvailableForTests(false);
+    expect(isTaskCaged({ sandbox_mode: "off", docker_sandbox_enabled: true })).toBe(true);
   });
 });

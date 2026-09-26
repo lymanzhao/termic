@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { archiveTask, cliRpc, ensureActiveTask, openTask, requireTermicApi, snap, waitForAgentReady, waitForAppShell, waitVisible } from "../helpers";
+import { archiveTask, cliRpc, FILE_MANAGER_NAME, ensureActiveTask, openTask, requireTermicApi, snap, waitForAgentReady, waitForAppShell, waitVisible } from "../helpers";
 
 declare global {
   interface Window {
@@ -208,7 +208,7 @@ describe("editor open", () => {
     await browser.waitUntil(async () => !!(await tabOf(path.join(dir, "other.md"))), {
       timeout: 8_000, timeoutMsg: "a relative link in an external document did not open its sibling",
     });
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
   });
 });
 
@@ -297,11 +297,19 @@ describe("terminal cmd+click opens a permanent tab", () => {
   });
 
   it("pins the file in place when it is the one already in the preview slot", async () => {
-    // Close README, then make it the preview occupant.
-    await browser.execute((id, tid) => window.__termic!.useApp.getState().closeTab(id, tid), taskId, (await tabFor("README.md")).id);
-    await browser.execute((id) => window.__termic!.useApp.getState().openPreviewTab(id, {
-      type: "edit", path: "README.md", title: "README.md",
-    }), taskId);
+    // Close README, then make it the preview occupant. Retried until it
+    // STAYS the preview: the case above clicks in a loop, and each click
+    // resolves its path over IPC, so on a slow runner a late one can land
+    // after this reopen and pin README again.
+    await browser.waitUntil(async () => {
+      const open = await tabFor("README.md");
+      if (open) await browser.execute((id, tid) => window.__termic!.useApp.getState().closeTab(id, tid), taskId, open.id);
+      await browser.execute((id) => window.__termic!.useApp.getState().openPreviewTab(id, {
+        type: "edit", path: "README.md", title: "README.md",
+      }), taskId);
+      await browser.pause(500);
+      return (await tabFor("README.md"))?.preview === true;
+    }, { timeout: 15_000, interval: 100, timeoutMsg: "README never stayed in the preview slot" });
     const before = await tabFor("README.md");
     expect(before.preview).toBe(true);
 
@@ -398,7 +406,7 @@ describe("editor save", () => {
       document
         .querySelector(".cm-content")!
         .dispatchEvent(
-          new KeyboardEvent("keydown", { key: "s", metaKey: true, bubbles: true }),
+          new KeyboardEvent("keydown", { key: "s", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }),
         );
     });
     await browser.waitUntil(
@@ -1779,7 +1787,7 @@ describe("directory links", () => {
     // defaultPrevented is exactly "some MarkdownPreview took it".
     const claimed = await browser.execute(() => {
       const ev = new KeyboardEvent("keydown", {
-        key: "f", metaKey: true, bubbles: true, cancelable: true,
+        key: "f", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true, cancelable: true,
       });
       window.dispatchEvent(ev);
       return ev.defaultPrevented;
@@ -1801,7 +1809,7 @@ describe("directory links", () => {
     const cmdBracket = (key: string) =>
       browser.execute((k) => {
         window.dispatchEvent(
-          new KeyboardEvent("keydown", { key: k, metaKey: true, bubbles: true }),
+          new KeyboardEvent("keydown", { key: k, [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }),
         );
       }, key);
 
@@ -1842,7 +1850,7 @@ describe("directory links", () => {
     );
 
     await browser.execute(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "[", metaKey: true, bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "[", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }));
     });
 
     // The listing must not have moved.
@@ -1898,7 +1906,7 @@ describe("directory links", () => {
     );
 
     await browser.execute(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "[", metaKey: true, bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "[", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }));
     });
 
     // Give anything that WOULD happen a chance to happen: the task switch was
@@ -1941,7 +1949,7 @@ describe("directory links", () => {
     const back = () =>
       browser.execute(() => {
         window.dispatchEvent(
-          new KeyboardEvent("keydown", { key: "[", metaKey: true, bubbles: true }),
+          new KeyboardEvent("keydown", { key: "[", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true }),
         );
       });
 
@@ -1972,7 +1980,7 @@ describe("directory links", () => {
     // And Opt+Cmd+Down, which is what switching tasks is FOR, still does.
     await browser.execute(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "ArrowDown", metaKey: true, altKey: true, bubbles: true,
+        key: "ArrowDown", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, altKey: true, bubbles: true,
       }));
     });
     await browser.waitUntil(
@@ -2077,7 +2085,7 @@ const waitFind = async (ok: (p: FindPaint) => boolean, msg: string, taskId?: str
 const pressCmdF = () =>
   browser.execute(() => {
     window.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "f", metaKey: true, bubbles: true, cancelable: true }),
+      new KeyboardEvent("keydown", { key: "f", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true, cancelable: true }),
     );
   });
 
@@ -2904,7 +2912,7 @@ describe("comment on an editor selection for the agent", () => {
     await selectLines(1, 2);
     await browser.execute(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "l", metaKey: true, shiftKey: true, bubbles: true,
+        key: "l", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, shiftKey: true, bubbles: true,
       }));
     });
     await writeComment("and mention the fixture");
@@ -2924,7 +2932,7 @@ describe("comment on an editor selection for the agent", () => {
     }, taskId!);
     await browser.execute(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "l", metaKey: true, shiftKey: true, bubbles: true,
+        key: "l", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, shiftKey: true, bubbles: true,
       }));
     });
     expect(await browser.execute(() => !!document.querySelector(".tc-comment-textarea"))).toBe(false);
@@ -3755,7 +3763,7 @@ describe("unviewable file notice", () => {
     // The copy the user reads, and the two ways out.
     expect(text).toContain("This looks like a binary file, so the editor can't show it.");
     expect(text).toContain("Open in default app");
-    expect(text).toContain("Reveal in Finder");
+    expect(text).toContain(`Reveal in ${FILE_MANAGER_NAME}`);
     // Neither the raw Rust message nor the old red framing survives.
     expect(text).not.toContain("UTF-8");
     expect(text).not.toContain("Error:");
@@ -3823,7 +3831,7 @@ describe("unviewable file notice", () => {
       "This file is too large for the editor to show (3.0 MB).",
     );
     expect(text).toContain("Open in default app");
-    expect(text).toContain("Reveal in Finder");
+    expect(text).toContain(`Reveal in ${FILE_MANAGER_NAME}`);
     // Same as the binary case: no raw message, no red framing.
     expect(text).not.toContain("bytes)");
     expect(text).not.toContain("Error:");

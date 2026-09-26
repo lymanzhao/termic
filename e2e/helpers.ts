@@ -10,6 +10,15 @@ import { fileURLToPath } from "node:url";
 import { dataDir } from "../wdio.conf.js";
 
 const socketPath = path.join(dataDir, "termic.sock");
+
+/** Connect to the app's control plane. Unix: the socket file itself. Windows:
+ *  the file holds the loopback `host:port` the app listens on
+ *  (termic_proto::local). */
+export function controlConnect(file: string = socketPath): net.Socket {
+  if (process.platform !== "win32") return net.createConnection(file);
+  const [host, port] = fs.readFileSync(file, "utf8").trim().split(/:(?=\d+$)/);
+  return net.createConnection({ host, port: Number(port) });
+}
 /** Per-boot CLI token, read fresh: the app rewrites it on every launch. */
 const cliToken = () => fs.readFileSync(path.join(dataDir, "cli-token"), "utf8").trim();
 
@@ -31,7 +40,10 @@ export function artifact(name: string): string {
  * no display / Screen-Recording permission.
  */
 export async function snap(name: string): Promise<void> {
-  if (process.env.CI) return;
+  // Skipped in CI, unless TERMIC_E2E_SNAP (a regex on the name) asks for it:
+  // a CI job sets it to look at a UI no one has on their own machine.
+  const want = process.env.TERMIC_E2E_SNAP;
+  if (process.env.CI && !(want && new RegExp(want).test(name))) return;
   try {
     await browser.saveScreenshot(artifact(name));
   } catch {
@@ -1200,7 +1212,7 @@ export async function workBadges(taskId: string): Promise<Array<WorkBadge | null
  */
 export function cliRpc(cmd: Record<string, unknown>): Promise<any> {
   return new Promise((resolve, reject) => {
-    const c = net.createConnection(socketPath);
+    const c = controlConnect();
     let buf = "";
     const to = setTimeout(() => {
       c.destroy();
@@ -1245,11 +1257,13 @@ export function cliRpc(cmd: Record<string, unknown>): Promise<any> {
  *  `npm run build:cli`". */
 export function cliBinary(): string {
   const dir = path.resolve("src-tauri/binaries");
-  const triple = process.platform === "darwin"
-    ? (process.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin")
-    : (process.arch === "arm64" ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu");
+  const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+  const triple = process.platform === "darwin" ? `${arch}-apple-darwin`
+    : process.platform === "win32" ? `${arch}-pc-windows-msvc`
+    : `${arch}-unknown-linux-gnu`;
   const candidates = process.platform === "darwin"
     ? [`termic-cli-universal-apple-darwin`, `termic-cli-${triple}`]
+    : process.platform === "win32" ? [`termic-cli-${triple}.exe`]
     : [`termic-cli-${triple}`];
   for (const name of candidates) {
     const full = path.join(dir, name);
@@ -1349,3 +1363,50 @@ export function flushEditorMeasure(): Promise<number> {
     return flushed;
   }) as Promise<number>;
 }
+
+/**
+ * `rmSync(dir, { recursive, force })`, retried, that says who is in the way
+ * when it still fails. On Windows a directory some process is inside (its
+ * working directory, or an open handle) cannot be removed, and EBUSY names
+ * no process. The failure message then lists every process whose command
+ * line mentions termic or git, with its parent, which is usually enough to
+ * name the one that outlived its task.
+ */
+export function rmTree(dir: string, opts: { bestEffort?: boolean } = {}): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
+  } catch (e) {
+    if (process.platform !== "win32") throw e;
+    let procs = "";
+    try {
+      procs = execFileSync("powershell.exe", ["-NoProfile", "-Command",
+        "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'termic|git|pwsh|bash|node' } | "
+        + "ForEach-Object { \"$($_.ProcessId) <- $($_.ParentProcessId) $($_.Name): $($_.CommandLine)\" }"],
+      { encoding: "utf8", timeout: 20_000 });
+    } catch (le) { procs = `(could not list processes: ${String(le)})`; }
+    const msg = `${(e as Error).message}\nprocesses at the time:\n${procs}`;
+    // A temp dir in the OS temp folder that outlives its test is harmless;
+    // `bestEffort` is for a case whose subject is not the cleanup.
+    if (opts.bestEffort) { console.warn(`rmTree left ${dir} behind: ${msg}`); return; }
+    throw new Error(msg);
+  }
+}
+
+/** The system clipboard's text: `pbpaste` on macOS, `Get-Clipboard` on
+ *  Windows (line endings back to `\n`, which is what the app wrote), `xclip`
+ *  on Linux. */
+export function readClipboard(): string {
+  if (process.platform === "linux") {
+    return execFileSync("xclip", ["-o", "-selection", "clipboard"], { encoding: "utf8" });
+  }
+  if (process.platform === "win32") {
+    return execFileSync("powershell.exe", ["-NoProfile", "-Command", "Get-Clipboard -Raw"], { encoding: "utf8" })
+      .replace(/\r\n/g, "\n");
+  }
+  return execFileSync("pbpaste", { encoding: "utf8" });
+}
+
+/** What the app calls the OS file manager (`FILE_MANAGER` in
+ *  src/lib/openExternal.ts), for specs asserting on menu and notice copy. */
+export const FILE_MANAGER_NAME =
+  process.platform === "darwin" ? "Finder" : process.platform === "win32" ? "File Explorer" : "File Manager";

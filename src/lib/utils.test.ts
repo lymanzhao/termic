@@ -45,6 +45,15 @@ describe("slugify", () => {
   it("numeric-only string passes through", () => {
     expect(slugify("123")).toBe("123");
   });
+
+  it("never yields a Windows reserved device name (same cases as the Rust side)", () => {
+    expect(slugify("CON")).toBe("con-1");
+    expect(slugify("nul")).toBe("nul-1");
+    expect(slugify("com1")).toBe("com1-1");
+    expect(slugify("lpt9")).toBe("lpt9-1");
+    expect(slugify("com10")).toBe("com10");
+    expect(slugify("console")).toBe("console");
+  });
 });
 
 // ── the one-dash rule ─────────────────────────────────────────────────

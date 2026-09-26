@@ -456,7 +456,16 @@ pub fn login_env(base_id: &str, store: &std::path::Path) -> Vec<(String, String)
         LoginStore::SelfHostingDir { env } => vec![(env.into(), p)],
         LoginStore::ParentDir { env, .. } => vec![(env.into(), p)],
         LoginStore::XdgRoot { env, .. } => vec![(env.into(), p)],
-        LoginStore::HomeOnly { .. } => vec![("HOME".into(), p)],
+        // Node reads the home dir from USERPROFILE on Windows, not HOME, so
+        // relocating only HOME there would leave a second account quietly
+        // sharing the first one's login.
+        LoginStore::HomeOnly { .. } => {
+            let mut v = vec![("HOME".to_string(), p.clone())];
+            if cfg!(windows) {
+                v.push(("USERPROFILE".into(), p));
+            }
+            v
+        }
         // No directory at all. The token is not known here: the caller reads
         // it from the account's own store, so this only names the variable.
     });
@@ -714,7 +723,13 @@ mod instance_dir_tests {
             ("GEMINI_CLI_HOME".to_string(), "/data/logins/claude/work".to_string()),
         ]);
         assert_eq!(login_env("opencode", store), vec![("XDG_DATA_HOME".to_string(), "/data/logins/claude/work".to_string())]);
-        assert_eq!(login_env("pi", store), vec![("HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        // Windows also relocates USERPROFILE, which is where Node reads the
+        // home dir there.
+        let mut pi = vec![("HOME".to_string(), "/data/logins/claude/work".to_string())];
+        if cfg!(windows) {
+            pi.push(("USERPROFILE".to_string(), "/data/logins/claude/work".to_string()));
+        }
+        assert_eq!(login_env("pi", store), pi);
         // An unmeasured agent gets NOTHING, which is the caller's signal that
         // it cannot hold a second account.
         assert!(login_env("some-unmapped-cli", store).is_empty());

@@ -38,6 +38,7 @@ import { Sun, Moon, Monitor, Sunrise, Droplet, Binary, Code2, Flower2, GitPullRe
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
 import { TaskWorkBadge } from "@/components/TaskWorkBadge";
 import type { DelegatedWork } from "@/lib/delegatedWork";
+import { dragRegion, appRegionStyle, installCommand, IS_MAC } from "@/lib/platform";
 
 type Step = 0 | 1 | 2 | 3 | 4;
 
@@ -159,8 +160,7 @@ export function WelcomeDialog() {
           macOS app title bars. The pip buttons opt out via
           data-tauri-drag-region="false" so they stay clickable. */}
       <div
-        data-tauri-drag-region
-        style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+        {...dragRegion()}
         className="mb-4 flex items-center gap-3 -mt-1 cursor-grab active:cursor-grabbing select-none"
       >
         <TermicMark size={40} />
@@ -184,7 +184,7 @@ export function WelcomeDialog() {
         <div
           className="flex gap-1.5"
           data-tauri-drag-region="false"
-          style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+          style={appRegionStyle("no-drag")}
         >
           {Array.from({ length: lastStep + 1 }, (_, i) => i).map(i => (
             <button key={i} onClick={() => setStep(i as Step)}
@@ -387,7 +387,7 @@ function ForgeRows() {
           {!f.found ? (
             <span className="text-[12px] text-[var(--color-fg-faint)]">
               <span className="font-mono">{f.id}</span> {t("welcome.notInstalled")} ·{" "}
-              <span className="font-mono">brew install {f.id}</span>
+              <span className="font-mono">{installCommand(f.id)}</span>
             </span>
           ) : !f.authed ? (
             <span className="text-[12px] text-[var(--color-fg-faint)]">
@@ -614,9 +614,6 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
   // would be wrong the first time an event is added and nobody would notice,
   // because it is a sentence rather than a test.
   const [plans, setPlans] = useState<Record<string, HookPlan>>({});
-  useEffect(() => {
-    agentHooksAutoGet().then(setAutoState).catch(() => {});
-  }, []);
   const setAuto = async (on: boolean) => {
     setAutoState(on);
     try {
@@ -634,13 +631,30 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
   };
   const detected = clis.filter(c => c.found && c.name !== "shell").map(c => c.name);
 
-  // Auto-install once on arrival for everything we can wire. `ran` guards a
-  // re-entry (the pips let the user jump back) so Remove is not undone.
+  // On arrival: "Keep every agent hooked up" goes ON by default, which
+  // installs the hook for every supported agent now and for any added later
+  // (`agent_hooks_auto_set`). The box shows it checked and unticking it
+  // turns it off, so this is a default, not a decision taken for the user.
+  // Only when the switch could not be turned on does this fall back to
+  // installing each detected agent one by one: running both at once would
+  // write the same agent config files from two places.
+  //
+  // `ran` guards a re-entry (the pips let the user jump back) so a Remove or
+  // an untick is not undone.
   const [ran, setRan] = useState(false);
   useEffect(() => {
-    if (ran || !detected.length) return;
+    if (ran) return;
     setRan(true);
     void (async () => {
+      let on = false;
+      try { on = await agentHooksAutoGet(); } catch { /* treated as off */ }
+      if (!on) {
+        // Checked at once, like a click on the box: the call below returns
+        // only after installing every agent's hook, which can take seconds.
+        setAutoState(true);
+        try { await agentHooksAutoSet(true); on = true; } catch { /* falls back below */ }
+      }
+      setAutoState(on);
       const plansOut: Record<string, HookPlan> = {};
       await Promise.all(detected.map(async id => {
         try { plansOut[id] = await agentHooksPlan(id); } catch { /* row works without it */ }
@@ -650,12 +664,13 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
       for (const id of detected) {
         try {
           const st = await agentHooksStatus(id);
-          out[id] = st.supported && !st.host.installed && !st.host.disabled_all
+          out[id] = !on && st.supported && !st.host.installed && !st.host.disabled_all
             ? await agentHooksInstall(id).catch(() => st)
             : st;
         } catch { /* a row we cannot read is a row we do not show a button for */ }
       }
       setRows(out);
+      await useApp.getState().refreshAgentHooks();
     })();
   }, [ran, detected]);
 
@@ -865,7 +880,7 @@ function StepTheme() {
                   {item.label}
                 </span>
                 <span className="text-[11.5px] text-[var(--color-fg-faint)]">
-                  {item.id === "auto" && t("welcome.themeSubAuto")}
+                  {item.id === "auto" && (IS_MAC ? t("welcome.themeSubAuto") : t("welcome.themeSubAutoSystem"))}
                   {item.id === "light" && t("welcome.themeSubLight")}
                   {item.id === "claude" && t("welcome.themeSubClaude")}
                   {item.id === "dark" && t("welcome.themeSubDark")}

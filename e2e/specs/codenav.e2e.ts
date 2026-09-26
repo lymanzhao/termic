@@ -20,6 +20,21 @@ import {
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeServer = path.join(here, "..", "fixtures", "fake-lsp.mjs");
 
+/** Install the fake server at `dest` the way the platform runs a repo-local
+ *  server: the script itself (shebang + exec bit) on unix, a `.cmd` launcher
+ *  on Windows, which cannot execute an extensionless script (termic looks up
+ *  `<dest>.cmd` there, as it does npm's own shims). Returns what to delete. */
+function installFakeServer(dest: string): string {
+  if (process.platform === "win32") {
+    const cmd = `${dest}.cmd`;
+    writeFileSync(cmd, `@node "${fakeServer}" %*\r\n`);
+    return cmd;
+  }
+  copyFileSync(fakeServer, dest);
+  chmodSync(dest, 0o755);
+  return dest;
+}
+
 /** The checkout the task reads: a main-checkout task runs in the repo root. */
 const taskPath = (taskId: string) =>
   browser.execute(
@@ -52,7 +67,7 @@ const modClickWord = (taskId: string, word: string) =>
     const coords = view.coordsAtPos(at + 1);
     const content = dom.querySelector(".cm-content") as HTMLElement;
     content.dispatchEvent(new MouseEvent("mousedown", {
-      bubbles: true, cancelable: true, button: 0, metaKey: true,
+      bubbles: true, cancelable: true, button: 0, [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true,
       clientX: Math.round(coords.left + 1), clientY: Math.round((coords.top + coords.bottom) / 2),
     }));
   }, taskId, word);
@@ -142,8 +157,7 @@ describe("Terraform code intelligence", () => {
     taskId = await openTask("lsp-terraform");
     root = await taskPath(taskId);
     mkdirSync(path.join(root, "bin"), { recursive: true });
-    copyFileSync(fakeServer, path.join(root, "bin/terraform-ls"));
-    chmodSync(path.join(root, "bin/terraform-ls"), 0o755);
+    installFakeServer(path.join(root, "bin", "terraform-ls"));
     writeFileSync(path.join(root, files[0]), 'variable "Store" {\n  default = "demo"\n}\n');
     writeFileSync(path.join(root, files[1]), 'Store = "demo"\n');
     writeFileSync(path.join(root, files[2]), 'locals {\n  store = "demo"\n}\n');
@@ -164,7 +178,7 @@ describe("Terraform code intelligence", () => {
         for (const s of servers.filter(s => s.root === r && s.language === "terraform"))
           await t.invoke("lsp_stop", { id: s.id });
       }, root);
-      for (const rel of [...files, "bin/terraform-ls", ".fake-lsp.json"])
+      for (const rel of [...files, "bin/terraform-ls", "bin/terraform-ls.cmd", ".fake-lsp.json"])
         rmSync(path.join(root, rel), { force: true });
     }
     await setTypeChecking(false);
@@ -224,8 +238,7 @@ describe("code intelligence", () => {
     // this spec needs — no production build flag, no test-only language.
     const bin = path.join(root, "node_modules", ".bin");
     mkdirSync(bin, { recursive: true });
-    copyFileSync(fakeServer, path.join(bin, "tsgo"));
-    chmodSync(path.join(bin, "tsgo"), 0o755);
+    installFakeServer(path.join(bin, "tsgo"));
     writeFileSync(path.join(root, "navme.ts"), "export const answer = 42;\n");
     // A SECOND file with the same basename, which the fixture reports one
     // usage in: two files called navme.ts is what makes the popup's row
@@ -262,8 +275,8 @@ describe("code intelligence", () => {
     ]) {
       rmSync(path.join(root, rel), { force: true });
     }
-    rmSync(path.join(root, "nested"), { recursive: true, force: true });
-    rmSync(path.join(root, "node_modules"), { recursive: true, force: true });
+    rmSync(path.join(root, "nested"), { recursive: true, force: true, maxRetries: 10 });
+    rmSync(path.join(root, "node_modules"), { recursive: true, force: true, maxRetries: 10 });
     // Never hand the next spec file a standing confirm: one is on screen at a
     // time, and an unanswered one blocks the whole window.
     await browser.execute(() => window.__termic!.useUI.getState().resolveConfirm(false));
@@ -452,7 +465,7 @@ describe("code intelligence", () => {
     // 1. The handshake carried BOTH roots. The CM client sends only rootUri;
     //    a server that reads only workspaceFolders (ruby-lsp) would otherwise
     //    index nothing, silently.
-    expect(seen.initialize.workspaceFolders[0].uri).toContain(root.split("/").pop());
+    expect(seen.initialize.workspaceFolders[0].uri).toContain(root.split(/[\\/]/).pop());
     expect(seen.initialize.rootUri).toContain("file://");
     // 2. The server→client request was answered, with the right ARITY. This
     //    is the reply the CM client would have sent -32601 to, and the one ty
@@ -497,7 +510,8 @@ describe("code intelligence", () => {
     await ensureActiveTask(taskId);
   });
 
-  it("lists the server in Activity, where it can be stopped", async () => {
+  // The Activity monitor is macOS / Linux only (procmon_other.rs).
+  (process.platform === "win32" ? it.skip : it)("lists the server in Activity, where it can be stopped", async () => {
     // These are the first thing termic runs that can cost more than every
     // agent in the window combined, so they are sampled like everything else
     // rather than described in a settings pane.
@@ -655,7 +669,7 @@ describe("code intelligence", () => {
         const view = dom!.__cmView;
         const rect = view.coordsAtPos(at);
         view.contentDOM.dispatchEvent(new MouseEvent("mousedown", {
-          bubbles: true, cancelable: true, metaKey: true, button: 0,
+          bubbles: true, cancelable: true, [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, button: 0,
           clientX: rect.left + 1, clientY: (rect.top + rect.bottom) / 2,
         }));
       }, taskId, offset);
@@ -765,14 +779,14 @@ describe("code intelligence", () => {
     // Back returns to the CALL SITE, not to the previous definition. ⌘[ is
     // IntelliJ's key; it is Previous Task app-wide and claimed CONDITIONALLY
     // here, the same way a folder listing already claims it (issue #151).
-    await pressInEditor("[", { metaKey: true });
+    await pressInEditor("[", { [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true });
     await browser.waitUntil(async () => Math.abs((await head()) - startedAt) <= 1, {
       timeout: 10_000,
       timeoutMsg: "Back did not return to where the jump started",
     });
 
     // And Forward retraces it.
-    await pressInEditor("]", { metaKey: true });
+    await pressInEditor("]", { [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true });
     await browser.waitUntil(async () => (await head()) === 13, {
       timeout: 10_000, timeoutMsg: "Forward did not retrace the jump",
     });
@@ -790,7 +804,7 @@ describe("code intelligence", () => {
       const content = dom.querySelector(".cm-content") as HTMLElement;
       content.focus();
       content.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "F12", metaKey: true, bubbles: true, cancelable: true,
+        key: "F12", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true, cancelable: true,
       }));
     }, taskId);
     await waitVisible(`[data-task-id="${taskId}"] .cm-lsp-outline`, 10_000);
@@ -1045,11 +1059,11 @@ describe("code intelligence", () => {
     const titles = await browser.execute((sel) =>
       [...document.querySelectorAll(`${sel} .cm-lsp-usages-row`)].map(el => (el as HTMLElement).title), popup) as string[];
     expect(titles.length).toBe(3);
-    for (const t of titles) expect(t).toMatch(/^\/.*navme\.ts:\d+$/);
-    expect(titles[2]).toContain("/nested/navme.ts:");
+    for (const t of titles) expect(t).toMatch(/^(\/|[A-Za-z]:\\).*navme\.ts:\d+$/);
+    expect(titles[2]).toMatch(/[\\/]nested[\\/]navme\.ts:/);
     const footerTitle = await browser.execute((sel) =>
       (document.querySelector(`${sel} .cm-lsp-usages-footer`) as HTMLElement).title, popup) as string;
-    expect(footerTitle).toMatch(/^\/.*navme\.ts$/);
+    expect(footerTitle).toMatch(/^(\/|[A-Za-z]:\\).*navme\.ts$/);
 
     // Height assertions are relative to the room actually below the popup.
     // CodeMirror already shrinks a tooltip to the space under its anchor, and
@@ -1170,7 +1184,7 @@ describe("code intelligence", () => {
       const content = dom.querySelector(".cm-content") as HTMLElement;
       content.focus();
       content.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "F12", metaKey: true, bubbles: true, cancelable: true,
+        key: "F12", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true, cancelable: true,
       }));
     }, taskId);
     await waitVisible(`[data-task-id="${taskId}"] .cm-lsp-outline`, 15_000);
@@ -1185,7 +1199,7 @@ describe("code intelligence", () => {
       const content = dom.querySelector(".cm-content") as HTMLElement;
       content.focus();
       content.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "F12", metaKey: true, bubbles: true, cancelable: true,
+        key: "F12", [/^(mac|darwin)/i.test(navigator.platform) ? "metaKey" : "ctrlKey"]: true, bubbles: true, cancelable: true,
       }));
     }, taskId);
     await waitVisible(`[data-task-id="${taskId}"] .cm-lsp-outline`, 10_000);

@@ -60,12 +60,14 @@ import { TerminalFindBar } from "@/components/task/TerminalFindBar";
 import { isTerminalFindCombo } from "@/lib/terminalFind";
 import * as ipc from "@/lib/ipc";
 import { maybeRebuildDockerImageForLaunch } from "@/lib/dockerDailyRebuild";
-import { loginShell, loginShellArgs } from "@/lib/loginShell";
+import { commandShell, loginShell, loginShellArgs } from "@/lib/loginShell";
 import { usePrefs, useResolvedThemeFull, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
 import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, spawnResumeShape, resumeIdArgsForCli, resumePickerArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
 import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { ReviewCommentsBar } from "./ReviewCommentsBar";
+import { IS_WINDOWS } from "@/lib/platform";
+import { isConsoleHostTitle } from "@/lib/terminalTitle";
 
 interface Props { task: Task; tab: TerminalTab; active: boolean; }
 
@@ -1250,18 +1252,27 @@ const captureArmedRef = useRef(false);
       if (e.type === "keydown" && (e.isComposing || e.keyCode === 229)) {
         return false;
       }
-      if (e.type === "keydown") {
-        const binds = usePrefs.getState().shortcuts;
-        if (PASS_TO_APP.some(id => bindingMatches(e, binds[id]))) {
-          return false; // let the global handler take it (file finder, find-in-files, …)
-        }
-      }
       // Open find in terminal (TerminalFindBar). See isTerminalFindCombo.
+      // BEFORE the pass-through below: off macOS the combo is Ctrl+Shift+F,
+      // which is also find-in-files (⇧⌘F with Ctrl for Cmd), and inside a
+      // terminal it means this terminal's find, as in Windows Terminal.
       if (e.type === "keydown" && isTerminalFindCombo(e, IS_MAC)) {
         setSearchOpen(true);
         e.preventDefault();
         e.stopPropagation();
         return false;
+      }
+      if (e.type === "keydown") {
+        const binds = usePrefs.getState().shortcuts;
+        // Off macOS the app's Cmd is Ctrl, and plain Ctrl+letter belongs to
+        // the shell (Ctrl+P is readline's previous-line). Only a binding that
+        // also carries Shift or Alt is taken from the terminal there.
+        if (PASS_TO_APP.some(id => {
+          const b = binds[id];
+          return (IS_MAC || !!b?.shift || !!b?.alt) && bindingMatches(e, b);
+        })) {
+          return false; // let the global handler take it (file finder, find-in-files, …)
+        }
       }
       // ctrl+V inside a DOCKER task: attach the clipboard image, the way the
       // agent would if it could reach the pasteboard.
@@ -1293,9 +1304,28 @@ const captureArmedRef = useRef(false);
           .catch(() => {
             // No image on the clipboard (or the read failed): hand the agent
             // the keystroke it was going to get anyway and let it answer.
+            // On Windows Ctrl+V is paste (below), so paste the text instead.
+            if (IS_WINDOWS) {
+              navigator.clipboard.readText().then(t => term.paste(t)).catch(() => {});
+              return;
+            }
             const pid = ptyRef.current;
             if (pid) ipc.ptyWrite(pid, [0x16]).catch(() => {});
           });
+        return false;
+      }
+
+      // Windows: plain Ctrl+V pastes, as in Windows Terminal, conhost and
+      // every other Windows app. (macOS pastes with Cmd+V natively; Linux
+      // keeps Ctrl+V for the shell's quoted-insert and pastes with
+      // Ctrl+Shift+V, below.)
+      if (
+        IS_WINDOWS && e.type === "keydown" && e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+        && (e.key === "v" || e.key === "V")
+      ) {
+        navigator.clipboard.readText().then(t => term.paste(t)).catch(() => {});
+        e.preventDefault();
+        e.stopPropagation();
         return false;
       }
 
@@ -1814,6 +1844,9 @@ const captureArmedRef = useRef(false);
     // codex). For claude (OSC 9;4 source) the title is a label only.
     let lastTitleState: "busy" | "idle" | "attention" | null = null;
     term.onTitleChange(t => {
+      // Windows' console host announces the program's path first; that is
+      // not the agent speaking (see isConsoleHostTitle).
+      if (isConsoleHostTitle(t)) return;
       // Display the title verbatim (no prefix strip). The spinner /
       // brand glyphs are SIGNAL: seeing "⠐ ⠂ Task" vs "✳ Task" in the
       // tab pill tells the user "agent is working" at a glance —
@@ -2535,7 +2568,11 @@ const captureArmedRef = useRef(false);
         // the user's login shell ($SHELL, falling back to bash/fish/sh),
         // mirroring the AuxTerminal scratch shell. Hard-coding zsh here
         // locked out users without it (#13).
-        const userShell = isAgent ? "" : await loginShell();
+        // A tab that RUNS a command gets commandShell (Git Bash on Windows,
+        // since those commands are POSIX shell); a bare shell tab gets the
+        // user's own interactive shell.
+        const runsCommand = (isCustom && !!tab.command) || isRegistryTerminal;
+        const userShell = isAgent ? "" : await (runsCommand ? commandShell() : loginShell());
         if (cancelled) return;
         const spawnCmd = isAgent ? spawnCommandForCli(tab.cli) : userShell;
         // Custom / registry terminal: run the launch command, then drop

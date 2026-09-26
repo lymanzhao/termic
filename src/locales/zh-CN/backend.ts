@@ -53,7 +53,7 @@ export default {
 
   closeTab: {
     unsavedTitle: "不保存直接关闭？",
-    unsavedMessage: "「{{name}}」有未保存的更改。关闭标签页将丢弃这些更改。按 ⌘S 可先保存。",
+    unsavedMessage: "「{{name}}」有未保存的更改。关闭标签页将丢弃这些更改。按 {{combo}} 可先保存。",
     unsavedConfirm: "丢弃并关闭",
     scheduledTitle: "删除定时消息？",
     scheduledPhraseOne: "{{count}} 条定时消息",

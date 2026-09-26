@@ -24,7 +24,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -37,6 +36,10 @@ pub mod agent_usage;
 pub mod codex_trust;
 mod sandbox;
 mod proxy;
+mod proc_ctl;
+mod fs_link;
+#[cfg(windows)]
+mod hook_pipe;
 mod repo_config;
 mod shell_env;
 mod automation;
@@ -45,7 +48,6 @@ mod forge;
 mod mcp_server;
 // Row shapes + OS-agnostic logic (subtree walk, cpu_ratio, label_for,
 // signal_from_name) shared by every `procmon` variant below.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 mod procmon_common;
 // macOS: real libproc/mach FFI. Linux: /proc. Everything else: a stub that
 // answers "unsupported on this OS" — see procmon_other.rs's module doc.
@@ -62,7 +64,6 @@ mod procmon;
 mod docker;
 mod agent_dirs;
 mod profiles;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod sudo_touchid;
 #[cfg(test)]
 mod test_support;
@@ -669,6 +670,14 @@ pub struct Task {
     /// identity that creates one (`$TERMIC_TASK_ID`) is claimed, not proven.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<TaskGroup>,
+    /// The task whose agent created this one through the CLI or MCP (its id),
+    /// kept whether or not the two share a group. It is what links a child to
+    /// its orchestrator ACROSS projects, where a group cannot: the sidebar is
+    /// split by project, so a group spanning two would draw as two unrelated
+    /// blocks. Cosmetic like `group`, and for the same reason (the parent id
+    /// is claimed through `$TERMIC_TASK_ID`, not proven).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<String>,
     /// Per-agent account override for THIS task (GH #278), agent id -> account
     /// name. Written when a running task is switched to another account, and
     /// read at every spawn so the choice survives a relaunch. Absent means
@@ -773,6 +782,15 @@ impl Task {
     /// `sandbox_enabled` bool for records written before monitoring
     /// shipped. `sandbox_mode` wins when present.
     pub fn effective_sandbox_mode(&self) -> SandboxMode {
+        // Where Seatbelt does not exist (Windows, Linux) a stored Seatbelt
+        // mode means Off, everywhere at once. It arrives without the user
+        // choosing it on this machine: a `.termic.yaml` committed from a
+        // Mac, a project default, `--sandbox enforce` from the CLI. Left
+        // as is, pty_spawn's provision would fail and spawn uncaged while
+        // every reader (and the frontend's auto-YOLO) believed it caged.
+        if !sandbox::available() {
+            return SandboxMode::Off;
+        }
         self.sandbox_mode.unwrap_or(
             if self.sandbox_enabled { SandboxMode::Enforce } else { SandboxMode::Off }
         )
@@ -1106,17 +1124,7 @@ fn build_account_farm(primary: &Path, store: &Path, entries: &[&str]) -> std::io
         if !src.exists() {
             continue;
         }
-        #[cfg(unix)]
-        if std::os::unix::fs::symlink(&src, &dst).is_ok() {
-            made += 1;
-        }
-        // Junction for the shared dirs (projects/…), hardlink-or-copy for
-        // the shared files (settings.json, CLAUDE.md, …) - the plain
-        // symlink_dir/symlink_file calls need privileges this does not
-        // have. A hardlinked file is still ONE file (edits propagate),
-        // which is the property the farm exists for.
-        #[cfg(not(unix))]
-        if crate::make_link(&src, &dst).is_ok() {
+        if fs_link::symlink_any(&src, &dst).is_ok() {
             made += 1;
         }
     }
@@ -1316,7 +1324,26 @@ fn git_tracks_path(repo: &Path, path: &Path) -> bool {
 /// `./wt`, `../siblings`)? Both levels of the setting branch on exactly this.
 fn is_absolute_location(s: &str) -> bool {
     let t = s.trim();
-    t.starts_with('/') || t == "~" || t.starts_with("~/")
+    // `Path::is_absolute` so `D:\wt` counts on Windows. Treating it as
+    // relative made `root.join("D:\wt")` return `D:\wt` itself, without
+    // the per-project subdirectory: every project shared one tasks root.
+    std::path::Path::new(t).is_absolute()
+        || t.starts_with('/')
+        || t == "~"
+        || t.starts_with("~/")
+        || (cfg!(windows) && t.starts_with("~\\"))
+}
+
+/// A single path component a user typed as a NAME (a rename, a member
+/// directory): not empty, not `.`/`..`, and no separator. `\` counts as a
+/// separator on Windows, where `..\x` would otherwise rename outside the
+/// directory the name is meant to live in.
+fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !(cfg!(windows) && (s.contains('\\') || s.contains(':')))
 }
 
 /// Per-project subdirectory under an ABSOLUTE tasks path, so projects sharing
@@ -1412,7 +1439,7 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // file; we must write through to its target. canonicalize fails on a
     // DANGLING link (dotfiles target not created yet), so follow links by
     // hand in that case rather than clobbering the link.
-    let resolved = fs::canonicalize(dest).unwrap_or_else(|_| {
+    let resolved = dunce::canonicalize(dest).unwrap_or_else(|_| {
         let mut cur = dest.to_path_buf();
         for _ in 0..8 {
             match fs::read_link(&cur) {
@@ -1604,22 +1631,18 @@ fn expand_tilde(path: &str) -> String {
     // `~` and `~/…` only — NOT `~user` or `~work`, which name no home we can
     // resolve. `is_absolute_location` draws the same line, and the tasks-path
     // UI mirrors it, so all three must agree on what a tilde means.
-    let Some(rest) = trimmed.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/'))
+    let Some(rest) = trimmed
+        .strip_prefix('~')
+        .filter(|r| r.is_empty() || r.starts_with('/') || (cfg!(windows) && r.starts_with('\\')))
     else {
         return trimmed.to_string();
     };
+    // Join rather than concatenate, so the result uses the platform
+    // separator after the home dir (`C:\Users\u\x`, not `C:\Users\u/x`).
+    let rest = rest.trim_start_matches(['/', '\\']);
     dirs::home_dir()
-        .map(|h| {
-            let joined = format!("{}{rest}", h.to_string_lossy());
-            // The literal the user typed carries a forward slash
-            // (`~/.next-claude`); on Windows the home part is backslashed,
-            // so route the join through the platform separator instead of
-            // handing the agent a mixed-separator path.
-            #[cfg(windows)]
-            return joined.replace('/', "\\");
-            #[cfg(not(windows))]
-            joined
-        })
+        .map(|h| if rest.is_empty() { h } else { h.join(rest) })
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| trimmed.to_string())
 }
 
@@ -1635,7 +1658,7 @@ fn expand_tilde(path: &str) -> String {
 /// `expand_tilde` this does not trim: an env value's surrounding whitespace is
 /// the caller's business, not ours.
 fn expand_tilde_env(value: &str) -> String {
-    if value == "~" || value.starts_with("~/") {
+    if value == "~" || value.starts_with("~/") || (cfg!(windows) && value.starts_with("~\\")) {
         expand_tilde(value)
     } else {
         value.to_string()
@@ -1651,7 +1674,7 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
     let pb = PathBuf::from(&expanded);
     if !pb.exists() { return Err(format!("{} does not exist", expanded)); }
     if !pb.is_dir() { return Err(format!("{} is not a directory", expanded)); }
-    let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
+    let canon = dunce::canonicalize(&pb).map_err(|e| e.to_string())?;
     let is_git = git(&["rev-parse", "--git-dir"], &canon).is_ok();
     m.non_git = !is_git;
     m.root_path = canon.to_string_lossy().into_owned();
@@ -1686,6 +1709,42 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
 /// Within ONE profile it stays a duplicate, because two entries for one path
 /// in the same sidebar are indistinguishable to the user and every lookup that
 /// resolves a path to a project would then have to pick one arbitrarily.
+/// Why git would not open a folder that IS a repo, when that is the reason
+/// `rev-parse` failed, instead of calling it "not a git repo". `None` means
+/// there is no repo there, and the caller's own message stands.
+///
+/// Discovery lists any folder with a `.git`, so a repo git refuses to open
+/// was offered and then rejected as not a repo, with the real reason gone.
+/// The usual one, on Windows especially, is git's ownership check: a repo
+/// owned by another account (a folder made from an admin shell, a clone by
+/// another user) fails every command with "detected dubious ownership".
+/// Trusting it is the user's call, so this names the command rather than
+/// running it.
+fn git_open_error(path: &Path, shown: &str, err: &str) -> Option<String> {
+    if err.contains("dubious ownership") {
+        let slashed = path.to_string_lossy().replace('\\', "/");
+        return Some(format!(
+            "Git refuses to open {shown}: it is owned by another user account (git's safe.directory check). \
+             If you trust this repo, run: git config --global --add safe.directory {slashed}"
+        ));
+    }
+    if !path.join(".git").exists() {
+        return None;
+    }
+    // No git to ask at all: on Windows, Git installed with "Use Git from Git
+    // Bash only" is not on the PATH other apps see, and a Termic started
+    // before Git was installed still has the old PATH until it restarts.
+    if crate::shell_env::which("git").is_none() {
+        return Some(format!(
+            "Termic can't find git, so it can't open {shown}. Install Git (on Windows, with \
+             \"Git from the command line and also from 3rd-party software\"), then restart Termic."
+        ));
+    }
+    // The last line of git's stderr is its own summary ("fatal: ...").
+    let why = err.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or(err);
+    Some(format!("Git could not open {shown}: {why}"))
+}
+
 fn project_path_taken(list: &[Project], profile: &ProfileId, canon: &str) -> bool {
     list.iter().any(|p| &p.profile == profile && p.root_path == canon)
 }
@@ -2127,7 +2186,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ty.is_symlink() {
             let target = fs::read_link(&from)?;
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &to)?;
+            fs_link::symlink_any(&target, &to)?;
             #[cfg(not(unix))]
             { let _ = target; let _ = fs::copy(&from, &to)?; }
         } else if ty.is_dir() {
@@ -2158,14 +2217,10 @@ fn link_config_dir(repo: &Path, wt: &Path, name: &str) {
     if dst.symlink_metadata().is_ok() {
         return;
     }
-    let target = fs::canonicalize(&src).unwrap_or(src);
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&target, &dst).is_ok();
-    // Windows: junction for the dirs, hardlink-or-copy for files (the
-    // list is no longer dirs-only: `.mcp.json` is a file, GH #251).
-    // std's symlink_dir/symlink_file need privileges a junction does not.
-    #[cfg(not(unix))]
-    let linked = make_link(&target, &dst).is_ok();
+    let target = dunce::canonicalize(&src).unwrap_or(src);
+    // The list is not dirs-only (`.mcp.json` is a file, GH #251);
+    // symlink_any picks the right Windows link kind.
+    let linked = fs_link::symlink_any(&target, &dst).is_ok();
     if linked {
         // The link is a symlink, which git's `<name>/` (directory) ignore
         // patterns do NOT match - so without this it shows as an untracked
@@ -2424,8 +2479,27 @@ fn migrate_workspaces_to_tasks() {
 
 /// Raw stdout, for callers that read blobs (`git show HEAD:some.png`) where
 /// a lossy UTF-8 decode would destroy the bytes.
+/// `git`, for the app's own background work. `GIT_OPTIONAL_LOCKS=0`: a
+/// `git status` refreshes the index's stat cache opportunistically, and
+/// takes `index.lock` to write it back. The app polls status all day, so the
+/// user's own `git commit` in a terminal kept meeting "Unable to create
+/// index.lock: File exists" (the Windows e2e runner hit exactly that). The
+/// commands that need the lock (add, commit, checkout) still take it.
+fn git_command() -> std::process::Command {
+    let mut cmd = crate::proc_ctl::command("git");
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
 fn git_bytes(args: &[&str], cwd: &Path) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
+    // Windows: worktrees live under `%USERPROFILE%\termic\tasks\<project>\<task>`
+    // and routinely hold `node_modules` / `target`, past the 260-character
+    // MAX_PATH that Git for Windows honours unless told otherwise. Set per
+    // call, so it works whatever the user's global config says.
+    if cfg!(windows) {
+        cmd.args(["-c", "core.longpaths=true"]);
+    }
     cmd.args(args).current_dir(cwd);
     // Run with the user's login-shell environment, same as the PTY (see
     // pty_spawn). A GUI-launched .app gets a bare launchd PATH; without this,
@@ -2473,7 +2547,7 @@ fn fetch_ref(repo: &Path, remote_ref: &str) -> std::result::Result<(), String> {
         return Ok(());
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     // Single-ref, no-tags fetch: updates refs/remotes/<remote>/<ref> via the
     // remote's configured fetch refspec and nothing else — fast, no need to
     // pull every ref.
@@ -3293,7 +3367,7 @@ pub(crate) fn pty_resize_inner(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PtyManager {
     inner: Arc<Mutex<HashMap<String, PtySlot>>>,
 }
@@ -3553,7 +3627,9 @@ fn configure_terminal_env(cmd: &mut CommandBuilder) {
 /// Names are used verbatim (free text per GH #196, no case transform).
 fn valid_port_name(name: &str) -> bool {
     shell_env::is_env_key(name)
-        && !RESERVED_PORT_NAMES.contains(&name)
+        // Windows env names are case-insensitive: a port named `Path` would
+        // replace PATH there.
+        && !RESERVED_PORT_NAMES.iter().any(|r| if cfg!(windows) { r.eq_ignore_ascii_case(name) } else { *r == name })
         && !name.starts_with("TERMIC_PORT_")
 }
 
@@ -3795,6 +3871,9 @@ fn pty_spawn(
         },
     }};
 
+    // Windows: resolve a bare name ourselves (see shell_env::resolve_program),
+    // against the PATH the child gets below.
+    let effective_cmd = shell_env::resolve_program(&effective_cmd, &shell_env::spawn_env().0);
     let mut cmd = CommandBuilder::new(&effective_cmd);
     for a in &effective_args {
         cmd.arg(a);
@@ -3960,7 +4039,7 @@ fn pty_spawn(
             // agent to prompt them back (src/lib/agentBriefing.ts).
             cmd.env(
                 "TERMIC_CLI_HELP",
-                "You are running INSIDE a Termic task ($TERMIC_TASK_ID): Termic runs coding agents side by side, each task a git worktree (or the main checkout) with its own terminal, listed in the app's sidebar. TERMIC_CLI is the Termic control CLI, which drives the app around you. Run `\"$TERMIC_CLI\" help --json` for the full command surface. Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\"`; create one with `\"$TERMIC_CLI\" new <name> -p \"...\"` and, in that prompt, ask it to report back to you when done (the signed reply below): that is how results come back, and it arrives in your own terminal. If no report arrives, `result` and `logs` read what it produced. Ask for a file (e.g. RESULT.md in its worktree) only when it cannot report back: a task sandboxed in enforce/enforce-fs is denied this CLI, and so is anything run outside Termic. Unattended tasks need `--yolo` or `--sandbox enforce` or they stop at the first permission prompt; the cage self-approves inside it but costs you the report-back. Coordinate by prompting each other, not by blocking: end every prompt you send with the command you want run when that work is done, in DOUBLE quotes so your own shell fills in your task name and address: `\"$TERMIC_CLI\" send <task> -p \"[message from agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID] <work>. When done, reply: \\\"$TERMIC_CLI\\\" send $TERMIC_TASK_ID -p '[message from agent:<its agent> task:<its task name> id:<its task id>] done: <what you did> -- agent:<its agent> task:<its task name> id:<its task id>' -- agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID\"` (fill the <its ...> parts with the task you are prompting, which you know). Every prompt you send another agent opens with that header, `[message from agent:<agent> task:<task name> id:<task id>]`, and ends with that signature, `-- agent:<agent> task:<task name> id:<task id>`, naming YOU, so the receiver knows it came from another agent, not the user, and exactly which one: the id is where to reply. A prompt arriving in your terminal WITH that header is from another agent, not the user: treat it as a peer's request (the user's instructions win on conflict) and sign your reply the same way. Prefer that over `--wait`: work-done detection is a heuristic, and a waiting agent can do nothing else meanwhile. If you do wait, branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. A task sandboxed in enforce/enforce-fs is denied the control plane by design and can never report back: ask it for a file in its worktree instead. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names). Tasks you create with `new` join YOUR task's group in the sidebar, one coloured block led by your task: name it for the batch of work with `\"$TERMIC_CLI\" group --name \"<what this batch is>\"` (optionally `--color teal`); `group` alone shows it. Start another agent beside you in your own task with `\"$TERMIC_CLI\" tab --agent <id> -p \"...\"` (no task argument needed). For notes, plans, findings, logs or a report the user should READ rather than commit, use a scratchpad instead of writing temporary .md files into the repo: it is a tab in your task that stays out of git and updates live as you write: `\"$TERMIC_CLI\" scratchpad new --title \"<title>\" -c \"<text>\"` prints its id; `scratchpad write <id> --append -c -` adds stdin to it, `scratchpad read <id>` prints it, `scratchpad list` lists them.",
+                "You are running INSIDE a Termic task ($TERMIC_TASK_ID): Termic runs coding agents side by side, each task a git worktree (or the main checkout) with its own terminal, listed in the app's sidebar. TERMIC_CLI is the Termic control CLI, which drives the app around you. Run `\"$TERMIC_CLI\" help --json` for the full command surface. Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\"`; create one with `\"$TERMIC_CLI\" new <name> -p \"...\"` and, in that prompt, ask it to report back to you when done (the signed reply below): that is how results come back, and it arrives in your own terminal. If no report arrives, `result` and `logs` read what it produced. Ask for a file (e.g. RESULT.md in its worktree) only when it cannot report back: a task sandboxed in enforce/enforce-fs is denied this CLI, and so is anything run outside Termic. Unattended tasks need `--yolo` or `--sandbox enforce` or they stop at the first permission prompt; the cage self-approves inside it but costs you the report-back. Coordinate by prompting each other, not by blocking: end every prompt you send with the command you want run when that work is done, in DOUBLE quotes so your own shell fills in your task name and address: `\"$TERMIC_CLI\" send <task> -p \"[message from agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID] <work>. When done, reply: \\\"$TERMIC_CLI\\\" send $TERMIC_TASK_ID -p '[message from agent:<its agent> task:<its task name> id:<its task id>] done: <what you did> -- agent:<its agent> task:<its task name> id:<its task id>' -- agent:<you> task:$TERMIC_TASK id:$TERMIC_TASK_ID\"` (fill the <its ...> parts with the task you are prompting, which you know). Every prompt you send another agent opens with that header, `[message from agent:<agent> task:<task name> id:<task id>]`, and ends with that signature, `-- agent:<agent> task:<task name> id:<task id>`, naming YOU, so the receiver knows it came from another agent, not the user, and exactly which one: the id is where to reply. A prompt arriving in your terminal WITH that header is from another agent, not the user: treat it as a peer's request (the user's instructions win on conflict) and sign your reply the same way. Prefer that over `--wait`: work-done detection is a heuristic, and a waiting agent can do nothing else meanwhile. If you do wait, branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. A task sandboxed in enforce/enforce-fs is denied the control plane by design and can never report back: ask it for a file in its worktree instead. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names). Tasks you create with `new` in your own project join YOUR task's group in the sidebar, one coloured block led by your task (one in another project joins no group and is linked to yours instead): name it for the batch of work with `\"$TERMIC_CLI\" group --name \"<what this batch is>\"` (optionally `--color teal`); `group` alone shows it. Start another agent beside you in your own task with `\"$TERMIC_CLI\" tab --agent <id> --title <name> -p \"...\"` (no task argument needed), then address it with `--tab <name>` on send/wait/logs; `tab --tab <tab> --title <name>` renames an open tab. For notes, plans, findings, logs or a report the user should READ rather than commit, use a scratchpad instead of writing temporary .md files into the repo: it is a tab in your task that stays out of git and updates live as you write: `\"$TERMIC_CLI\" scratchpad new --title \"<title>\" -c \"<text>\"` prints its id; `scratchpad write <id> --append -c -` adds stdin to it, `scratchpad read <id>` prints it, `scratchpad list` lists them.",
             );
         }
     }
@@ -3990,6 +4069,17 @@ fn pty_spawn(
     // write anything it likes to it; the hook is the same process tree.
     if let Some(path) = pty_slave_path(&pair.master) {
         cmd.env("TERMIC_PTY", path);
+    }
+    // Windows: no slave device, so a named pipe stands in for it, served
+    // below and fed into this PTY's output (hook_pipe.rs). Created before the
+    // spawn so a startup hook finds it. Docker tasks keep /proc/1/fd/1.
+    #[cfg(windows)]
+    let hook_pipe = if is_docker { None } else { hook_pipe::HookPipe::create() };
+    #[cfg(windows)]
+    if let Some(p) = &hook_pipe {
+        cmd.env("TERMIC_PTY", p.env_path());
+        // Tells the hook scripts to write through `termic hook-emit`.
+        cmd.env("TERMIC_PTY_PIPE", "1");
     }
 
     // Stop grok scanning ~/.claude/settings.json for hooks.
@@ -4089,6 +4179,24 @@ fn pty_spawn(
     };
     #[cfg(not(target_os = "macos"))]
     let mut sudo_watch: Option<sudo_touchid::SudoWatch> = None;
+    // Serve the hook pipe into the same buffer and feed the reader fills.
+    #[cfg(windows)]
+    let hook_pipe_path = hook_pipe.map(|pipe| {
+        let path = pipe.env_path();
+        let buf_h = pty_buf.clone();
+        let feed_h = feed.clone();
+        pipe.serve(
+            reader_done.clone(),
+            Arc::new(move |bytes: &[u8]| {
+                buf_h.0.lock().extend_from_slice(bytes);
+                buf_h.1.notify_all();
+                if let Some(feed) = &feed_h {
+                    feed.push(bytes);
+                }
+            }),
+        );
+        path
+    });
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
@@ -4142,6 +4250,12 @@ fn pty_spawn(
             done_r.store(true, Ordering::Release);
             buf_r.1.notify_all();
         }
+        // The hook pipe's accept loop waits for a client; one last empty
+        // connection lets it see `done` and exit with the PTY.
+        #[cfg(windows)]
+        if let Some(p) = &hook_pipe_path {
+            hook_pipe::wake(p);
+        }
     });
 
     // Flusher thread: block until the reader signals fresh output, then
@@ -4193,6 +4307,34 @@ fn pty_spawn(
         let status = child.wait().ok();
         let code = status.and_then(|s| i32::try_from(s.exit_code()).ok());
         dlog(&format!("[pty/{id_w}] child exited code={code:?}"));
+        // ConPTY keeps its output pipe open until the pseudoconsole itself is
+        // closed, so on Windows the reader below never sees EOF for a child
+        // that exits on its own: pty-exit never fired, and a failed resume
+        // neither retried nor showed the exited banner. Give the reader a
+        // moment to drain what the child wrote, then close the pseudoconsole
+        // by dropping the slot (what pty_kill does), which ends the read.
+        #[cfg(windows)]
+        {
+            let drained = {
+                let mut b = buf_w.0.lock();
+                let deadline = Instant::now() + Duration::from_millis(200);
+                while !done_w.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    if now >= deadline { break; }
+                    buf_w.1.wait_for(&mut b, deadline - now);
+                }
+                done_w.load(Ordering::Acquire)
+            };
+            if !drained {
+                let slot = state_w.lock().remove(&id_w);
+                if let Some(slot) = slot {
+                    if let Some(name) = slot.docker_container.clone() {
+                        std::thread::spawn(move || docker::rm_container(&name));
+                    }
+                    drop(slot);
+                }
+            }
+        }
         // Wait for the reader to drain and emit all remaining PTY output
         // before firing pty-exit. Without this the frontend could process
         // exit before the last bytes arrive and tear down the listener.
@@ -4298,8 +4440,7 @@ fn pty_kill(state: State<'_, PtyManager>, pty_id: String) -> Result<(), String> 
         // thread that has the Child handle pinned in wait()).
         if let Some(pid) = slot.child_pid {
             // SAFETY: kill(2) is async-signal-safe and the pid is an i32.
-            proc_kill(pid, false, ProcSignal::Kill);
-        }
+            proc_ctl::signal_pid(pid as i32, proc_ctl::Sig::Kill);}
         drop(slot.writer);
         drop(slot.master);
         // The SIGKILL above only killed the local `docker run` client; the
@@ -4469,56 +4610,7 @@ fn farm_planted(entry: &std::fs::DirEntry) -> bool {
     if entry.file_name() == std::ffi::OsStr::new(ACCOUNT_FARM_MARKER) {
         return true;
     }
-    #[cfg(windows)]
-    {
-        // The Windows farm links shared FILES as hardlinks (a symlink
-        // needs privileges), which std cannot distinguish from a plain
-        // file. A hardlink carries more than one link in the file's
-        // link count; anything an agent wrote fresh has exactly one.
-        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-            return true;
-        }
-        return file_is_hardlinked(&entry.path());
-    }
-    #[cfg(not(windows))]
     entry.file_type().map(|t| t.is_symlink()).unwrap_or(false)
-}
-
-/// Does `path` carry more than one link (Windows half of farm_planted)?
-#[cfg(windows)]
-fn file_is_hardlinked(path: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    // SAFETY: CreateFileW with read-attributes only, on a path from a live
-    // directory listing; INVALID_HANDLE_VALUE is mapped to the error path
-    // and the handle is closed on every exit.
-    unsafe {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let h = CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut() as _,
-        );
-        if h.is_null() || h == INVALID_HANDLE_VALUE {
-            return false;
-        }
-        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-        let ok = GetFileInformationByHandle(h, &mut info);
-        CloseHandle(h);
-        ok != 0 && info.nNumberOfLinks > 1
-    }
 }
 
 #[tauri::command]
@@ -4824,6 +4916,7 @@ fn profile_seeded_tasks_path(name: String) -> (String, String) {
 
 #[tauri::command]
 fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView, String> {
+    dlog("[profile] create: start");
     // Under the lock: creating the FIRST profile also adopts the existing
     // install, and both entries have to land in one write or the registry is
     // briefly a registry that names one of two profiles.
@@ -4868,6 +4961,7 @@ fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView
     };
     // Every window's strip has to learn there is now more than one profile.
     forget_task_window(None);
+    dlog("[profile] create: tray");
     rebuild_tray_menu(&app);
     let _ = app.emit("termic://profiles-changed", ());
     Ok(view)
@@ -4909,7 +5003,13 @@ fn profile_update(app: AppHandle, slug: String, name: Option<String>, accent: Op
 ///
 /// One action from the user's side, which is why the popover does not
 /// distinguish them: switching profiles IS opening a window.
-#[tauri::command]
+///
+/// `(async)`: it may CREATE a window, and a synchronous command runs on the
+/// main thread, where building a webview window deadlocks on Windows
+/// (WebView2 needs the message loop the command is blocking; wry#583). The
+/// first Windows e2e run caught it: "creating a profile did not open its
+/// window".
+#[tauri::command(async)]
 fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
     use tauri::Manager;
     // Chrome's tie-break for a project that lives in several profiles is
@@ -4917,6 +5017,7 @@ fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
     //
     // Under the lock and NOTHING ELSE under it: `build_profile_window` below
     // writes the registry too, and holding this across it would deadlock.
+    dlog(&format!("[profile] open {slug}: start"));
     let id = with_registry(|_g, reg| {
         if reg.get(&slug).is_none() {
             return Err(format!("no such profile: {slug}"));
@@ -4938,17 +5039,35 @@ fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
     // Whoever focuses LAST wins, so the target goes last.
     //
     // A profile window is a window: an app that was windowless has one again.
-    leave_windowless(&app);
-    let win = match app.get_webview_window(&id.window_label()) {
-        Some(w) => w,
-        None => build_profile_window(&app, &id).map_err(|e| e.to_string())?,
-    };
-    let _ = win.unminimize();
-    let _ = win.show();
-    focus_window_unless_e2e(&win);
-    // The menu marks the open profiles, so opening one changes it.
-    rebuild_tray_menu(&app);
-    Ok(())
+    // The window work runs ON the main thread, from the event loop rather
+    // than from inside this IPC handler: building a window inside the
+    // handler deadlocks on Windows (wry#583), and building it from a worker
+    // thread returns before the window exists, after which every window
+    // call is a round trip to a main thread that is busy creating it (both
+    // froze the app in the Windows e2e run). This is how the startup window
+    // is made, which always worked.
+    on_main_thread(&app, move |app| {
+        dlog("[profile] open: leave_windowless");
+        leave_windowless(app);
+        dlog("[profile] open: build");
+        let win = match app.get_webview_window(&id.window_label()) {
+            Some(w) => w,
+            None => build_profile_window(app, &id).map_err(|e| e.to_string())?,
+        };
+        if id.is_root() {
+            // The root is hidden, never destroyed, so reopening it is a show and
+            // not a build, and nothing else would clear the "user closed it" mark.
+            root_brought_back();
+        }
+        dlog("[profile] open: show");
+        let _ = win.unminimize();
+        let _ = win.show();
+        focus_window_unless_e2e(&win);
+        // The menu marks the open profiles, so opening one changes it.
+        rebuild_tray_menu(app);
+        dlog("[profile] open: done");
+        Ok(())
+    })
 }
 
 /// Stop using profiles, keeping every byte of data.
@@ -5014,7 +5133,7 @@ fn profiles_disable(app: AppHandle) -> Result<(), String> {
 /// failure.
 #[tauri::command]
 fn window_close_if_not_last(app: AppHandle, window: tauri::Window) -> Result<bool, String> {
-    if profile_windows(&app).len() <= 1 {
+    if shown_profile_windows(&app).len() <= 1 {
         return Ok(false);
     }
     // Through the ordinary close path, not `destroy`: `CloseRequested` is what
@@ -5295,13 +5414,14 @@ fn project_add(window: tauri::Window, root_path: String, non_git: Option<bool>) 
         if !pb.is_dir() {
             return Err(format!("{} is not a directory", expanded));
         }
-    } else if git(&["rev-parse", "--git-dir"], &pb).is_err() {
+    } else if let Err(e) = git(&["rev-parse", "--git-dir"], &pb) {
         // NOTE: the "not a git repo" substring is load-bearing for
         // cli_server::handle_project_add's --non-git hint.
-        return Err(format!("{} is not a git repo. Confirm adding it as a plain folder.", expanded));
+        return Err(git_open_error(&pb, &expanded, &format!("{e:#}"))
+            .unwrap_or_else(|| format!("{} is not a git repo. Confirm adding it as a plain folder.", expanded)));
     }
     let mut list = load_projects_all();
-    let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
+    let canon = dunce::canonicalize(&pb).map_err(|e| e.to_string())?;
     if project_path_taken(&list, &window_profile(&window), &canon.to_string_lossy()) {
         // NOTE: the "project already added" substring is load-bearing for
         // cli_server::handle_project_add's idempotent re-add.
@@ -5496,15 +5616,16 @@ fn project_add_multi(window: tauri::Window, root_path: String, name: String, mem
                 if !pb.is_dir() {
                     return Err(format!("{} is not a directory", expanded));
                 }
-            } else if git(&["rev-parse", "--git-dir"], &pb).is_err() {
-                return Err(format!("{} is not a git repo. Confirm using it as a plain folder host.", expanded));
+            } else if let Err(e) = git(&["rev-parse", "--git-dir"], &pb) {
+                return Err(git_open_error(&pb, &expanded, &format!("{e:#}"))
+                    .unwrap_or_else(|| format!("{} is not a git repo. Confirm using it as a plain folder host.", expanded)));
             }
             pb
         }
     };
 
     let mut list = load_projects_all();
-    let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
+    let canon = dunce::canonicalize(&pb).map_err(|e| e.to_string())?;
     if project_path_taken(&list, &window_profile(&window), &canon.to_string_lossy()) {
         return Err("a project at this path is already added".into());
     }
@@ -5689,11 +5810,14 @@ fn project_update(mut p: Project) -> Result<(), String> {
 /// so the entry disappears from disk entirely; the user's actual git repo
 /// at `root_path` is NOT touched (we never own that directory).
 #[tauri::command]
-async fn project_remove(id: String) -> Result<(), String> {
+async fn project_remove(state: State<'_, PtyManager>, id: String) -> Result<(), String> {
+    let ptys = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let tasks: Vec<Task> = load_tasks_all()
             .into_iter().filter(|w| w.project_id == id).collect();
         for w in tasks {
+            // As task_archive: nothing may still run in the worktree.
+            stop_every_task_pty(&ptys, &w.id);
             // task_archive_sync handles SIGTERMing scripts, running the
             // archive script, removing the worktree, and saving archived=true.
             // Errors per-task are logged but don't abort — we want a
@@ -5755,7 +5879,7 @@ fn link_repo_mode_members(host_dir: &Path, members: &[ProjectMember], first_port
     let mut next_member_port = first_port;
     for pm in members {
         let dir_name = pm.name.clone();
-        if dir_name.is_empty() || dir_name.contains('/') { continue; }
+        if !is_plain_name(&dir_name) { continue; }
         if !seen.insert(dir_name.clone()) { continue; }
         let target = host_dir.join(&dir_name);
         // If the link already exists from a previous open-repo,
@@ -5769,15 +5893,15 @@ fn link_repo_mode_members(host_dir: &Path, members: &[ProjectMember], first_port
             // can spell the same directory differently (/var vs /private/var).
             let is_member_itself = !meta.file_type().is_symlink()
                 && matches!(
-                    (fs::canonicalize(&target), fs::canonicalize(&pm.root_path)),
+                    (dunce::canonicalize(&target), dunce::canonicalize(&pm.root_path)),
                     (Ok(a), Ok(b)) if a == b
                 );
             if !is_our_link && !is_member_itself {
                 eprintln!("task_open_repo: {} exists and isn't our symlink; skipping {}", target.display(), pm.name);
                 continue;
             }
-        } else if let Err(e) = make_link(Path::new(&pm.root_path), &target) {
-            eprintln!("task_open_repo: link {} failed: {e}", pm.name);
+        } else if let Err(e) = fs_link::symlink_any(&pm.root_path, &target) {
+            eprintln!("task_open_repo: symlink {} failed: {e}", pm.name);
             continue;
         }
         let member_port = next_member_port;
@@ -6022,6 +6146,7 @@ fn task_open_repo(
         // ordered sibling (see sort_tasks).
         order: None,
         group: None,
+        spawned_by: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     Ok(task)
@@ -6044,7 +6169,7 @@ pub struct ImportableWorktree {
 /// Canonicalize for set-membership comparison, falling back to the raw
 /// string when the path can't be resolved (e.g. it was deleted).
 fn canon_str(p: &str) -> String {
-    fs::canonicalize(p)
+    dunce::canonicalize(p)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| p.to_string())
 }
@@ -6284,6 +6409,7 @@ fn task_import_worktree(
         // ordered sibling (see sort_tasks).
         order: None,
         group: None,
+        spawned_by: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     Ok(task)
@@ -6524,6 +6650,11 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
             Err(e) => Err(e),
         }
     };
+    dlog(&format!(
+        "[worktree] add {} for '{branch}' in {}: {}",
+        wt_path.display(), repo.display(),
+        match &add_result { Ok(_) => "ok".to_string(), Err(e) => e.to_string() },
+    ));
     if let Err(e) = add_result {
         if e.to_string().contains("already used by worktree") {
             // The branch was the whole point of a checkout, so renaming the
@@ -6561,8 +6692,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         let key_target = common_gitdir.as_ref().unwrap().join("git-crypt");
         let key_link = wt_gitdir.join("git-crypt");
         if !key_link.exists() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&key_target, &key_link)
+            fs_link::symlink_any(&key_target, &key_link)
                 .map_err(|e| format!("git-crypt setup: symlink {} → {} failed: {e}",
                     key_link.display(), key_target.display()))?;
         }
@@ -6731,6 +6861,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         // ordered sibling (see sort_tasks).
         order: None,
         group: None,
+        spawned_by: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     drop(port_guard);
@@ -6866,7 +6997,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         // defends (the parent exists + is non-empty, so symlink/worktree-add
         // fail and roll back), but reject it up front as defense-in-depth so
         // no archive/teardown path can ever operate on `..`.
-        if dir_name.contains('/') || dir_name.is_empty() || dir_name == "." || dir_name == ".." {
+        if !is_plain_name(&dir_name) {
             return Err(format!("invalid member dir name: {dir_name:?}"));
         }
         if !seen_dirs.insert(dir_name.clone()) {
@@ -6905,7 +7036,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
             if src.exists() {
                 let dst = wrapper.join(shared);
                 if !dst.exists() {
-                    let _ = make_link(&src, &dst);
+                    let _ = fs_link::symlink_any(&src, &dst);
                 }
             }
         }
@@ -7008,7 +7139,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         match spec.mode {
             MemberMode::RepoRoot => {
                 emit_create_progress(&app, &task_id, format!("Linking member '{dir_name}' to its live checkout…"));
-                if let Err(e) = make_link(Path::new(&mp.root_path), &target) {
+                if let Err(e) = fs_link::symlink_any(&mp.root_path, &target) {
                     rollback(&done);
                     return Err(format!("symlink {dir_name}: {e}"));
                 }
@@ -7228,6 +7359,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         // ordered sibling (see sort_tasks).
         order: None,
         group: None,
+        spawned_by: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
     drop(port_guard);
@@ -7292,7 +7424,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 use std::process::Stdio;
                 emit_scoped(&app2, &format!("setup-output://{}", ws_id),
                     serde_json::json!({ "line": format!("[{label}] $ {script}") }));
-                let mut cmd = Command::new("bash");
+                let mut cmd = crate::proc_ctl::command(shell_env::script_bash());
                 // Real login-shell env so setup finds bun/nvm/etc. and
                 // sees the user's $EDITOR; `bash -l` alone misses what the
                 // user set in their actual shell (fish/zsh rc) (#16, #17).
@@ -7445,6 +7577,11 @@ fn apply_group_join(list: &mut [Task], task_id: &str, target_id: &str, color: Op
     if list[ti].profile != list[si].profile {
         return Err("tasks in different profiles cannot share a group".into());
     }
+    // A group is a block inside ONE project's list; a member elsewhere would
+    // be drawn as a second, unrelated block (see `apply_spawn_link`).
+    if list[ti].project_id != list[si].project_id {
+        return Err("tasks in different projects cannot share a group".into());
+    }
     let mut changed = Vec::new();
     let group = match list[ti].group.clone() {
         Some(g) => g,
@@ -7458,6 +7595,32 @@ fn apply_group_join(list: &mut [Task], task_id: &str, target_id: &str, color: Op
     if list[si].group.as_ref() != Some(&group) {
         list[si].group = Some(group);
         changed.push(si);
+    }
+    Ok(changed)
+}
+
+/// Record that `parent_id`'s agent created `child_id` (the CLI's and MCP's
+/// `new`). Always stamps `spawned_by`; a child in the SAME project also joins
+/// the parent's group, founding it if need be. A child in another project
+/// joins nothing: the sidebar links the two on hover instead.
+fn apply_spawn_link(list: &mut [Task], child_id: &str, parent_id: &str, color: Option<String>) -> Result<Vec<usize>, String> {
+    if child_id == parent_id {
+        return Err("a task cannot spawn itself".into());
+    }
+    let pi = list.iter().position(|t| t.id == parent_id).ok_or("no such parent task")?;
+    let ci = list.iter().position(|t| t.id == child_id).ok_or("no such task")?;
+    let same_project = list[pi].project_id == list[ci].project_id && list[pi].profile == list[ci].profile;
+    let mut changed = Vec::new();
+    if list[ci].spawned_by.as_deref() != Some(parent_id) {
+        list[ci].spawned_by = Some(parent_id.to_string());
+        changed.push(ci);
+    }
+    if same_project {
+        for i in apply_group_join(list, child_id, parent_id, color)? {
+            if !changed.contains(&i) {
+                changed.push(i);
+            }
+        }
     }
     Ok(changed)
 }
@@ -7533,6 +7696,17 @@ async fn task_group_join(task_id: String, target_id: String, color: Option<Strin
     tauri::async_runtime::spawn_blocking(move || {
         let mut list = load_tasks_all();
         let changed = apply_group_join(&mut list, &task_id, &target_id, color)?;
+        save_changed(&list, changed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_link_spawn(task_id: String, parent_id: String, color: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = load_tasks_all();
+        let changed = apply_spawn_link(&mut list, &task_id, &parent_id, color)?;
         save_changed(&list, changed)
     })
     .await
@@ -8179,10 +8353,19 @@ fn tokenize_home_prefix(path: &str) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     if !home.is_empty() && (path == home || path.starts_with(&format!("{home}/"))) {
-        path.replacen(&home, "$HOME", 1)
-    } else {
-        path.to_string()
+        return path.replacen(&home, "$HOME", 1);
     }
+    // Windows: `C:\Users\<name>\x`, any case. Written with `/` so the
+    // committed `.termic.yaml` reads the same on a teammate's Mac, and so
+    // nobody's username lands in the repo.
+    if cfg!(windows) && !home.is_empty() {
+        let lower = path.to_lowercase();
+        let h = home.to_lowercase();
+        if lower == h || lower.starts_with(&format!("{h}\\")) || lower.starts_with(&format!("{h}/")) {
+            return format!("$HOME{}", path[home.len()..].replace('\\', "/"));
+        }
+    }
+    path.to_string()
 }
 
 /// Read a project's committed `.termic.yaml` (at its `root_path`).
@@ -8417,8 +8600,7 @@ pub(crate) fn kill_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     let count = victims.len();
     for (pid, container) in victims {
         if let Some(pid) = pid {
-            proc_kill(pid, false, ProcSignal::Kill);
-        }
+            proc_ctl::signal_pid(pid as i32, proc_ctl::Sig::Kill);}
         // Killing the client does not stop the container (see
         // docker::rm_container). Reap by name so this stays correct even
         // though callers like task_set_docker also sweep the whole task.
@@ -8744,6 +8926,68 @@ fn profile_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
         .collect()
 }
 
+/// The root window is up but the user CLOSED it, with another profile still
+/// on screen. The root is never destroyed (its webview is the app's), only
+/// hidden, so `profile_windows` still counts it; this is what says the hide
+/// was the user's and not windowless mode's.
+///
+/// Without it every "bring the UI back" path (dock click, the menu-bar item,
+/// `termic open`, a second launch, a deep link, switching profile) showed the
+/// closed root along with the window the user kept, and a launch that had
+/// correctly left main closed grew it back at the first of those.
+static ROOT_PUT_AWAY: AtomicBool = AtomicBool::new(false);
+
+/// Whether `leave_windowless` should leave the root hidden: only while the
+/// user put it away AND another profile window is there to show instead. With
+/// nothing else to show, the root comes back rather than leaving no window.
+fn root_stays_hidden(put_away: bool, other_windows: usize) -> bool {
+    put_away && other_windows > 0
+}
+
+/// The profile windows the user has up: every one, minus a root they closed
+/// (see ROOT_PUT_AWAY). What "is this the last window" and "which windows come
+/// back" count, so a hidden root is not mistaken for an open one.
+fn shown_profile_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
+    let wins = profile_windows(app);
+    let root = ProfileId::Root.window_label();
+    let others = wins.iter().filter(|w| w.label() != root).count();
+    if root_stays_hidden(ROOT_PUT_AWAY.load(Ordering::SeqCst), others) {
+        wins.into_iter().filter(|w| w.label() != root).collect()
+    } else {
+        wins
+    }
+}
+
+/// A caller is about to show the window labelled `label` on purpose (a task
+/// or link that lives in it): if that is a root the user had closed, it is
+/// open again.
+fn note_root_shown(label: &str) {
+    if label == ProfileId::Root.window_label() {
+        root_brought_back();
+    }
+}
+
+/// Launch left the root hidden because the user had closed it: keep it
+/// exactly as closed as when they shut it.
+///
+/// Two halves, each a bug on its own. `build_profile_window` had already
+/// stamped `open_at_quit = true` on the hidden root, so the NEXT launch (an
+/// update's relaunch, typically) read "main was open" and showed it; the flag
+/// is put back. And ROOT_PUT_AWAY, or the first dock click, `termic open` or
+/// profile switch shows it anyway.
+fn keep_root_closed_at_launch() {
+    set_open_at_quit(&ProfileId::Root, false);
+    ROOT_PUT_AWAY.store(true, Ordering::SeqCst);
+}
+
+/// Record that the root window is on screen again (reopened from the profile
+/// menu, or shown because nothing else was left).
+fn root_brought_back() {
+    if ROOT_PUT_AWAY.swap(false, Ordering::SeqCst) {
+        set_open_at_quit(&ProfileId::Root, true);
+    }
+}
+
 /// Build a profile's window: the SAME window for every profile, differing
 /// only in its label and title.
 ///
@@ -8752,6 +8996,70 @@ fn profile_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
 /// identity: `tauri-plugin-window-state` keys saved frames by it, so each
 /// profile remembers its own geometry, and the root profile keeps the literal
 /// `main` label a pre-profiles install already has a frame saved under.
+/// WebView2 ships browser keys on by default: F5 / Ctrl+R / Ctrl+Shift+R
+/// reload the page, Ctrl+P prints, Ctrl+F and F3 open a find bar, Ctrl+U
+/// shows the source. In this app a reload drops every terminal's scrollback
+/// and all UI state, and Ctrl+R / Ctrl+P / Ctrl+F are shortcuts the app and
+/// the shells inside it want. Tauri has no setter for this, so reach the
+/// WebView2 settings object directly. Clipboard and editing keys are not
+/// browser accelerators and keep working. WKWebView has no such keys.
+///
+/// Called from `on_page_load` (`without_browser_accelerators`), never right
+/// after `build()`: from an async command `build()` returns before the
+/// WebView2 controller exists, and reaching into it then froze the whole app
+/// on Windows (the first profile window, found by the e2e trace).
+fn disable_browser_accelerators(win: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let _ = win.with_webview(|wv| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+            use windows_core::Interface;
+            // SAFETY: COM calls on the live controller Tauri hands us, on
+            // the thread it runs this closure on.
+            unsafe {
+                if let Ok(core) = wv.controller().CoreWebView2() {
+                    if let Ok(settings) = core.Settings() {
+                        if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+                            let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false.into());
+                        }
+                    }
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = win;
+}
+
+/// Run `f` on the main thread, from the event loop, and wait for its result.
+/// For window creation from a command (see `profile_open`). Must be called
+/// OFF the main thread, i.e. from an `(async)` command, or it would wait on
+/// itself.
+fn on_main_thread<T: Send + 'static>(
+    app: &AppHandle,
+    f: impl FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f(&handle));
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|e| e.to_string())?
+}
+
+/// Register `disable_browser_accelerators` for when the page has loaded, on
+/// the main thread, with the webview fully created.
+fn without_browser_accelerators<'a>(
+    builder: tauri::WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> tauri::WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    builder.on_page_load(|win, payload| {
+        if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+            disable_browser_accelerators(&win);
+        }
+    })
+}
+
 fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri::WebviewWindow> {
     use tauri::Manager;
     let label = id.window_label();
@@ -8792,7 +9100,18 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
             .traffic_light_position(tauri::LogicalPosition::new(16.0, traffic_y));
     }
 
-    let win = builder.build()?;
+    // Windows: no native frame. The app's own top bar is the title bar there
+    // (it drags, double-click maximizes, and WindowControls draws minimize /
+    // maximize / close), so the native one was a second, empty bar above it.
+    // A frameless window keeps its shadow and its resize edges on Windows.
+    #[cfg(windows)]
+    {
+        builder = builder.decorations(false);
+    }
+
+    dlog(&format!("[profile] build {label}: builder.build"));
+    let win = without_browser_accelerators(builder).build()?;
+    dlog(&format!("[profile] build {label}: built"));
 
     // Restore saved bounds ourselves (the plugin skips "main" via
     // skip_initial_state) so the ordering is deterministic. SIZE +
@@ -8861,12 +9180,16 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
                 // quit / ask) is about the LAST window going away. A
                 // non-root profile also destroys rather than hides, so the
                 // popover shows it closed and reopening rebuilds it.
-                if profile_windows(&handle).len() > 1 {
+                // Counts SHOWN windows: a root the user already closed is
+                // hidden, not gone, and counting it made closing the last
+                // visible window destroy it and leave no window at all.
+                if shown_profile_windows(&handle).len() > 1 {
                     // A DELIBERATE close is remembered, so relaunch does not
                     // resurrect a window the user put away. App quit does not
                     // come through here, which is what makes restore work.
                     set_open_at_quit(&close_id, false);
                     if is_root {
+                        ROOT_PUT_AWAY.store(true, Ordering::SeqCst);
                         let _ = window_for_close.hide();
                     } else {
                         let _ = window_for_close.destroy();
@@ -9061,8 +9384,14 @@ fn focus_window_unless_e2e(win: &tauri::WebviewWindow) {
     }
 }
 
-#[tauri::command]
+/// `(async)` for the same reason as `profile_open`: building a window from a
+/// synchronous command deadlocks on Windows.
+#[tauri::command(async)]
 fn procmon_open_window(app: AppHandle) -> Result<(), String> {
+    on_main_thread(&app, procmon_open_window_main)
+}
+
+fn procmon_open_window_main(app: &AppHandle) -> Result<(), String> {
     use tauri::Manager;
     if let Some(win) = app.get_webview_window(PROCMON_WINDOW) {
         let _ = win.unminimize();
@@ -9071,7 +9400,7 @@ fn procmon_open_window(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
     let win = tauri::WebviewWindowBuilder::new(
-        &app,
+        app,
         PROCMON_WINDOW,
         // Its own Vite entry (activity.html), NOT index.html: the monitor's
         // webview must not load xterm / WebGL / CodeMirror to draw a table.
@@ -9079,7 +9408,8 @@ fn procmon_open_window(app: AppHandle) -> Result<(), String> {
     )
     .title("Activity")
     .inner_size(880.0, 620.0)
-    .min_inner_size(560.0, 320.0)
+    .min_inner_size(560.0, 320.0);
+    let win = without_browser_accelerators(win)
     .build()
     .map_err(|e| e.to_string())?;
     // Remember WHERE the monitor was, never how big. The window-state plugin
@@ -9143,226 +9473,63 @@ pub(crate) fn stop_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     // Counts every matching slot, including any without a child_pid, so the
     // reported number keeps matching kill_task_ptys. Only the ones with a pid
     // can be signalled.
-    let victims: Vec<Option<u32>> = {
+    let victims: Vec<(Option<u32>, PtyWriter)> = {
         let map = manager.inner.lock();
         map.iter()
             .filter(|(_, slot)| slot.task_id.as_deref() == Some(task_id))
-            .map(|(_, slot)| slot.child_pid)
+            .map(|(_, slot)| (slot.child_pid, slot.writer.clone()))
             .collect()
     };
     let count = victims.len();
-    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
+    graceful_then_kill(&victims);
     count
 }
 
-// ───────────────────── process kill / liveness ───────────────────────
-// The platform split for everything that used to call kill(2) directly.
-
-/// What a kill wants to happen to the target. Unix has both; Windows has
-/// only the hard stop (TerminateProcess, or a tree kill via taskkill /T),
-/// where `Term` collapses to `Kill` - there is no polite signal to send.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcSignal {
-    /// SIGTERM: ask the process to exit.
-    Term,
-    /// SIGKILL: the kernel takes it down now.
-    Kill,
-}
-
-/// Put `src` (a live repo checkout, a shared config dir, a shared memory
-/// file) at `link` inside a worktree. Unix: a symlink. Windows: a
-/// junction for directories (symlink_dir needs privileges a junction
-/// does not) and a hardlink for files, falling back to a copy across
-/// volumes - a copy stops propagating edits, which the shared-memory
-/// callers tolerate rather than fail the whole worktree over.
-pub(crate) fn make_link(src: &Path, link: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(src, link)
-    }
-    #[cfg(windows)]
-    {
-        if src.is_dir() {
-            win_junction(src, link)
-        } else {
-            std::fs::hard_link(src, link)
-                .or_else(|_| std::fs::copy(src, link).map(|_| ()))
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (src, link);
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no link support"))
-    }
-}
-
-/// Directory junction (the no-privilege Windows directory link), through
-/// `cmd /C mklink /J`. Paths are canonicalized so cmd sees backslashes,
-/// then the `\\?\` prefix is stripped (cmd does not accept it on the
-/// link side).
-#[cfg(windows)]
-fn win_junction(target: &Path, link: &Path) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let deunc = |p: &Path| {
-        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let s = c.to_string_lossy().to_string();
-        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
-    };
-    let link = deunc(link);
-    let target = deunc(target);
-    // Tokens as SEPARATE args, not one script string: cmd /C strips
-    // quotes in batches, and a single quoted script arg makes mklink see
-    // mangled paths ("the filename syntax is incorrect").
-    let st = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&link)
-        .arg(&target)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()?;
-    if st.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("mklink /J {} failed", link.display()),
-        ))
-    }
-}
-
-/// Pid as stored by the various registries: PTY slots keep u32
-/// (child_pid), the script/grep/LSP maps keep i32 (pgid). A private
-/// conversion keeps every call site cast-free.
-trait ToPid {
-    fn to_pid(self) -> u32;
-}
-impl ToPid for u32 {
-    fn to_pid(self) -> u32 {
-        self
-    }
-}
-impl ToPid for i32 {
-    fn to_pid(self) -> u32 {
-        self.max(0) as u32
-    }
-}
-
-/// Kill a process by pid; with `group`, the whole process GROUP on Unix
-/// (a negated pid) / the whole process TREE on Windows (taskkill /T).
-/// Best-effort: reports whether the signal was delivered.
-pub(crate) fn proc_kill(pid: impl ToPid, group: bool, sig: ProcSignal) -> bool {
-    let pid = pid.to_pid();
-    #[cfg(unix)]
-    {
-        let sig = match sig {
-            ProcSignal::Term => libc::SIGTERM,
-            ProcSignal::Kill => libc::SIGKILL,
-        };
-        let target = if group { -(pid as i32) } else { pid as i32 };
-        // SAFETY: kill(2) is async-signal-safe and the pid is an i32.
-        unsafe { libc::kill(target, sig) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        if group {
-            // No process groups on Windows; taskkill takes the tree,
-            // which is the property every `group` call site wants (the
-            // children must not outlive the leader).
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        } else {
-            terminate_pid(pid)
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (pid, group, sig);
-        false
-    }
-}
-
-/// Liveness probe without signalling (`kill(pid, 0)` on Unix).
-pub(crate) fn proc_alive(pid: impl ToPid) -> bool {
-    let pid = pid.to_pid();
-    #[cfg(unix)]
-    {
-        // A pid the waiter has already reaped fails with ESRCH, which is
-        // the exit the caller is waiting for.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        // SAFETY: OpenProcess on a pid we do not own fails with
-        // ACCESS_DENIED, which reads as "not ours / not alive" - the
-        // fail-closed direction for a liveness check on our own children.
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) as HANDLE;
-            if h.is_null() {
-                return false;
-            }
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(h, &mut code);
-            CloseHandle(h);
-            ok != 0 && code == STILL_ACTIVE as u32
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-/// Hard-stop a single process (Windows single-target half of proc_kill).
-#[cfg(windows)]
-fn terminate_pid(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
-    // SAFETY: OpenProcess may fail (gone or not ours) -> false;
-    // TerminateProcess is the documented hard stop, handle closed below.
-    unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let ok = TerminateProcess(h, 1);
-        CloseHandle(h);
-        ok != 0
-    }
-}
+/// The shared writer half of a PTY slot.
+type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// SIGTERM, wait for exit up to STOP_GRACE, SIGKILL the remainder.
 /// Split out so both the task-tagged and the role-tagged sweeps share it.
-fn graceful_then_kill(pids: &[u32]) {
+///
+/// Windows has no SIGTERM for a console program. The graceful step there is
+/// Ctrl+C typed into the pseudoconsole, which ConPTY delivers to the agent as
+/// a console Ctrl+C: the same thing a user interrupting it does. Written on
+/// its own thread per PTY, because a terminal whose program stopped reading
+/// blocks the write, and a stuck write must not hold up the kill below.
+fn graceful_then_kill(victims: &[(Option<u32>, PtyWriter)]) {
+    let pids: Vec<u32> = victims.iter().filter_map(|(p, _)| *p).collect();
     if pids.is_empty() {
         return;
     }
-    for &pid in pids {
-        proc_kill(pid, false, ProcSignal::Term);
+    if cfg!(windows) {
+        for (pid, writer) in victims {
+            if pid.is_none() {
+                continue;
+            }
+            let writer = writer.clone();
+            std::thread::spawn(move || {
+                let mut w = writer.lock();
+                let _ = w.write_all(b"\x03");
+                let _ = w.flush();
+            });
+        }
+    } else {
+        for &pid in &pids {
+            proc_ctl::signal_pid(pid as i32, proc_ctl::Sig::Term);
+        }
     }
     // `kill(pid, 0)` probes liveness without signalling. A pid the waiter has
     // already reaped fails with ESRCH, which is the exit we are waiting for.
+    let alive = |pid: u32| proc_ctl::pid_alive(pid as i32);
     let deadline = std::time::Instant::now() + STOP_GRACE;
     while std::time::Instant::now() < deadline {
-        if !pids.iter().any(|&p| proc_alive(p)) {
+        if !pids.iter().any(|&p| alive(p)) {
             return;
         }
         std::thread::sleep(STOP_POLL);
     }
-    for &pid in pids.iter().filter(|&&p| proc_alive(p)) {
-        proc_kill(pid, false, ProcSignal::Kill);
+    for &pid in pids.iter().filter(|&&p| alive(p)) {
+        proc_ctl::signal_pid(pid as i32, proc_ctl::Sig::Kill);
     }
 }
 
@@ -9375,19 +9542,36 @@ fn graceful_then_kill(pids: &[u32]) {
 /// undefined state the agent kill exists to prevent. Kept separate from the
 /// task-tagged sweep because `task_set_sandbox` reuses that one, and a
 /// sandbox edit has no business killing the user's scratch shell.
+/// A PTY of `task_id` that `stop_task_ptys` does not reach: no `task_id`
+/// of its own (that doubles as the sandbox trigger, so only agents carry
+/// it), but a CLI role or an Activity `owner` naming the task. The owner
+/// matters: a main-panel shell or a run tab has no CLI role (only agents
+/// are addressable), and the provenance tag is the one thing every tab
+/// sets. Matching the role alone left a terminal tab's shell alive in an
+/// archived worktree.
+fn is_untagged_task_pty(
+    slot_task: Option<&str>,
+    role: Option<&PtyRole>,
+    owner: Option<&PtyOwner>,
+    task_id: &str,
+) -> bool {
+    slot_task.is_none()
+        && (role.is_some_and(|r| r.task_id == task_id)
+            || owner.and_then(|o| o.task_id.as_deref()) == Some(task_id))
+}
+
 pub(crate) fn stop_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize {
-    let victims: Vec<Option<u32>> = {
+    let victims: Vec<(Option<u32>, PtyWriter)> = {
         let map = manager.inner.lock();
         map.values()
-            .filter(|slot| {
-                slot.task_id.is_none()
-                    && slot.role.as_ref().is_some_and(|r| r.task_id == task_id)
-            })
-            .map(|slot| slot.child_pid)
+            .filter(|slot| is_untagged_task_pty(
+                slot.task_id.as_deref(), slot.role.as_ref(), slot.owner.as_ref(), task_id,
+            ))
+            .map(|slot| (slot.child_pid, slot.writer.clone()))
             .collect()
     };
     let count = victims.len();
-    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
+    graceful_then_kill(&victims);
     count
 }
 
@@ -9412,7 +9596,7 @@ pub(crate) fn stop_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize 
 ///
 /// Returns how many PTYs were live when we started.
 pub(crate) fn stop_tab_ptys(manager: &PtyManager, task_id: &str, tab_id: &str) -> usize {
-    let victims: Vec<Option<u32>> = {
+    let victims: Vec<(Option<u32>, PtyWriter)> = {
         let map = manager.inner.lock();
         map.values()
             .filter(|slot| {
@@ -9420,11 +9604,11 @@ pub(crate) fn stop_tab_ptys(manager: &PtyManager, task_id: &str, tab_id: &str) -
                     r.task_id == task_id && r.tab_id.as_deref() == Some(tab_id)
                 })
             })
-            .map(|slot| slot.child_pid)
+            .map(|slot| (slot.child_pid, slot.writer.clone()))
             .collect()
     };
     let count = victims.len();
-    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
+    graceful_then_kill(&victims);
     count
 }
 
@@ -9504,11 +9688,41 @@ fn task_set_agent_session_id(id: String, cli: String, uuid: String) -> Result<()
 /// the prior synchronous version, that froze the entire Mac through the
 /// blocked main webview event loop. `spawn_blocking` parks the work on a
 /// background thread so the UI keeps painting and the OS stays responsive.
+///
+/// The task's PTYs are stopped first, as the CLI's `archive` does
+/// (`stop_every_task_pty`). The UI used to leave that to the panes
+/// unmounting after the refetch, which is harmless on unix (a process may
+/// sit in a deleted directory) and fatal on Windows: a working directory
+/// that is open cannot be deleted (os error 32), and the archive failed.
 #[tauri::command]
-async fn task_archive(id: String, delete_branch: Option<bool>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || task_archive_sync(id, delete_branch.unwrap_or(false)))
+async fn task_archive(state: State<'_, PtyManager>, id: String, delete_branch: Option<bool>) -> Result<(), String> {
+    let ptys = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_every_task_pty(&ptys, &id);
+        task_archive_sync(id, delete_branch.unwrap_or(false))
+    })
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Stop everything running for a task before its worktree goes: the agent
+/// PTYs (`task_id`) AND the shell, run and command tabs, which carry the
+/// task only in their CLI role or their Activity `owner`, because `task_id`
+/// doubles as the sandbox trigger.
+/// Stopping only the first kind left a terminal tab's shell sitting in the
+/// worktree, which Windows then refused to delete. Graceful, then forced
+/// (see `stop_task_ptys`), so an agent gets to flush its transcript. Blocks
+/// for the grace period: call it off the async runtime.
+pub(crate) fn stop_every_task_pty(manager: &PtyManager, task_id: &str) -> usize {
+    stop_task_ptys(manager, task_id) + stop_task_role_ptys(manager, task_id)
+}
+
+/// Whether `branch` is a local branch of `repo`. Archive deletes the task's
+/// branch only if it is still there: the goal is "that branch is gone", and
+/// one that already is (deleted by hand, or never created because the
+/// worktree add failed) must not turn a finished archive into an error.
+fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    git(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], repo).is_ok()
 }
 
 /// Remove `dir` only when it holds no VISIBLE entries. This is a NON-recursive
@@ -9559,13 +9773,19 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
     // polling thread will keep trying to sync a worktree that no longer exists.
     spotlight_stop_for_ws(&id);
 
+    let mut list = load_tasks_all();
+    let w = list.iter_mut().find(|w| w.id == id).ok_or("task not found")?;
+
     // Remove any Docker containers for this task (non-fatal). `--rm`
     // handles the clean-exit case; this covers crashes / kills where it
     // never fired, before we tear down the worktree the container mounts.
-    docker::cleanup_task(&id);
-
-    let mut list = load_tasks_all();
-    let w = list.iter_mut().find(|w| w.id == id).ok_or("task not found")?;
+    // Only for a task that is on Docker: turning Docker off already reaps
+    // its containers (task_set_docker), and asking the daemon about every
+    // other task stalled each archive for as long as a slow or paused Docker
+    // Desktop took to answer (minutes, on a machine where it was asleep).
+    if w.docker_sandbox_enabled {
+        docker::cleanup_task(&id);
+    }
     let proj = load_projects_all().into_iter().find(|p| p.id == w.project_id);
 
     // Kill any running setup/run scripts for this task BEFORE doing
@@ -9581,8 +9801,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
         };
         for k in keys {
             if let Some(pid) = running_scripts_remove(&k) {
-                proc_kill(pid, true, ProcSignal::Term);
-            }
+                proc_ctl::signal_group(pid, proc_ctl::Sig::Term);}
         }
     }
 
@@ -9644,7 +9863,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
             if !meta.file_type().is_symlink() { continue; }
             let target = fs::read_link(&link).ok().map(|p| p.to_string_lossy().into_owned());
             if target.as_deref() != Some(m.path.as_str()) { continue; }
-            if let Err(e) = fs::remove_file(&link) {
+            if let Err(e) = fs_link::remove_link(&link) {
                 errs.push(format!("rm symlink {}: {e}", m.dir_name));
             }
         }
@@ -9671,7 +9890,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
                     // symlinks on Unix.
                     let link = Path::new(&w.path).join(&m.dir_name);
                     if link.symlink_metadata().is_ok() {
-                        if let Err(e) = fs::remove_file(&link) {
+                        if let Err(e) = fs_link::remove_link(&link) {
                             errs.push(format!("rm symlink {}: {e}", m.dir_name));
                         }
                     }
@@ -9685,21 +9904,27 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
                     } else {
                         all_projects.iter().find(|p| p.id == m.project_id).map(|mp| mp.root_path.clone())
                     };
-                    if let Some(repo_path) = repo_path {
+                    let mut member_git_err: Option<String> = None;
+                    if let Some(repo_path) = &repo_path {
                         if let Err(e) = git(&["worktree", "remove", "--force", &m.path], Path::new(&repo_path)) {
-                            errs.push(format!("worktree remove {}: {e}", m.dir_name));
+                            member_git_err = Some(format!("worktree remove {}: {e}", m.dir_name));
                         }
-                        if delete_branch && !m.branch.is_empty() {
+                        if delete_branch && !m.branch.is_empty() && local_branch_exists(Path::new(&repo_path), &m.branch) {
                             if let Err(e) = git(&["branch", "-D", &m.branch], Path::new(&repo_path)) {
                                 errs.push(format!("branch delete {}: {e}", m.dir_name));
                             }
                         }
                     }
                     if Path::new(&m.path).exists() {
-                        if let Err(e) = fs::remove_dir_all(&m.path) {
+                        if let Err(e) = fs_link::remove_dir_all_settled(Path::new(&m.path)) {
+                            errs.extend(member_git_err.take());
                             errs.push(format!("rm member dir {}: {e}", m.dir_name));
+                        } else if let Some(repo_path) = &repo_path {
+                            let _ = git(&["worktree", "prune"], Path::new(repo_path));
+                            member_git_err = None;
                         }
                     }
+                    errs.extend(member_git_err);
                 }
             }
         }
@@ -9708,12 +9933,25 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
     // Non-git host (issue #4): the wrapper is a plain dir we mkdir'd, not
     // a git worktree, so skip the git teardown — `fs::remove_dir_all`
     // below cleans it up. (Member worktrees were already removed above.)
+    // A failed `git worktree remove` only counts if the directory is still
+    // there afterwards: on Windows it fails while a just-killed process still
+    // holds the tree, and the patient delete below finishes the job.
+    let mut git_remove_err: Option<String> = None;
     if let Some(p) = &proj {
         if !p.non_git {
             if let Err(e) = git(&["worktree", "remove", "--force", &w.path], Path::new(&p.root_path)) {
-                errs.push(format!("worktree remove: {e}"));
+                // What git believes versus what is on disk: a remove that
+                // says "is not a working tree" is otherwise undiagnosable.
+                dlog(&format!(
+                    "[archive] worktree remove {} failed: {e}\n  git worktree list: {}\n  .git pointer: {:?}",
+                    w.path,
+                    git(&["worktree", "list", "--porcelain"], Path::new(&p.root_path))
+                        .unwrap_or_default().replace('\n', " | "),
+                    fs::read_to_string(Path::new(&w.path).join(".git")).ok(),
+                ));
+                git_remove_err = Some(format!("worktree remove: {e}"));
             }
-            if delete_branch && !w.branch.is_empty() {
+            if delete_branch && !w.branch.is_empty() && local_branch_exists(Path::new(&p.root_path), &w.branch) {
                 if let Err(e) = git(&["branch", "-D", &w.branch], Path::new(&p.root_path)) {
                     errs.push(format!("branch delete failed: {e}"));
                 }
@@ -9721,10 +9959,18 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
         }
     }
     if Path::new(&w.path).exists() {
-        if let Err(e) = fs::remove_dir_all(&w.path) {
+        if let Err(e) = fs_link::remove_dir_all_settled(Path::new(&w.path)) {
+            errs.extend(git_remove_err.take());
             errs.push(format!("rm worktree dir: {e}"));
+        } else if let Some(p) = proj.as_ref().filter(|p| !p.non_git) {
+            // Git's own remove failed but the directory is gone now: drop
+            // git's record of it too, or the branch stays "checked out" there,
+            // and the failure no longer counts.
+            let _ = git(&["worktree", "prune"], Path::new(&p.root_path));
+            git_remove_err = None;
         }
     }
+    errs.extend(git_remove_err);
     // Tidy up now-empty ancestors (the project folder, then the legacy
     // `workspaces/` root once its last task is gone). Best-effort, empty-only.
     prune_empty_worktree_ancestors(Path::new(&w.path));
@@ -9736,12 +9982,27 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn task_delete(id: String) -> Result<(), String> {
+async fn task_delete(state: State<'_, PtyManager>, id: String) -> Result<(), String> {
     // Hard delete: archive (off-thread) then wipe the json. Same async
-    // discipline as task_archive — see its doc comment for why.
+    // discipline as task_archive — see its doc comment for why, and for
+    // the PTY stop.
+    let ptys = state.inner().clone();
     let id2 = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = task_archive_sync(id2.clone(), false);
+        stop_every_task_pty(&ptys, &id2);
+        // An archived task whose worktree is already gone (every row the
+        // History page empties) has nothing left to tear down. Archiving it
+        // again ran its archive script a second time and walked git's
+        // teardown for a worktree that no longer exists, per task, one after
+        // another: emptying a long History took longer than the page waits.
+        let torn_down = load_tasks_all().iter()
+            .find(|w| w.id == id2)
+            // A main checkout's path is the repo itself and stays; archiving
+            // it only unlinked members, which are gone already.
+            .is_some_and(|w| w.archived && (w.is_main_checkout || !Path::new(&w.path).exists()));
+        if !torn_down {
+            let _ = task_archive_sync(id2.clone(), false);
+        }
         delete_task_file(&id2).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?
 }
@@ -9866,8 +10127,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                 let key_target = common_gitdir.as_ref().unwrap().join("git-crypt");
                 let key_link  = wt_gitdir.join("git-crypt");
                 if !key_link.exists() {
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&key_target, &key_link)
+                    fs_link::symlink_any(&key_target, &key_link)
                         .map_err(|e| format!("git-crypt setup: symlink: {e}"))?;
                 }
                 git(&["reset", "--hard", "HEAD"], &wt_path)
@@ -9899,7 +10159,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                 if src.exists() {
                     let dst = wt_path.join(shared);
                     if !dst.exists() {
-                        let _ = make_link(&src, &dst);
+                        let _ = fs_link::symlink_any(&src, &dst);
                     }
                 }
             }
@@ -9936,7 +10196,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                     // Recreate symlink: <wrapper>/<dir_name> → m.path
                     let link = wt_path.join(&m.dir_name);
                     if !link.exists() {
-                        let _ = make_link(Path::new(&m.path), &link);
+                        let _ = fs_link::symlink_any(&m.path, &link);
                     }
                 }
                 MemberMode::Worktree => {
@@ -10117,7 +10377,7 @@ pub(crate) fn task_diff_inner(id: String) -> Result<TaskDiffSummary, String> {
         // `git diff --no-index /dev/null <file>` renders the whole file as
         // added; it exits 1 whenever the files differ (always, here), so run it
         // directly and accept the non-zero status the git() helper would reject.
-        let out = Command::new("git")
+        let out = git_command()
             .args(["--no-pager", "diff", "--no-index", "--", "/dev/null", rel])
             .current_dir(&wt)
             .env("PATH", shell_env::resolved_path())
@@ -10237,7 +10497,7 @@ pub(crate) fn task_send_diff_to_main_inner(id: &str) -> Result<SendDiffResult, S
         // between base and the working tree — exactly the union of
         // commits + staged + unstaged. --binary preserves binary blobs.
         let base = w.base_branch.clone();
-        let patch_out = std::process::Command::new("git")
+        let patch_out = git_command()
             .args(["--no-pager", "diff", "--binary", &base])
             .current_dir(&worktree)
             .output()
@@ -10263,7 +10523,7 @@ pub(crate) fn task_send_diff_to_main_inner(id: &str) -> Result<SendDiffResult, S
             // LC_ALL=C: git's messages are gettext-translated and the
             // conflict detection below string-matches stderr; without
             // the pin a de_DE user gets exit 1 instead of the pinned 10.
-            let mut child = std::process::Command::new("git")
+            let mut child = git_command()
                 .args(["apply", "--3way", "--whitespace=nowarn", "-"])
                 .env("LC_ALL", "C")
                 .current_dir(&main)
@@ -12521,12 +12781,12 @@ fn reject_escaping_segments(rel: &str) -> Result<PathBuf, String> {
 fn safe_task_path(ws_path: &Path, rel: &str) -> Result<PathBuf, String> {
     let pb = reject_escaping_segments(rel)?;
     let target = ws_path.join(&pb);
-    let canon_base = fs::canonicalize(ws_path)
+    let canon_base = dunce::canonicalize(ws_path)
         .map_err(|e| format!("{}: {e}", ws_path.display()))?;
     // Name the path in every error. These strings surface in the file tree and
     // in bug reports (GH #250), where "No such file or directory" on its own
     // says nothing about WHICH path went missing.
-    let canon_target = fs::canonicalize(&target)
+    let canon_target = dunce::canonicalize(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
     if !canon_target.starts_with(&canon_base) {
         // A symlink out of the task is the usual way to land here, and where it
@@ -12586,7 +12846,7 @@ fn safe_task_read_path_in(project_root: Option<&Path>, base: &Path, rel: &str) -
         return Err(strict);
     }
     let Some(root) = project_root else { return Err(strict) };
-    let (Ok(canon_root), Ok(target)) = (fs::canonicalize(root), fs::canonicalize(base.join(&pb)))
+    let (Ok(canon_root), Ok(target)) = (dunce::canonicalize(root), dunce::canonicalize(base.join(&pb)))
     else {
         return Err(strict);
     };
@@ -12625,8 +12885,8 @@ struct PathStat {
 fn check_task_path_existence(ws_path: &Path, rel: &str) -> Result<PathStat, String> {
     let pb = reject_escaping_segments(rel)?;
     let target = ws_path.join(&pb);
-    let canon_base = fs::canonicalize(ws_path).map_err(|e| e.to_string())?;
-    if let Ok(canon) = fs::canonicalize(&target) {
+    let canon_base = dunce::canonicalize(ws_path).map_err(|e| e.to_string())?;
+    if let Ok(canon) = dunce::canonicalize(&target) {
         if !canon.starts_with(&canon_base) {
             return Err(format!("path escapes task: {rel}"));
         }
@@ -12640,7 +12900,7 @@ fn check_task_path_existence(ws_path: &Path, rel: &str) -> Result<PathStat, Stri
             _ => break, // exhausted ancestors without finding one that exists (shouldn't happen: ws_path itself always exists)
         }
         if probe.exists() {
-            let canon = fs::canonicalize(probe).map_err(|e| e.to_string())?;
+            let canon = dunce::canonicalize(probe).map_err(|e| e.to_string())?;
             if !canon.starts_with(&canon_base) {
                 return Err(format!("path escapes task: {rel}"));
             }
@@ -12715,7 +12975,7 @@ fn read_capped_file(abs: &Path, cap: u64) -> Result<Vec<u8>, String> {
 pub fn attachments_dir() -> PathBuf {
     let raw = std::env::temp_dir().join("termic-attachments");
     let _ = std::fs::create_dir_all(&raw);
-    std::fs::canonicalize(&raw).unwrap_or(raw)
+    dunce::canonicalize(&raw).unwrap_or(raw)
 }
 
 /// Where an image pasted into a terminal is written. See `attachments_dir`
@@ -13340,7 +13600,7 @@ fn safe_task_path_for_create(ws_path: &Path, rel: &str) -> Result<PathBuf, Strin
     if pb.as_os_str().is_empty() {
         return Err("empty path".into());
     }
-    let canon_base = fs::canonicalize(ws_path).map_err(|e| format!("{}: {e}", ws_path.display()))?;
+    let canon_base = dunce::canonicalize(ws_path).map_err(|e| format!("{}: {e}", ws_path.display()))?;
     // Longest existing prefix of `pb`, walking from the full path backwards.
     let comps: Vec<_> = pb.components().collect();
     for split in (0..=comps.len()).rev() {
@@ -13349,7 +13609,7 @@ fn safe_task_path_for_create(ws_path: &Path, rel: &str) -> Result<PathBuf, Strin
         if !probe.exists() {
             continue;
         }
-        let canon_head = fs::canonicalize(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
+        let canon_head = dunce::canonicalize(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
         if !canon_head.starts_with(&canon_base) {
             return Err(format!("path escapes task: {rel} -> {}", canon_head.display()));
         }
@@ -13549,7 +13809,7 @@ async fn scratch_promote_target_exists(task_id: String, rel_path: String) -> Res
 fn task_path_rename(id: String, path: String, new_name: String) -> Result<String, String> {
     let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let trimmed = new_name.trim();
-    if trimmed.is_empty() || trimmed.contains('/') || trimmed == "." || trimmed == ".." {
+    if !is_plain_name(trimmed) {
         return Err(format!("invalid name: {new_name:?}"));
     }
     let (cwd, rel) = resolve_task_git_path(&w, &path)?;
@@ -13599,7 +13859,7 @@ fn task_reveal_path(id: String, path: String) -> Result<(), String> {
     let abs = safe_task_path(&cwd, &rel)?;
     let target = abs.to_string_lossy().into_owned();
     let (program, args) = reveal_command(std::env::consts::OS, &target);
-    Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+    crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -13949,11 +14209,11 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
         })
     };
     let canon_target = if rel.is_empty() {
-        fs::canonicalize(&base).map_err(|e| format!("{}: {e}", base.display()))?
+        dunce::canonicalize(&base).map_err(|e| format!("{}: {e}", base.display()))?
     } else if let Some((member, remainder)) = &member_hit {
         let mp = PathBuf::from(&member.path);
         if remainder.is_empty() {
-            fs::canonicalize(&mp).map_err(|e| format!("{}: {e}", mp.display()))?
+            dunce::canonicalize(&mp).map_err(|e| format!("{}: {e}", mp.display()))?
         } else {
             safe_task_path(&mp, remainder)?
         }
@@ -14026,7 +14286,7 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
         let present: HashSet<String> = out.iter().map(|e| e.name.clone()).collect();
         for m in &w.composition {
             if m.mode != MemberMode::RepoRoot { continue; }
-            if m.dir_name.is_empty() || m.dir_name.contains('/') { continue; }
+            if !is_plain_name(&m.dir_name) { continue; }
             if present.contains(&m.dir_name) { continue; }
             // Absent from the listing. Only relink when the slot is truly
             // empty (never clobber real user content sharing the name) and
@@ -14035,7 +14295,7 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
             if target.symlink_metadata().is_ok() { continue; }
             let src = member_repo_path(m);
             if src.is_empty() || !Path::new(&src).exists() { continue; }
-            match make_link(Path::new(&src), &target) {
+            match fs_link::symlink_any(&src, &target) {
                 Ok(()) => out.push(FileEntry { name: m.dir_name.clone(), is_dir: true }),
                 Err(e) => eprintln!("heal member link {} → {src} failed: {e}", target.display()),
             }
@@ -14065,7 +14325,7 @@ async fn task_list_files_for_finder(id: String) -> Result<Vec<String>, String> {
         // globs (same ones the file tree uses) so a hidden path doesn't leak
         // back in via ⌘P. A repo that won't list just contributes nothing.
         let ls = |dir: &str, prefix: &str, patterns: &[glob::Pattern]| -> Vec<String> {
-            match std::process::Command::new("git")
+            match git_command()
                 .args(["ls-files", "--cached", "--others", "--exclude-standard"])
                 .current_dir(dir)
                 .output()
@@ -14122,7 +14382,7 @@ async fn task_match_ignored_files(id: String, clicked: String) -> Result<Vec<Str
         }
         let mut matches: Vec<String> = Vec::new();
         let mut scan = |dir: &str, prefix: &str, patterns: &[glob::Pattern]| {
-            if let Ok(o) = std::process::Command::new("git")
+            if let Ok(o) = git_command()
                 .args(["ls-files", "--cached", "--others"])
                 .current_dir(dir)
                 .output()
@@ -14254,7 +14514,15 @@ fn slugify(s: &str) -> String {
             prev_dash = false;
         }
     }
-    out.trim_matches('-').to_string()
+    let out = out.trim_matches('-').to_string();
+    // Windows cannot create a directory with a reserved device name, and the
+    // slug is a worktree directory. On every OS, so a task named on a Mac
+    // still checks out on a teammate's Windows machine. Mirrored in utils.ts.
+    let reserved = matches!(out.as_str(), "con" | "prn" | "aux" | "nul")
+        || (out.len() == 4
+            && (out.starts_with("com") || out.starts_with("lpt"))
+            && matches!(out.as_bytes()[3], b'1'..=b'9'));
+    if reserved { format!("{out}-1") } else { out }
 }
 
 /// Recursively copy a file or directory. `fs::copy` ONLY handles files, so
@@ -14344,7 +14612,7 @@ fn copy_file_or_dir_walk(src: &Path, dst: &Path, try_clone: bool) -> std::io::Re
             if let Ok(target) = fs::read_link(src) {
                 if let Some(parent) = dst.parent() { let _ = fs::create_dir_all(parent); }
                 let _ = fs::remove_file(dst); // overwrite if present
-                return std::os::unix::fs::symlink(target, dst);
+                return fs_link::symlink_any(target, dst);
             }
         }
         return Ok(());
@@ -14458,7 +14726,7 @@ fn run_script(script: &str, cwd: &Path, port: u16, name: &str, extra: &[NamedPor
     // missing — GUI launch starts from a bare launchd env. Without this,
     // `bun`/`nvm`/etc. are "command not found" in setup/run scripts even
     // though they work in a terminal (#16), and `$EDITOR` is wrong (#17).
-    let mut cmd = Command::new("bash");
+    let mut cmd = crate::proc_ctl::command(shell_env::script_bash());
     let (path, inject) = shell_env::spawn_env();
     cmd.arg("-lc").arg(script).current_dir(cwd)
         .env("PATH", path)
@@ -14505,7 +14773,7 @@ fn run_script_streaming(
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     thread::spawn(move || {
-        let mut cmd = Command::new("bash");
+        let mut cmd = crate::proc_ctl::command(shell_env::script_bash());
         let (setup_path, setup_inject) = shell_env::spawn_env();
         cmd.arg("-lc")
             .arg(&script)
@@ -14754,18 +15022,10 @@ fn lsp_user_section(settings: &serde_json::Value, section: &str) -> serde_json::
 fn lsp_config_for(item: &serde_json::Value, root: &Path) -> serde_json::Value {
     let section = item.get("section").and_then(|s| s.as_str()).unwrap_or("");
     let venv = root.join(".venv");
-    // A venv's interpreter lives in bin/ on Unix and Scripts/python.exe on
-    // Windows; probe both spellings so a Windows checkout's venv is
-    // detected exactly the same way.
-    let interpreter = [
-        venv.join("bin").join("python"),
-        venv.join("Scripts").join("python.exe"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file());
+    let interpreter = venv.join("bin").join("python");
     match section {
-        "python" if interpreter.is_some() => serde_json::json!({
-            "pythonPath": interpreter.as_ref().unwrap().to_string_lossy(),
+        "python" if interpreter.is_file() => serde_json::json!({
+            "pythonPath": interpreter.to_string_lossy(),
             "venvPath": root.to_string_lossy(),
             "venv": ".venv",
         }),
@@ -14776,10 +15036,10 @@ fn lsp_config_for(item: &serde_json::Value, root: &Path) -> serde_json::Value {
         // to be confusing when it is wrong — a project whose stubs are
         // installed in a venv ty is not looking at reports errors about
         // packages that ARE installed.
-        "ty" if interpreter.is_some() => serde_json::json!({
+        "ty" if interpreter.is_file() => serde_json::json!({
             "environment": { "python": venv.to_string_lossy() },
         }),
-        "python.analysis" if interpreter.is_some() => serde_json::json!({
+        "python.analysis" if interpreter.is_file() => serde_json::json!({
             // Only what is needed to find the environment. Everything else is
             // the server's own default, deliberately: a client that invents
             // analysis settings is a client that argues with the project's
@@ -14839,8 +15099,28 @@ fn lsp_patch_initialize(body: &str, root: &Path) -> String {
 /// `file://` URI for an absolute path. Percent-encodes what a path can hold
 /// and a URI cannot; deliberately minimal rather than a dependency.
 fn lsp_path_to_uri(p: &Path) -> String {
+    lsp_path_to_uri_for(&p.to_string_lossy(), cfg!(windows))
+}
+
+/// `lsp_path_to_uri` with the platform injected, so the Windows form is
+/// tested everywhere. Windows: `C:\Users\u\x` -> `file:///C:/Users/u/x`
+/// (the standard form: a leading slash, forward slashes, the drive colon
+/// unencoded). Mirrored byte for byte by `pathToFileUri` (lib/osPath.ts).
+fn lsp_path_to_uri_for(path: &str, windows: bool) -> String {
     let mut out = String::from("file://");
-    for b in p.to_string_lossy().as_bytes() {
+    let mut owned;
+    let mut p: &str = path;
+    if windows {
+        owned = p.strip_prefix(r"\\?\").unwrap_or(p).replace('\\', "/");
+        let b = owned.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            out.push('/');
+            out.push_str(&owned[..2]);
+            owned = owned[2..].to_string();
+        }
+        p = &owned;
+    }
+    for b in p.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*b as char)
@@ -15048,6 +15328,69 @@ fn lsp_install_spec(language: &str) -> Option<LspInstall> {
             sha256: "a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901",
             bytes: 14_834_607, archive: "gz", exe_in_archive: "", args: &[],
         },
+        // Windows. Digests are the publishers' own (the GitHub release asset
+        // digest, HashiCorp's SHA256SUMS), and each archive was opened to
+        // confirm the executable's path inside it.
+        ("terraform", "windows", "x86_64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_windows_amd64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_windows_amd64.zip",
+            sha256: "6edc885fe113f6a7fd049622ed0bd255141e68c84acc2fce1bb6a54c1f47bfe1",
+            bytes: 31_165_056, archive: "zip", exe_in_archive: "terraform-ls.exe", args: &["serve"],
+        },
+        ("terraform", "windows", "aarch64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_windows_arm64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_windows_arm64.zip",
+            sha256: "4701a880e6cf441a7b24bb9a0bd5f156fdbcd35aee5fa6663c3f08e85f2234fd",
+            bytes: 30_360_959, archive: "zip", exe_in_archive: "terraform-ls.exe", args: &["serve"],
+        },
+        ("typescript", "windows", "x86_64") => LspInstall {
+            label: "TypeScript 7", version: "7.0.2",
+            repo: "microsoft/typescript", asset: "typescript-win32-x64.tgz",
+            url: "https://github.com/microsoft/typescript/releases/download/v7.0.2/typescript-win32-x64.tgz",
+            sha256: "61fc4e141d2bc687db580e71bbfa63b9c209f0310645d82ca1b457eb3a24fd19",
+            bytes: 9_776_626, archive: "tar.gz", exe_in_archive: "package/lib/tsc.exe",
+            args: &["--lsp", "--stdio"],
+        },
+        ("typescript", "windows", "aarch64") => LspInstall {
+            label: "TypeScript 7", version: "7.0.2",
+            repo: "microsoft/typescript", asset: "typescript-win32-arm64.tgz",
+            url: "https://github.com/microsoft/typescript/releases/download/v7.0.2/typescript-win32-arm64.tgz",
+            sha256: "0a73534e6ee50cdbb2a29ac48657ca0ad13cf0f424cf63808e4df7baeb87b8be",
+            bytes: 8_900_840, archive: "tar.gz", exe_in_archive: "package/lib/tsc.exe",
+            args: &["--lsp", "--stdio"],
+        },
+        ("python", "windows", "x86_64") => LspInstall {
+            label: "ty", version: "0.0.73",
+            repo: "astral-sh/ty", asset: "ty-x86_64-pc-windows-msvc.zip",
+            url: "https://github.com/astral-sh/ty/releases/download/0.0.73/ty-x86_64-pc-windows-msvc.zip",
+            sha256: "774f39828acec8dd77755503efc1986862bb276104d8251cdad953c0874c7d7f",
+            bytes: 11_897_438, archive: "zip", exe_in_archive: "ty.exe",
+            args: &["server"],
+        },
+        ("python", "windows", "aarch64") => LspInstall {
+            label: "ty", version: "0.0.73",
+            repo: "astral-sh/ty", asset: "ty-aarch64-pc-windows-msvc.zip",
+            url: "https://github.com/astral-sh/ty/releases/download/0.0.73/ty-aarch64-pc-windows-msvc.zip",
+            sha256: "ef992fa568eb5d4b342edf4d5cfcaca0e0e6e7fa29cbb937a6c12fbc5dfe674e",
+            bytes: 11_589_456, archive: "zip", exe_in_archive: "ty.exe",
+            args: &["server"],
+        },
+        ("rust", "windows", "x86_64") => LspInstall {
+            label: "rust-analyzer", version: "2026-08-17.4",
+            repo: "rust-lang/rust-analyzer", asset: "rust-analyzer-x86_64-pc-windows-msvc.zip",
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-pc-windows-msvc.zip",
+            sha256: "3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2",
+            bytes: 17_452_536, archive: "zip", exe_in_archive: "rust-analyzer.exe", args: &[],
+        },
+        ("rust", "windows", "aarch64") => LspInstall {
+            label: "rust-analyzer", version: "2026-08-17.4",
+            repo: "rust-lang/rust-analyzer", asset: "rust-analyzer-aarch64-pc-windows-msvc.zip",
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-pc-windows-msvc.zip",
+            sha256: "604562665e30aed593ec87397bfa157b4601e2d72f3a01bb8b32776302c179f2",
+            bytes: 15_618_764, archive: "zip", exe_in_archive: "rust-analyzer.exe", args: &[],
+        },
         _ => return None,
     })
 }
@@ -15192,7 +15535,7 @@ static LSP_PROBE_CACHE: std::sync::Mutex<Option<HashMap<String, bool>>> =
     std::sync::Mutex::new(None);
 
 fn lsp_candidate_runs_uncached(exe: &str, probe: &[&str]) -> bool {
-    Command::new(exe)
+    crate::proc_ctl::command(exe)
         .args(probe)
         .env("PATH", shell_env::resolved_path())
         .stdin(std::process::Stdio::null())
@@ -15232,19 +15575,19 @@ fn lsp_resolve_server_preferring(
             let exe = parts.remove(0);
             // A bare name goes through PATH; a path (absolute or ./relative)
             // is taken as given, so a script inside the repo works.
-            let resolved = if exe.contains('/') {
+            let is_path = exe.contains('/') || (cfg!(windows) && exe.contains('\\'));
+            let resolved = if is_path {
                 // `./x` and `x` name the same file; keeping the dot would put
                 // it in the spawned process's argv[0] and in every error
                 // message about it.
-                let rel = exe.strip_prefix("./").unwrap_or(&exe);
-                let p = if exe.starts_with('/') { PathBuf::from(&exe) } else { root.join(rel) };
+                let rel = exe.strip_prefix("./").or_else(|| exe.strip_prefix(".\\")).unwrap_or(&exe);
+                // `has_root`, not `is_absolute`: on Windows `/usr/bin/x` has
+                // no drive, so it is not absolute, and joining it onto the
+                // checkout silently swapped in the checkout's drive.
+                let p = if Path::new(&exe).has_root() { PathBuf::from(&exe) } else { root.join(rel) };
                 p.to_string_lossy().to_string()
             } else {
-                shell_env::resolved_path()
-                    .split(':')
-                    .filter(|d| !d.is_empty())
-                    .map(|d| Path::new(d).join(&exe))
-                    .find(|p| p.is_file())
+                shell_env::which(&exe)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or(exe)
             };
@@ -15291,58 +15634,38 @@ fn split_command_line(line: &str) -> Vec<String> {
 }
 
 /// Resolve ONE named candidate, or nothing. Split out so the preference and
-/// Probe `<dir>/<exe>` across the resolved PATH, plus the `.exe` spelling
-/// on Windows (where the PATH separator is `;`, not `:`).
-fn path_probe(exe: &str) -> Option<String> {
-    let path_env = shell_env::resolved_path();
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    for dir in path_env.split(sep).filter(|d| !d.is_empty()) {
-        let cand = Path::new(dir).join(exe);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().to_string());
-        }
-        #[cfg(windows)]
-        {
-            let cand = Path::new(dir).join(format!("{exe}.exe"));
-            if cand.is_file() {
-                return Some(cand.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
+/// A server executable inside the checkout, `rel` written in its unix layout
+/// (`.venv/bin/ty`, `node_modules/.bin/tsgo`). On Windows a venv keeps its
+/// executables in `Scripts\` and they carry `.exe`, and npm writes a `.cmd`
+/// next to an extensionless POSIX shell shim that `is_file()` would accept
+/// and CreateProcess cannot run: resolve through PATHEXT instead.
+fn lsp_local_exe(root: &Path, rel: &str) -> Option<String> {
+    lsp_local_exe_for(root, rel, cfg!(windows))
 }
 
-/// Probe a repo-local tool path, tolerating the Windows layouts: npm's
-/// `.bin` shims carry an `.exe`/`.cmd` suffix, and a venv keeps its tools
-/// in `.venv/Scripts/<tool>.exe` instead of `.venv/bin/<tool>`. The unix
-/// spelling is probed first everywhere.
-fn local_tool(root: &Path, rel: &str) -> Option<String> {
-    let probe = |p: PathBuf| p.is_file().then(|| p.to_string_lossy().to_string());
-    if let Some(hit) = probe(root.join(rel)) {
-        return Some(hit);
+fn lsp_local_exe_for(root: &Path, rel: &str, windows: bool) -> Option<String> {
+    if !windows {
+        let cand = root.join(rel);
+        return cand.is_file().then(|| cand.to_string_lossy().to_string());
     }
-    #[cfg(windows)]
-    if let Some((dir, name)) = rel.rsplit_once('/') {
-        if let Some(hit) = probe(root.join(dir).join(format!("{name}.exe"))) {
-            return Some(hit);
-        }
-        if let Some(hit) = probe(root.join(dir).join(format!("{name}.cmd"))) {
-            return Some(hit);
-        }
-        // `.venv/bin/<tool>` -> `.venv/Scripts/<tool>.exe`.
-        if let Some(scripts) = dir.strip_suffix("bin").map(|d| format!("{d}Scripts")) {
-            if let Some(hit) = probe(root.join(scripts).join(format!("{name}.exe"))) {
-                return Some(hit);
-            }
-        }
-    }
-    None
+    let rel = rel.replacen(".venv/bin/", ".venv/Scripts/", 1);
+    let rel_path = Path::new(&rel);
+    let dir = root.join(rel_path.parent().unwrap_or(Path::new("")));
+    let name = rel_path.file_name()?.to_string_lossy().into_owned();
+    shell_env::exe_candidates_with(&name, &std::env::var("PATHEXT").unwrap_or_default())
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// the default order cannot drift: both go through the same probes.
 fn lsp_resolve_named(root: &Path, language: &str, name: &str) -> Option<(String, Vec<String>)> {
-    let on_path = |exe: &str| path_probe(exe);
-    let local = |rel: &str| local_tool(root, rel);
+    let path_env = shell_env::resolved_path();
+    let on_path = |exe: &str| -> Option<String> {
+        shell_env::which_in(exe, &path_env).map(|p| p.to_string_lossy().to_string())
+    };
+    let local = |rel: &str| -> Option<String> { lsp_local_exe(root, rel) };
     match (language, name) {
         ("python", "zuban") => local(".venv/bin/zuban")
             .or_else(|| on_path("zuban"))
@@ -15377,8 +15700,11 @@ fn lsp_resolve_named(root: &Path, language: &str, name: &str) -> Option<(String,
 }
 
 fn lsp_resolve_server(root: &Path, language: &str) -> Option<(String, Vec<String>)> {
-    let on_path = |exe: &str| path_probe(exe);
-    let local = |rel: &str| local_tool(root, rel);
+    let path_env = shell_env::resolved_path();
+    let on_path = |exe: &str| -> Option<String> {
+        shell_env::which_in(exe, &path_env).map(|p| p.to_string_lossy().to_string())
+    };
+    let local = |rel: &str| -> Option<String> { lsp_local_exe(root, rel) };
 
     let from_toolchain = match language {
         // TypeScript 7 is a native Go binary (`tsgo`), no Node runtime at all.
@@ -15509,7 +15835,7 @@ fn lsp_resolve_server(root: &Path, language: &str) -> Option<(String, Vec<String
 /// `rustup which` prints a path even when it is not, so the caller still has
 /// to check that it runs.
 fn rustup_rust_analyzer() -> Option<String> {
-    let out = Command::new("rustup")
+    let out = crate::proc_ctl::command("rustup")
         .args(["which", "rust-analyzer"])
         .env("PATH", shell_env::resolved_path())
         .output()
@@ -15656,8 +15982,6 @@ async fn lsp_install_version(
         let _ = fs::remove_dir_all(&staging);
         return Err(format!("{} {} did not contain {exe_rel}", spec.label, asset.version));
     }
-    // Executable bits are a Unix concept; a staged .exe on Windows is
-    // already executable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -15671,7 +15995,7 @@ async fn lsp_install_version(
     // and pnpm do.
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("/usr/bin/xattr")
+        let _ = crate::proc_ctl::command("/usr/bin/xattr")
             .args(["-dr", "com.apple.quarantine"])
             .arg(&staging)
             .status();
@@ -15814,7 +16138,7 @@ async fn lsp_install_zuban() -> Result<String, String> {
         let (path, inject) = shell_env::spawn_env();
 
         let run = |program: &str, args: &[&str]| -> Result<(), String> {
-            let mut cmd = Command::new(program);
+            let mut cmd = crate::proc_ctl::command(program);
             cmd.args(args).env("PATH", &path);
             for (k, v) in &inject {
                 // Not the index. `PIP_INDEX_URL` / `UV_INDEX_URL` out of the
@@ -15839,10 +16163,7 @@ async fn lsp_install_zuban() -> Result<String, String> {
         };
 
         let venv = dir.to_string_lossy().to_string();
-        let uv = shell_env::resolved_path()
-            .split(':')
-            .map(|d| PathBuf::from(d).join("uv"))
-            .find(|p| p.is_file());
+        let uv = shell_env::which("uv");
         // PINNED, and wheels only.
         //
         // The rest of this installer verifies a digest before anything is
@@ -15888,11 +16209,7 @@ async fn lsp_install_zuban() -> Result<String, String> {
 #[tauri::command]
 async fn lsp_catalog() -> Vec<LspCatalogEntry> {
     fn seek(exe: &str) -> Option<String> {
-        shell_env::resolved_path()
-            .split(':')
-            .map(|dir| PathBuf::from(dir).join(exe))
-            .find(|p| p.is_file())
-            .map(|p| p.to_string_lossy().to_string())
+        shell_env::which(exe).map(|p| p.to_string_lossy().to_string())
     }
     fn downloadable(language: &str) -> (Option<String>, Option<String>) {
         let installed = lsp_installed_exe(language).map(|(exe, _)| exe);
@@ -16389,8 +16706,7 @@ async fn lsp_start(
     custom: Option<String>,
 ) -> Result<String, String> {
     use std::io::{BufReader, Read as _};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
+    use crate::proc_ctl::CommandProcExt as _;
     use std::process::Stdio;
 
     let root_path = PathBuf::from(&root);
@@ -16416,7 +16732,7 @@ async fn lsp_start(
         .filter(|v| !matches!(v, serde_json::Value::Object(m) if m.is_empty()))
         .unwrap_or(serde_json::Value::Null);
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = crate::proc_ctl::command(&exe);
     // PATH and the toolchain pointers, NOT the user's secrets.
     //
     // `spawn_env` returns the login-shell delta, which is how an agent CLI gets
@@ -16449,12 +16765,8 @@ async fn lsp_start(
         .env("PATH", path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Own process group so the stop path can signal the whole tree
-    // (language servers fork cargo/node). Windows has no process groups;
-    // the tree kill in proc_kill covers the same cleanup.
-    #[cfg(unix)]
-    cmd.process_group(0);
+        .stderr(Stdio::piped())
+        .new_group();
     for (k, v) in inject {
         cmd.env(k, v);
     }
@@ -16618,7 +16930,7 @@ async fn lsp_start(
         }
         // Signal the GROUP: language servers fork (cargo check, node) and
         // signalling the leader alone leaves the children behind.
-        proc_kill(pid, true, ProcSignal::Term);
+        proc_ctl::signal_group(pid, proc_ctl::Sig::Term);
         let _ = child.wait();
     });
 
@@ -16662,8 +16974,7 @@ async fn lsp_stop(id: String) -> Result<(), String> {
         g.as_mut().and_then(|m| m.remove(&id))
     };
     if let Some(s) = server {
-        proc_kill(s.pid, true, ProcSignal::Term);
-    }
+        proc_ctl::signal_group(s.pid, proc_ctl::Sig::Term);}
     Ok(())
 }
 
@@ -16716,7 +17027,7 @@ fn reap_foreign_servers(page: &str) -> usize {
         ));
         // The GROUP: these fork (node, cargo check), and signalling the leader
         // alone leaves the children behind, which is the leak twice over.
-        proc_kill(s.pid, true, ProcSignal::Term);
+        proc_ctl::signal_group(s.pid, proc_ctl::Sig::Term);
     }
     orphans.len()
 }
@@ -16849,13 +17160,13 @@ fn spotlight_update_untracked(project_id: &str, untracked: Vec<String>) {
 /// changes (committed or uncommitted). Used by the polling thread to
 /// detect when a re-sync is needed.
 fn spotlight_state_hash(worktree: &Path) -> String {
-    let head = std::process::Command::new("git")
+    let head = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(worktree)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let status = std::process::Command::new("git")
+    let status = git_command()
         .args(["status", "--porcelain"])
         .current_dir(worktree)
         .output()
@@ -16896,7 +17207,7 @@ fn spotlight_apply(
 
     // Names of files that differ vs the base branch (for the log only).
     let name_list = |args: &[&str], cwd: &Path| -> Vec<String> {
-        std::process::Command::new("git").args(args).current_dir(cwd).output().ok()
+        git_command().args(args).current_dir(cwd).output().ok()
             .map(|o| String::from_utf8_lossy(&o.stdout)
                 .lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
             .unwrap_or_default()
@@ -16905,7 +17216,7 @@ fn spotlight_apply(
         &["--no-pager", "diff", "--name-only", &format!("{base}..HEAD")], worktree);
 
     // Uncommitted diff (staged + unstaged on top of HEAD) — binary-safe patch.
-    let uncommitted = std::process::Command::new("git")
+    let uncommitted = git_command()
         .args(["--no-pager", "diff", "--binary", "HEAD"])
         .current_dir(worktree)
         .output()
@@ -16924,7 +17235,7 @@ fn spotlight_apply(
     // 1. Detached checkout of the worktree's commit. --force is safe: the
     //    caller guarantees the repo root is clean before the first apply,
     //    and re-syncs always revert to the original ref first.
-    let out = std::process::Command::new("git")
+    let out = git_command()
         .args(["checkout", "--detach", "--force", &wt_head])
         .current_dir(main)
         .output()
@@ -16937,7 +17248,7 @@ fn spotlight_apply(
     // 2. Apply uncommitted diff as working-tree changes (not staged, no --3way:
     //    HEAD now matches the worktree's committed state so it applies cleanly).
     if has_uncommitted {
-        let mut child = std::process::Command::new("git")
+        let mut child = git_command()
             .args(["apply", "--whitespace=nowarn", "-"])
             .current_dir(main)
             .stdin(std::process::Stdio::piped())
@@ -16985,7 +17296,7 @@ fn spotlight_apply(
 /// and remove any untracked files we copied in. Because spotlight never
 /// moved a branch, this just moves HEAD back — no history is rewritten.
 fn spotlight_revert(main: &Path, original_ref: &str, applied_untracked: &[String]) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = git_command()
         .args(["checkout", "--force", original_ref])
         .current_dir(main)
         .output()
@@ -17011,8 +17322,7 @@ fn spotlight_kill_run(ws_id: &str) {
     // Host run scripts use map key "{ws_id}::run" (empty member component).
     let key = format!("{ws_id}::run");
     if let Some(pid) = running_scripts_remove(&key) {
-        proc_kill(pid, true, ProcSignal::Term);
-    }
+        proc_ctl::signal_group(pid, proc_ctl::Sig::Term);}
 }
 
 /// Stop spotlight for a task without requiring an AppHandle (called
@@ -17324,8 +17634,7 @@ fn task_run_script_stream(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
+    use crate::proc_ctl::CommandProcExt as _;
     use std::process::Stdio;
 
     // Port lock spans load -> top-up -> save only; dropped before the
@@ -17445,15 +17754,14 @@ fn task_run_script_stream(
         // key maps to neither pid tiny; running_scripts_finish's pid check
         // covers the old waiter racing us.
         if let Some(prev) = running_scripts_remove(&map_key_o) {
-            proc_kill(prev, true, ProcSignal::Term);
-            for _ in 0..50 {
-                if !proc_alive(prev) { break; }
+            proc_ctl::signal_group(prev, proc_ctl::Sig::Term);for _ in 0..50 {
+                if !proc_ctl::group_alive(prev) { break; }
                 thread::sleep(std::time::Duration::from_millis(100));
             }
         }
         // `process_group(0)` puts the child in its own group so we can kill
         // the whole tree later via `kill(-pgid, SIGTERM)`.
-        let mut cmd = Command::new("bash");
+        let mut cmd = crate::proc_ctl::command(shell_env::script_bash());
         let (run_path, run_inject) = shell_env::spawn_env();
         cmd.arg("-lc").arg(&script)
             .current_dir(&cwd)
@@ -17479,11 +17787,8 @@ fn task_run_script_stream(
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "UTF-8")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Own process group so the stop path can kill the whole tree;
-        // see the LSP spawn for the Windows note.
-        #[cfg(unix)]
-        cmd.process_group(0);
+            .stderr(Stdio::piped())
+            .new_group();
         for (k, v) in run_inject {
             cmd.env(k, v);
         }
@@ -17544,8 +17849,7 @@ fn task_stop_script(id: String, kind: String, member: Option<String>) -> Result<
     let member_dir = member.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let map_key = format!("{id}:{}:{kind}", member_dir.unwrap_or_default());
     if let Some(pid) = running_scripts_remove(&map_key) {
-        proc_kill(pid, true, ProcSignal::Term);
-    }
+        proc_ctl::signal_group(pid, proc_ctl::Sig::Term);}
     Ok(())
 }
 
@@ -17576,28 +17880,7 @@ impl FindBackend {
 /// instead of shelling out to `which` because this runs on the search
 /// path and a process spawn is the expensive part of the probe.
 fn find_on_path(bin: &str, path: &str) -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.split(':')
-            .filter(|d| !d.is_empty())
-            .map(|d| Path::new(d).join(bin))
-            .find(|p| {
-                fs::metadata(p)
-                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        // No exec bits on Windows: CreateProcess resolves `bin` to
-        // `bin.exe` itself (PATHEXT is a shell layer, not a kernel one),
-        // so probe both spellings and accept any plain file.
-        std::env::split_paths(path)
-            .filter(|d| !d.as_os_str().is_empty())
-            .flat_map(|d| [d.join(format!("{bin}.exe")), d.join(bin)])
-            .find(|p| p.is_file())
-    }
+    shell_env::which_in(bin, path)
 }
 
 /// Resolve the backend, memoizing only an answer that can't get better.
@@ -17788,8 +18071,7 @@ fn task_grep_start(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
+    use crate::proc_ctl::CommandProcExt as _;
     use std::process::Stdio;
 
     let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no such task")?;
@@ -17817,8 +18099,7 @@ fn task_grep_start(
     // search_id each keystroke and ignores late events from stale ids,
     // but we still want to free the CPU cycles ASAP.
     if let Some(prev) = running_greps_swap(&id, None) {
-        proc_kill(prev, true, ProcSignal::Kill);
-    }
+        proc_ctl::signal_group(prev, proc_ctl::Sig::Kill);}
 
     let app_o = app.clone();
     let ws_id_o = id.clone();
@@ -17835,7 +18116,7 @@ fn task_grep_start(
             // can't quietly change what termic finds. Binary files and
             // .gitignore are handled by rg's defaults.
             FindBackend::Ripgrep(bin) => {
-                let mut c = std::process::Command::new(bin);
+                let mut c = crate::proc_ctl::command(bin);
                 c.args(["--json", "--no-config", "--hidden", "--glob", "!.git/"]);
                 if !opts.regex { c.arg("-F"); }
                 c.arg(if opts.case_sensitive { "-s" } else { "-i" });
@@ -17847,7 +18128,7 @@ fn task_grep_start(
             // --untracked --exclude-standard include new files but
             // respect .gitignore.
             FindBackend::GitGrep => {
-                let mut c = std::process::Command::new("git");
+                let mut c = git_command();
                 c.args([
                     "grep",
                     "-n", "--column", "-I",
@@ -17862,12 +18143,9 @@ fn task_grep_start(
         };
         cmd.current_dir(rcwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        // Own process group so cancel can kill the tree (see the LSP
-        // spawn for the Windows note).
-        #[cfg(unix)]
-        cmd.process_group(0);
-        cmd.spawn()
+            .stderr(Stdio::null())
+            .new_group()
+            .spawn()
     };
 
     thread::spawn(move || {
@@ -17944,8 +18222,7 @@ fn task_grep_start(
                     }
                     if count >= RESULT_CAP {
                         truncated = true;
-                        proc_kill(pid, true, ProcSignal::Kill);
-                        break;
+                        proc_ctl::signal_group(pid, proc_ctl::Sig::Kill);break;
                     }
                 }
                 flush_batch(&app_o, &emit_out, &mut batch);
@@ -17981,8 +18258,7 @@ fn task_grep_start(
 #[tauri::command]
 fn task_grep_cancel(id: String) -> Result<(), String> {
     if let Some(prev) = running_greps_swap(&id, None) {
-        proc_kill(prev, true, ProcSignal::Kill);
-    }
+        proc_ctl::signal_group(prev, proc_ctl::Sig::Kill);}
     Ok(())
 }
 
@@ -18133,6 +18409,12 @@ fn default_shell() -> String {
     shell_env::login_shell()
 }
 
+/// The shell for command tabs (see `commandShell` in lib/loginShell.ts).
+#[tauri::command]
+fn script_shell() -> String {
+    shell_env::script_bash().to_string_lossy().into_owned()
+}
+
 #[tauri::command]
 fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
@@ -18192,12 +18474,17 @@ async fn install_notification_sound(app: AppHandle, resource: String, file_name:
 
 #[tauri::command]
 fn notify(title: String, body: String) {
+    // osascript is macOS-only; elsewhere notifications go through
+    // tauri-plugin-notification from the webview (ipc.ts), not this.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let script = format!(
         r#"display notification "{b}" with title "{t}" sound name "Glass""#,
         b = body.replace('"', "'"),
         t = title.replace('"', "'"),
     );
-    let _ = Command::new("osascript").arg("-e").arg(&script).status();
+    let _ = crate::proc_ctl::command("osascript").arg("-e").arg(&script).status();
 }
 
 /// Resolve a macOS sound NAME to a playable file, mirroring the OS's own
@@ -18210,7 +18497,7 @@ fn resolve_completion_sound_path(name: &str) -> Option<std::path::PathBuf> {
     // selected system alert sound (the closest queryable analog to the
     // default notification sound), falling back to a stock sound.
     if name.is_empty() || name == "NSUserNotificationDefaultSoundName" {
-        if let Ok(out) = Command::new("defaults")
+        if let Ok(out) = crate::proc_ctl::command("defaults")
             .args(["read", "-g", "com.apple.sound.beep.sound"])
             .output()
         {
@@ -18257,7 +18544,7 @@ async fn play_completion_sound(name: String) {
     {
         if let Some(path) = resolve_completion_sound_path(&name) {
             std::thread::spawn(move || {
-                let _ = Command::new("afplay").arg(&path).status();
+                let _ = crate::proc_ctl::command("afplay").arg(&path).status();
             });
         }
     }
@@ -18280,7 +18567,7 @@ fn open_path(path: String) -> Result<(), String> {
 /// one of. Now they cannot disagree.
 fn spawn_os_open(target: &str) -> Result<(), String> {
     let (program, args) = open_command(std::env::consts::OS, target);
-    Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+    crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -18292,7 +18579,7 @@ fn spawn_os_open(target: &str) -> Result<(), String> {
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
     let (program, args) = reveal_command(std::env::consts::OS, &path);
-    Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+    crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -18368,14 +18655,14 @@ fn open_file_external(path: String) -> Result<String, String> {
     {
         let os = std::env::consts::OS;
         let (program, args) = open_command(os, &path);
-        let status = Command::new(program).args(&args).status();
+        let status = crate::proc_ctl::command(program).args(&args).status();
         let spawned = status.is_ok();
         let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
         if after_open(os, spawned, exit_ok) == AfterOpen::Done {
             return Ok("opened".to_string());
         }
         let (program, args) = reveal_command(os, &path);
-        Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+        crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
         Ok("revealed".to_string())
     }
 }
@@ -18694,7 +18981,8 @@ fn resolve_external_app(candidate: &str) -> Option<String> {
     if candidate.starts_with('/') || candidate.starts_with('~') {
         return Path::new(candidate).exists().then(|| candidate.to_string());
     }
-    resolve_in_dirs(shell_env::resolved_path().split(':'), candidate)
+    let dirs = shell_env::path_dirs(&shell_env::resolved_path());
+    resolve_in_dirs(dirs.iter().filter_map(|d| d.to_str()), candidate)
 }
 
 /// The dir-list half of the lookup above, split out so a test can drive it
@@ -18898,7 +19186,7 @@ async fn open_with_app(key: String, task_id: String) -> Result<(), String> {
             // This path must also stay byte-identical to what the button did
             // before it became a picker.
             if app.key == FILE_MANAGER_KEY {
-                Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+                crate::proc_ctl::command(program).args(&args).status().map_err(|e| e.to_string())?;
                 return Ok(());
             }
 
@@ -19059,11 +19347,13 @@ fn browser_program_exists(program: &str) -> bool {
     };
     #[cfg(not(unix))]
     let is_exec = |p: &std::path::Path| p.is_file();
-    if program.contains('/') {
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
         return is_exec(std::path::Path::new(program));
     }
     let Some(paths) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&paths).any(|dir| is_exec(&dir.join(program)))
+    // exe_candidates: on Windows `msedge` is `msedge.exe` (PATHEXT).
+    let names = shell_env::exe_candidates(program);
+    std::env::split_paths(&paths).any(|dir| names.iter().any(|n| is_exec(&dir.join(n))))
 }
 
 /// Validate a browser command template for the Settings UI. `Ok(())` for an
@@ -19127,7 +19417,7 @@ fn run_browser_argv(argv: &[String]) -> BrowserLaunch {
     // second copy of this timing rule is exactly what `spawn_os_open`'s
     // comment warns about.
 
-    let mut child = match Command::new(&argv[0]).args(&argv[1..]).spawn() {
+    let mut child = match crate::proc_ctl::command(&argv[0]).args(&argv[1..]).spawn() {
         Ok(c) => c,
         Err(e) => return BrowserLaunch::Failed(format!("could not run `{}`: {e}", argv[0])),
     };
@@ -21028,7 +21318,8 @@ fn run_capture_command_blocking(
     agent_id: Option<&str>,
     docker: bool,
 ) -> Result<String, String> {
-    let mut c = std::process::Command::new("sh");
+    // Git Bash's own `bash` on Windows (see script_bash); `sh` elsewhere.
+    let mut c = crate::proc_ctl::command(if cfg!(windows) { shell_env::script_bash() } else { "sh".into() });
     // `-c`, not `-lc`: the login env is injected below, and re-sourcing the
     // profile chain on top of it would only re-strip PATH on some setups.
     c.args(["-c", cmd]).current_dir(cwd);
@@ -21089,7 +21380,7 @@ fn discovery_dismiss(window: tauri::Window, path: String, dismissed: bool) -> Re
     // symlinked or non-normalized input still lands on the same key. A deleted
     // repo can't canonicalize; fall back to the raw path so a stale entry is
     // still removable.
-    let canon = fs::canonicalize(&path)
+    let canon = dunce::canonicalize(&path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or(path);
     let mut s = load_settings_in(&window_profile(&window));
@@ -21364,7 +21655,7 @@ fn discover_repos_inner(
     let push_repo = |path: &PathBuf,
                      out: &mut Vec<(DiscoveredRepo, std::time::SystemTime)>,
                      seen: &mut std::collections::HashSet<String>| {
-        let canon = fs::canonicalize(path).unwrap_or(path.clone());
+        let canon = dunce::canonicalize(path).unwrap_or(path.clone());
         let path_str = canon.to_string_lossy().into_owned();
         if !seen.insert(path_str.clone()) { return; } // already discovered
         let name = canon.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string();
@@ -21536,13 +21827,10 @@ pub(crate) fn agent_binary_on_path(agents: &[Agent], id: &str) -> bool {
     if bin.is_empty() {
         return false;
     }
-    if bin.starts_with('/') {
+    if Path::new(bin).is_absolute() {
         return Path::new(bin).exists();
     }
-    shell_env::resolved_path()
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .any(|dir| Path::new(&format!("{dir}/{bin}")).exists())
+    shell_env::which(bin).is_some()
 }
 
 fn detect_clis_blocking() -> Vec<CliInfo> {
@@ -21569,7 +21857,7 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
 
             if bin.is_empty() {
                 // No command configured — nothing to probe.
-            } else if bin.starts_with('/') {
+            } else if Path::new(bin).is_absolute() {
                 // Absolute path (e.g. set via the welcome wizard's binary
                 // picker) — just check existence, no PATH lookup.
                 if Path::new(bin).exists() {
@@ -21587,13 +21875,9 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
                 // PATH), so a GUI-launched .app could relaunch forever and
                 // still miss a CLI that `command -v` finds instantly from a
                 // real terminal.
-                for dir in shell_env::resolved_path().split(':').filter(|d| !d.is_empty()) {
-                    let c = format!("{dir}/{bin}");
-                    if Path::new(&c).exists() {
-                        found = true;
-                        path = c;
-                        break;
-                    }
+                if let Some(c) = shell_env::which(&bin) {
+                    found = true;
+                    path = c.to_string_lossy().into_owned();
                 }
             }
 
@@ -21601,7 +21885,7 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
             // it (avoids PATH ambiguity); fall back to the bare command.
             let version = if found {
                 let cmd = if path.is_empty() { bin.to_string() } else { path.clone() };
-                Command::new(&cmd)
+                crate::proc_ctl::command(&cmd)
                     .arg("--version")
                     .output()
                     .ok()
@@ -22157,7 +22441,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 let app2 = app.clone();
                 let slug = slug.to_string();
                 leave_windowless(app);
-                tauri::async_runtime::spawn(async move {
+                tauri::async_runtime::spawn_blocking(move || {
                     let _ = profile_open(app2, slug);
                 });
                 return;
@@ -22382,10 +22666,14 @@ pub(crate) fn leave_windowless(app: &AppHandle) {
     // The zero→non-zero edge is also what repairs xterm's viewport scroller
     // (lib/xtermViewportSync).
     let _ = app.emit("termic://windowless", false);
-    // Restore every profile window that exists. They exist because the user
-    // opened them, so hiding all and restoring one would silently lose a
-    // profile the user had up.
-    let wins = profile_windows(app);
+    // Restore every profile window the user had up. They exist because the
+    // user opened them, so hiding all and restoring one would silently lose a
+    // profile. A root the user CLOSED stays closed (ROOT_PUT_AWAY), unless it
+    // is the only window there is.
+    let wins = shown_profile_windows(app);
+    if wins.iter().any(|w| w.label() == ProfileId::Root.window_label()) {
+        root_brought_back();
+    }
     for win in &wins {
         // Unminimize here, not at the call sites: the tray's "Show Termic" and
         // RunEvent::Reopen used to skip it while `raise` did it, so the three
@@ -22514,7 +22802,9 @@ fn percent_decode_loose(s: &str) -> String {
 /// The label of the most recently focused OPEN profile window.
 pub(crate) fn most_recent_profile_label(app: &AppHandle) -> String {
     let reg = profiles_registry();
-    let open = profile_windows(app);
+    // Shown ones: a root the user closed is still a window, and routing a
+    // link or a profile-less CLI call to it would reopen it uninvited.
+    let open = shown_profile_windows(app);
     let mut best: Option<(String, String)> = None;
     for p in &reg.profiles {
         let label = reg.id_for(&p.slug).window_label();
@@ -22541,6 +22831,7 @@ fn raise_task_window(app: &AppHandle, task_id: &str) {
         }
     }
     if let Some(win) = app.get_webview_window(&label) {
+        note_root_shown(&label);
         let _ = win.unminimize();
         let _ = win.show();
         focus_window_unless_e2e(&win);
@@ -22576,6 +22867,7 @@ pub(crate) fn queue_deep_link(app: &AppHandle, url: &str) {
             let _ = build_profile_window(app, &id);
         }
         if let Some(win) = app.get_webview_window(&target) {
+            note_root_shown(&target);
             let _ = win.unminimize();
             let _ = win.show();
             focus_window_unless_e2e(&win);
@@ -23002,6 +23294,7 @@ pub fn run() {
                 // says: the alternative is launching to no window at all.
                 if root_closed_at_quit {
                     dlog("[profiles] root was closed at quit; leaving it hidden");
+                    keep_root_closed_at_launch();
                 } else {
                     let _ = win.show();
                     SHOWN_ONCE.store(true, Ordering::SeqCst);
@@ -23100,6 +23393,7 @@ pub fn run() {
 
             task_reorder,
             task_group_join,
+            task_link_spawn,
             task_group_new,
             task_group_leave,
             task_group_update,
@@ -23123,7 +23417,7 @@ pub fn run() {
             pty_spawn, pty_write, pty_resize, pty_kill,
             procmon_start, procmon_sample, procmon_stop, procmon_signal, procmon_open_window,
             lsp_offer, lsp_catalog, lsp_install, lsp_install_zuban, lsp_check_update, lsp_update, lsp_start, lsp_send, lsp_stop, lsp_reap_foreign, lsp_list,
-            notify, open_path, reveal_path, open_file_external, open_with_apps, open_with_app, open_external_url, browser_command_check, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
+            notify, open_path, reveal_path, open_file_external, open_with_apps, open_with_app, open_external_url, browser_command_check, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, script_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
             settings_load, settings_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
             docker_check, docker_image_status, docker_get_dockerfile, docker_default_dockerfile, docker_set_dockerfile, docker_build_image, docker_agent_dirs, docker_command_preview,
             automation::automation_result,
@@ -23230,8 +23524,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = RUNNING_SCRIPTS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, pid) in map.drain() {
-                proc_kill(pid, true, ProcSignal::Kill);
-            }
+                proc_ctl::signal_group(pid, proc_ctl::Sig::Kill);}
         }
     }
     // Language servers (GH #174). SIGKILL the whole group: rust-analyzer
@@ -23241,8 +23534,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = LSP_SERVERS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, s) in map.drain() {
-                proc_kill(s.pid, true, ProcSignal::Kill);
-            }
+                proc_ctl::signal_group(s.pid, proc_ctl::Sig::Kill);}
         }
     }
     // Per-task in-flight greps — same deal, SIGKILL the pg.
@@ -23250,8 +23542,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = RUNNING_GREPS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, pid) in map.drain() {
-                proc_kill(pid, true, ProcSignal::Kill);
-            }
+                proc_ctl::signal_group(pid, proc_ctl::Sig::Kill);}
         }
     }
     // 2. PTY children (agent CLIs + scratch shells). PtyManager owns
@@ -23260,8 +23551,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut inner = mgr.inner.lock();
         for (_, slot) in inner.drain() {
             if let Some(pid) = slot.child_pid {
-                proc_kill(pid, false, ProcSignal::Kill);
-            }
+                proc_ctl::signal_pid(pid as i32, proc_ctl::Sig::Kill);}
         }
     }
 }
@@ -24089,6 +24379,48 @@ mod tests {
             crate::profiles::save_registry(data, &crate::profiles::Registry::default()).unwrap();
             assert!(!crate::root_window_stays_closed());
         });
+    }
+
+    #[test]
+    fn a_root_left_closed_at_launch_is_still_closed_at_the_next_launch() {
+        // `setup` builds the root window even when it keeps it hidden, and
+        // the build stamps `open_at_quit = true`. So a launch that correctly
+        // left main closed wrote "main was open", and the relaunch after an
+        // update brought it back next to the profile the user kept.
+        with_scratch_data_dir(|data| {
+            let mk = |slug: &str, open: bool| crate::profiles::Profile {
+                slug: slug.into(), name: slug.into(), accent: "blue".into(),
+                order: 0, last_focused_at: None, open_at_quit: open,
+            };
+            let reg = crate::profiles::Registry {
+                root_slug: Some("personal".into()),
+                profiles: vec![mk("personal", false), mk("work", true)],
+                ..Default::default()
+            };
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            // Launch 1, in setup's order: read, build (the stamp), settle.
+            assert!(crate::root_window_stays_closed());
+            crate::set_open_at_quit(&ProfileId::Root, true);
+            crate::keep_root_closed_at_launch();
+            crate::set_open_at_quit(&ProfileId::Slug("work".into()), true);
+
+            // Launch 2 (the update's relaunch) reads the same answer.
+            assert!(crate::root_window_stays_closed());
+            assert!(!crate::profiles_registry().get("personal").unwrap().open_at_quit);
+        });
+    }
+
+    #[test]
+    fn a_root_the_user_closed_stays_hidden_only_while_another_window_is_up() {
+        // Every "bring the UI back" path shows the profile windows; a closed
+        // root is one of them (hidden, never destroyed) and must not come
+        // back with the others. With nothing else to show it must, or the
+        // app is left with no window.
+        assert!(crate::root_stays_hidden(true, 1));
+        assert!(!crate::root_stays_hidden(true, 0));
+        assert!(!crate::root_stays_hidden(false, 1));
+        assert!(!crate::root_stays_hidden(false, 0));
     }
 
     #[test]
@@ -25022,10 +25354,8 @@ mod tests {
             std::fs::write(primary.join("settings.json"), "{}").unwrap();
             crate::build_account_farm(&primary, &dir, &["settings.json"]).unwrap();
             assert!(dir.join(crate::ACCOUNT_FARM_MARKER).exists(), "the farm ran");
-            // The shared entry resolves to the primary copy: a symlink on
-            // Unix, a hardlink on Windows (both are ONE file, edits on
-            // either side propagate).
-            assert!(dir.join("settings.json").exists(), "the shared entry resolves");
+            assert!(dir.join("settings.json").symlink_metadata().unwrap()
+                .file_type().is_symlink(), "the shared entry is a symlink");
             assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]),
                 "a furnished store with no credential is not a login");
 
@@ -25360,6 +25690,7 @@ mod tests {
         assert_eq!(reply["result"], serde_json::json!([null, null]));
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
     fn termics_own_zuban_is_the_last_resort_not_the_first() {
         // A project's own copy, then the user's, then termic's. Anything else
@@ -25367,13 +25698,9 @@ mod tests {
         // (Only the ORDER is asserted here; the install itself needs a network
         // and an interpreter, which `make lsp-smoke` covers.)
         let dir = tempfile::tempdir().unwrap();
-        let (venv_bin, tool_name) = if cfg!(windows) {
-            (dir.path().join(".venv/Scripts"), "zuban.exe")
-        } else {
-            (dir.path().join(".venv/bin"), "zuban")
-        };
+        let venv_bin = dir.path().join(".venv/bin");
         fs::create_dir_all(&venv_bin).unwrap();
-        let local_zuban = venv_bin.join(tool_name);
+        let local_zuban = venv_bin.join("zuban");
         fs::write(&local_zuban, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -25415,8 +25742,8 @@ mod tests {
         assert!(typescript_without_tsconfig(dir.path()).is_none());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn a_reload_kills_only_the_servers_the_old_page_started() {
         use std::os::unix::process::CommandExt as _;
         // Real children, in their own process groups, so the SIGTERM this
@@ -25540,6 +25867,13 @@ mod tests {
             ("mă-duc", "m-duc"),
             ("🚀 ship it", "ship-it"),
             ("日本語 heading", "heading"),
+            // Windows reserved device names cannot be directories.
+            ("CON", "con-1"),
+            ("nul", "nul-1"),
+            ("com1", "com1-1"),
+            ("lpt9", "lpt9-1"),
+            ("com10", "com10"),
+            ("console", "console"),
         ] {
             let got = slugify(input);
             assert_eq!(got, want, "slugify({input:?})");
@@ -25635,8 +25969,8 @@ mod tests {
         assert!(cpp_without_compile_commands(dir.path()).is_none());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn a_typed_command_beats_everything_termic_knows() {
         use std::os::unix::fs::PermissionsExt;
         // The escape hatch: a server termic does not ship (pylsp, jedi, a
@@ -25664,6 +25998,24 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_rooted_path_is_taken_as_given() {
+        // On Windows `/usr/bin/x` has no drive, so it is not `is_absolute`;
+        // joining it onto the checkout swapped in the checkout's drive.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, _) = lsp_resolve_server_preferring(
+            dir.path(), "python", None, Some("/opt/lsp/serve --stdio"),
+        ).unwrap();
+        assert_eq!(exe, "/opt/lsp/serve");
+        #[cfg(windows)]
+        {
+            let (exe, _) = lsp_resolve_server_preferring(
+                dir.path(), "python", None, Some(r".\tools\serve.exe"),
+            ).unwrap();
+            assert_eq!(Path::new(&exe), dir.path().join(r"tools\serve.exe"));
+        }
+    }
+
+    #[test]
     fn a_command_line_splits_without_a_shell() {
         // No `sh -c`: this string comes from a settings field, and a shell
         // would make every stray `;` or backtick executable.
@@ -25682,8 +26034,8 @@ mod tests {
         assert_eq!(split_command_line("x; rm -rf /"), vec!["x;", "rm", "-rf", "/"]);
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn a_picked_server_beats_the_default_order() {
         use std::os::unix::fs::PermissionsExt;
         // A checkout with BOTH zuban and ty in its virtualenv. The default
@@ -25706,8 +26058,8 @@ mod tests {
         assert_eq!(args, vec!["server".to_string()], "and it is spawned ty's way");
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn a_pick_that_resolves_to_nothing_falls_back_instead_of_failing() {
         use std::os::unix::fs::PermissionsExt;
         // A preference is a preference, not an assertion that the binary is
@@ -25736,7 +26088,9 @@ mod tests {
         // resolved from PATH under a different Ruby cannot see them.
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("bin")).unwrap();
-        let binstub = dir.path().join("bin/ruby-lsp");
+        // Windows runs the `.bat` beside a Bundler binstub, never the
+        // extensionless script itself.
+        let binstub = dir.path().join(if cfg!(windows) { "bin/ruby-lsp.bat" } else { "bin/ruby-lsp" });
         fs::write(&binstub, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -25744,10 +26098,11 @@ mod tests {
             fs::set_permissions(&binstub, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let (exe, args) = lsp_resolve_server(dir.path(), "ruby").expect("a ruby server");
-        assert_eq!(exe, binstub.to_string_lossy());
+        assert_eq!(Path::new(&exe), binstub.as_path());
         assert!(args.is_empty(), "ruby-lsp takes no arguments: {args:?}");
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
     fn a_project_setting_is_layered_over_termics_own_answer() {
         // The user's block wins, key by key, without erasing the interpreter
@@ -25755,14 +26110,9 @@ mod tests {
         // analyse against the wrong Python and report errors about packages
         // that ARE installed.
         let dir = tempfile::tempdir().unwrap();
-        // The interpreter spelling the platform's venv layout puts there.
-        let (bin, exe) = if cfg!(windows) {
-            (dir.path().join(".venv/Scripts"), "python.exe")
-        } else {
-            (dir.path().join(".venv/bin"), "python")
-        };
+        let bin = dir.path().join(".venv/bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join(exe), "").unwrap();
+        fs::write(bin.join("python"), "").unwrap();
         let user = serde_json::json!({
             "python": { "analysis": { "typeCheckingMode": "strict" } },
         });
@@ -25775,13 +26125,7 @@ mod tests {
                 .unwrap();
         let section = &reply["result"][0];
         assert_eq!(section["analysis"]["typeCheckingMode"], "strict");
-        let python_path = section["pythonPath"].as_str().unwrap().replace('\\', "/");
-        let expected = if cfg!(windows) {
-            ".venv/Scripts/python.exe"
-        } else {
-            ".venv/bin/python"
-        };
-        assert!(python_path.ends_with(expected), "{python_path}");
+        assert!(section["pythonPath"].as_str().unwrap().ends_with(".venv/bin/python"));
     }
 
     #[test]
@@ -25845,6 +26189,7 @@ mod tests {
         assert!(reply.get("error").is_none());
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
     fn python_gets_the_checkouts_interpreter_and_everything_else_gets_null() {
         // pyright and basedpyright find the interpreter through
@@ -25853,13 +26198,8 @@ mod tests {
         // third-party import is unresolved and the file fills with errors
         // about our handshake rather than about the code.
         let dir = tempdir().unwrap();
-        let (venv_dir, exe) = if cfg!(windows) {
-            (dir.path().join(".venv/Scripts"), "python.exe")
-        } else {
-            (dir.path().join(".venv/bin"), "python")
-        };
-        fs::create_dir_all(&venv_dir).unwrap();
-        fs::write(venv_dir.join(exe), "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(dir.path().join(".venv/bin")).unwrap();
+        fs::write(dir.path().join(".venv/bin/python"), "#!/bin/sh\n").unwrap();
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "workspace/configuration",
             "params": { "items": [ {"section": "python"}, {"section": "ty"}, {"section": "ruff"} ] },
@@ -25870,8 +26210,8 @@ mod tests {
         // Still one entry per requested item, in order: ty asserts on that.
         assert_eq!(items.len(), 3);
         assert_eq!(
-            items[0]["pythonPath"].as_str().unwrap().replace('\\', "/"),
-            venv_dir.join(exe).to_string_lossy().replace('\\', "/"),
+            items[0]["pythonPath"].as_str().unwrap(),
+            dir.path().join(".venv/bin/python").to_string_lossy(),
         );
         // ty takes the environment rather than inferring one, so a project
         // whose stubs live in the venv is analysed against that venv.
@@ -25989,7 +26329,7 @@ mod tests {
     fn terraform_uses_the_project_server_with_serve() {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
-        let local = dir.path().join("bin/terraform-ls");
+        let local = dir.path().join(if cfg!(windows) { "bin/terraform-ls.exe" } else { "bin/terraform-ls" });
         fs::write(&local, "#!/bin/sh\n").unwrap();
         let (exe, args) = lsp_resolve_server(dir.path(), "terraform").unwrap();
         assert_eq!(Path::new(&exe), local);
@@ -25998,7 +26338,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn every_pinned_server_names_a_digest_and_a_payload() {
         // A pin with an empty digest would download and run an unverified
         // binary against the user's source. The shape is checked here because
@@ -26045,8 +26384,8 @@ mod tests {
         assert!(lsp_unpack_zip(b"not a zip", &staging, "terraform-ls").is_err());
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
-    #[cfg(unix)]
     fn terraform_download_uses_the_tested_pin_without_a_release_api() {
         let spec = lsp_install_spec("terraform").unwrap();
         assert!(spec.repo.is_empty());
@@ -26121,8 +26460,8 @@ mod tests {
         assert!(lsp_resolve_server(dir.path(), "elvish").is_none());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn a_candidate_that_does_not_run_is_not_a_server() {
         // rust-analyzer on PATH is usually rustup's SHIM, which prints
         // "rust-analyzer is unavailable for the active toolchain" and exits 1
@@ -26153,6 +26492,7 @@ mod tests {
         assert!(lsp_candidate_runs(good.to_str().unwrap(), &["--version"]));
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
     fn the_checkouts_own_toolchain_wins_over_path() {
         // A repo pinning its own TypeScript must be the one driven, or
@@ -26160,11 +26500,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let bin = dir.path().join("node_modules/.bin");
         fs::create_dir_all(&bin).unwrap();
-        // npm ships an .exe shim on Windows.
-        let tool = if cfg!(windows) { "tsgo.exe" } else { "tsgo" };
-        fs::write(bin.join(tool), "#!/bin/sh\n").unwrap();
+        fs::write(bin.join("tsgo"), "#!/bin/sh\n").unwrap();
         let (exe, args) = lsp_resolve_server(dir.path(), "typescript").unwrap();
-        assert_eq!(exe, bin.join(tool).to_string_lossy());
+        assert_eq!(exe, bin.join("tsgo").to_string_lossy());
         assert_eq!(args, vec!["--lsp".to_string(), "--stdio".to_string()]);
     }
 
@@ -26223,8 +26561,8 @@ mod tests {
         assert_eq!(out, "ses_abc123");
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
-    #[cfg(unix)]
     fn capture_sees_the_login_shell_path() {
         // The regression: a CLI installed outside the launchd PATH (opencode
         // lands in ~/.opencode/bin, Homebrew in /opt/homebrew/bin) has to be
@@ -26439,8 +26777,8 @@ mod tests {
         assert!(parse_rg_json_line(ev).is_none());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn path_probe_only_accepts_an_executable_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -26477,8 +26815,8 @@ mod tests {
         assert!(backend_verdict_is_final(true, true));
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn path_probe_takes_the_first_hit_in_path_order() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -26813,7 +27151,7 @@ mod tests {
         let root = tempdir().unwrap();
         mkrepo(root.path(), "keep");
         mkrepo(root.path(), "hide");
-        let hide_canon = fs::canonicalize(root.path().join("hide"))
+        let hide_canon = dunce::canonicalize(root.path().join("hide"))
             .unwrap().to_string_lossy().into_owned();
         let dismissed: std::collections::HashSet<String> = [hide_canon].into();
         let repos = discover_repos_inner(root.path(), &Default::default(), &dismissed).unwrap();
@@ -26853,11 +27191,9 @@ mod tests {
         link_config_dir(repo.path(), wt.path(), ".claude");
 
         let linked = wt.path().join(".mcp.json");
-        // On Windows the file link is a hardlink and the dir link a
-        // junction; "resolves to the primary copy" is the shared property.
-        assert!(linked.exists());
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(fs::read_to_string(&linked).unwrap(), "{\"mcpServers\":{}}");
-        assert!(wt.path().join(".claude").exists());
+        assert!(wt.path().join(".claude").symlink_metadata().unwrap().file_type().is_symlink());
         // A name the repo lacks is a no-op, not an error or a broken link.
         link_config_dir(repo.path(), wt.path(), ".gemini");
         assert!(wt.path().join(".gemini").symlink_metadata().is_err());
@@ -27191,8 +27527,8 @@ mod tests {
         assert!(safe_task_path(dir.path(), "docs/../../outside.txt").is_err());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn safe_task_path_rejects_symlink_escape() {
         // A symlink INSIDE the worktree pointing OUTSIDE must fail the
         // canonicalized containment check (the markdown preview reads
@@ -27213,13 +27549,12 @@ mod tests {
     /// A repo with a gitignored `.claude/`, plus a worktree carrying the
     /// symlink `link_config_dir` creates into it. This is the exact shape a
     /// real task has, and the shape the strict check refused to read.
-    #[cfg(unix)]
     fn repo_with_linked_config() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempdir().unwrap();
         fs::create_dir_all(repo.path().join(".claude/agents")).unwrap();
         fs::write(repo.path().join(".claude/settings.json"), b"{}").unwrap();
         let wt = tempdir().unwrap();
-        std::os::unix::fs::symlink(
+        crate::fs_link::symlink_any(
             fs::canonicalize(repo.path().join(".claude")).unwrap(),
             wt.path().join(".claude"),
         )
@@ -27228,7 +27563,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn reads_through_the_config_symlink_termic_created() {
         let (repo, wt) = repo_with_linked_config();
         // The bug: we make this link because .claude is gitignored, then the
@@ -27237,15 +27571,15 @@ mod tests {
         assert!(safe_task_path(wt.path(), ".claude").is_err());
 
         let dir = safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude").unwrap();
-        assert_eq!(dir, fs::canonicalize(repo.path().join(".claude")).unwrap());
+        assert_eq!(dir, dunce::canonicalize(repo.path().join(".claude")).unwrap());
         // …and files under it, which is what the editor opens.
         let file = safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude/settings.json").unwrap();
         assert!(file.ends_with(".claude/settings.json"));
         assert!(safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude/agents").is_ok());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn still_refuses_a_link_that_leaves_the_project() {
         // The case the containment check exists for: a repo shipping a link to
         // something private. It resolves outside the PROJECT root, so widening
@@ -27266,8 +27600,8 @@ mod tests {
         assert!(safe_task_read_path_in(None, wt.path(), ".claude").is_err());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn only_a_link_at_the_task_root_is_relaxed() {
         // A symlink buried deep in the repo must not widen the check, even
         // when its target is inside the project: only the top-level dirs
@@ -27287,7 +27621,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn ordinary_paths_are_untouched() {
         // The relaxation is a FALLBACK: everything that resolved before still
         // resolves the same way, and the classic escapes stay rejected.
@@ -27310,15 +27643,15 @@ mod tests {
         fs::create_dir_all(ws.path().join("docs")).unwrap();
         // Existing folder, new file.
         let p = safe_task_path_for_create(ws.path(), "docs/notes.md").unwrap();
-        assert_eq!(p, fs::canonicalize(ws.path()).unwrap().join("docs/notes.md"));
+        assert_eq!(p, dunce::canonicalize(ws.path()).unwrap().join("docs/notes.md"));
         // Neither the folder nor the file exists yet: the picker lets you type
         // a new one, and promote mkdir -p's it.
         let p = safe_task_path_for_create(ws.path(), "a/b/c/notes.md").unwrap();
-        assert_eq!(p, fs::canonicalize(ws.path()).unwrap().join("a/b/c/notes.md"));
+        assert_eq!(p, dunce::canonicalize(ws.path()).unwrap().join("a/b/c/notes.md"));
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn safe_task_path_for_create_rejects_escapes_including_through_a_symlink() {
         let outside = tempdir().unwrap();
         let ws = tempdir().unwrap();
@@ -27344,7 +27677,6 @@ mod tests {
     // is standing up a real worktree to drive `task_archive_sync`, and what
     // actually needs pinning is the call site, not the deletion.
     #[test]
-    #[cfg(unix)]
     fn only_the_hard_delete_purges_scratchpads() {
         let src = include_str!("lib.rs");
         let calls: Vec<&str> = src
@@ -27414,9 +27746,8 @@ mod tests {
         // about WHICH path is missing (GH #250).
         let ws = tempdir().unwrap();
         let err = safe_task_path(ws.path(), "docs/gone").unwrap_err();
-        assert!(err.contains("docs/gone"), "{err}");
-        // ENOENT (os error 2) on Unix; the missing PARENT names
-        // ERROR_PATH_NOT_FOUND (os error 3) on Windows.
+        assert!(err.replace('\\', "/").contains("docs/gone"), "{err}");
+        // ENOENT is 2; Windows reports a missing PARENT as 3 (path not found).
         assert!(err.contains("os error 2") || err.contains("os error 3"), "{err}");
     }
 
@@ -27459,8 +27790,8 @@ mod tests {
         assert!(check_task_path_existence(dir.path(), "docs/../../outside.txt").is_err());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn check_task_path_existence_rejects_symlink_escape_for_existing_file() {
         let outside = tempdir().unwrap();
         fs::write(outside.path().join("secret.png"), b"x").unwrap();
@@ -27469,8 +27800,8 @@ mod tests {
         assert!(check_task_path_existence(ws.path(), "link.png").is_err());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn check_task_path_existence_rejects_symlink_escape_for_missing_leaf() {
         // A symlinked directory INSIDE the worktree pointing OUTSIDE must
         // still fail containment even though the LEAF file itself doesn't
@@ -27619,8 +27950,8 @@ mod tests {
         assert!(task_file_fp_for_task(&task, "id_rsa").is_err());
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn task_file_fp_for_task_rejects_a_symlink_escaping_the_worktree() {
         // A `.pdf` NAME is not a `.pdf` LOCATION: containment is decided by
         // `safe_task_path`, which canonicalizes through the symlink before
@@ -27802,8 +28133,8 @@ mod tests {
         assert!(split_browser_command("").unwrap().is_empty());
     }
 
+    #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
     #[test]
-    #[cfg(unix)]
     fn browser_program_exists_finds_a_path_and_a_path_lookup() {
         // An absolute path to something that is really there, and a bare name
         // resolved through PATH. `sh` is on every platform we ship.
@@ -27813,8 +28144,8 @@ mod tests {
         assert!(!browser_program_exists("/nope/termic-no-such-browser-xyz"));
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn browser_program_exists_requires_the_execute_bit() {
         // A file on PATH with the right NAME but no +x is not a launcher.
         // Accepting it would pass the settings field and fail on click, which
@@ -28134,8 +28465,8 @@ mod tests {
             }
         }
 
+        #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
         #[test]
-        #[cfg(unix)]
         fn resolution_returns_the_path_to_launch_not_just_a_yes() {
             // The bug this pins: answering only "it exists somewhere on the
             // login shell's PATH" and then handing `Command::new` the bare
@@ -28154,8 +28485,8 @@ mod tests {
             assert_eq!(resolve_external_app("/nope/termic-no-such-editor-xyz"), None);
         }
 
+        #[cfg(unix)] // unix paths / tools; the Windows behaviour differs by design
         #[test]
-        #[cfg(unix)]
         fn resolution_returns_a_full_path_from_a_dir_only_a_shell_rc_exports() {
             // The reachable Linux case: an editor in a directory the login
             // shell exports but launchd does not. Driven through the extracted
@@ -28850,9 +29181,6 @@ mod tests {
             assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "-b", "main"]);
-        // Line-ending conversion would corrupt content comparisons (a
-        // checkout rewriting LF fixtures as CRLF).
-        run(&["config", "core.autocrlf", "false"]);
         run(&["-c", "user.name=Test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"]);
         let f = path.join("base.txt");
         fs::write(&f, "base content\n").unwrap();
@@ -29358,6 +29686,59 @@ mod tests {
         let wt = wt_dir.path().join("wt");
         git_worktree_add(&main, &wt, "task");
         (main_dir, wt_dir, main, wt)
+    }
+
+    #[test]
+    fn archive_reaches_a_shell_that_only_its_owner_ties_to_the_task() {
+        let owner = |t: &str| PtyOwner { task_id: Some(t.into()), tab_id: None, kind: "shell".into() };
+        // A main-panel shell: no task_id, no role, only the owner.
+        assert!(is_untagged_task_pty(None, None, Some(&owner("t1")), "t1"));
+        assert!(!is_untagged_task_pty(None, None, Some(&owner("t2")), "t1"));
+        // An agent carries task_id and is stop_task_ptys's, not this one's.
+        assert!(!is_untagged_task_pty(Some("t1"), None, Some(&owner("t1")), "t1"));
+        // Nothing naming the task.
+        assert!(!is_untagged_task_pty(None, None, None, "t1"));
+    }
+
+    #[test]
+    fn a_repo_git_will_not_open_says_why_instead_of_not_a_repo() {
+        let dir = tempdir().unwrap();
+        // No .git: not a repo, the caller's own message stands.
+        assert_eq!(git_open_error(dir.path(), "x", "fatal: not a git repository"), None);
+        // Git's ownership check names the command that trusts it.
+        let dubious = "git [\"rev-parse\"] failed: fatal: detected dubious ownership in repository at 'C:/Projects/seat-be'";
+        let msg = git_open_error(Path::new(r"C:\Projects\seat-be"), r"C:\Projects\seat-be", dubious).unwrap();
+        assert!(msg.contains("owned by another user account"), "{msg}");
+        assert!(msg.contains("git config --global --add safe.directory C:/Projects/seat-be"), "{msg}");
+        assert!(!msg.contains("not a git repo"), "{msg}");
+        // A .git that git still refuses: git's own last line, not "not a repo".
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let msg = git_open_error(dir.path(), "repo", "git failed: warning: x\nfatal: bad config line 1").unwrap();
+        assert_eq!(msg, "Git could not open repo: fatal: bad config line 1");
+    }
+
+    #[test]
+    fn app_git_never_takes_an_optional_lock() {
+        // A background `git status` that writes the index back holds
+        // index.lock, and the user's own commit then fails on it.
+        let cmd = git_command();
+        let set = cmd.get_envs().any(|(k, v)| {
+            k == "GIT_OPTIONAL_LOCKS" && v == Some(std::ffi::OsStr::new("0"))
+        });
+        assert!(set);
+    }
+
+    #[test]
+    fn a_local_branch_is_found_only_while_it_exists() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_run(dir.path(), &["branch", "feature/x"]);
+        assert!(local_branch_exists(dir.path(), "feature/x"));
+        git_run(dir.path(), &["branch", "-D", "feature/x"]);
+        assert!(!local_branch_exists(dir.path(), "feature/x"));
+        // A tag or a remote ref by that name is not a local branch.
+        git_run(dir.path(), &["tag", "feature/y"]);
+        assert!(!local_branch_exists(dir.path(), "feature/y"));
     }
 
     // ── git history / graph (issue #199) ──
@@ -30919,6 +31300,51 @@ filename f.rs
     }
 
     #[test]
+    fn group_join_refuses_a_task_in_another_project() {
+        // One group is one block in one project's list. Across projects it
+        // drew as two unrelated groups of one, both named after the lead.
+        let mut l = vec![gt("a"), gt("b")];
+        l[1].project_id = "q".into();
+        assert!(apply_group_join(&mut l, "b", "a", None).is_err());
+        assert!(l.iter().all(|t| t.group.is_none()), "a refusal writes nothing");
+    }
+
+    #[test]
+    fn spawn_link_groups_in_the_same_project_and_only_links_across() {
+        let mut l = vec![gt("orch"), gt("near"), gt("far")];
+        l[2].project_id = "q".into();
+
+        let changed = apply_spawn_link(&mut l, "near", "orch", Some("teal".into())).unwrap();
+        assert_eq!(l[1].spawned_by.as_deref(), Some("orch"));
+        assert_eq!(gid(&l, "near").as_deref(), Some("orch"));
+        assert_eq!(changed.len(), 2, "child stamped and grouped, lead founded; each written once");
+
+        let changed = apply_spawn_link(&mut l, "far", "orch", None).unwrap();
+        assert_eq!(changed, vec![2]);
+        assert_eq!(l[2].spawned_by.as_deref(), Some("orch"));
+        assert_eq!(gid(&l, "far"), None, "no group across projects");
+
+        // The link is to the DIRECT parent, even where the group is the
+        // root's (a sub-orchestrator's child lands in the root group).
+        l.push(gt("leaf"));
+        apply_spawn_link(&mut l, "leaf", "near", None).unwrap();
+        assert_eq!(l[3].spawned_by.as_deref(), Some("near"));
+        assert_eq!(gid(&l, "leaf").as_deref(), Some("orch"));
+
+        assert!(apply_spawn_link(&mut l, "orch", "orch", None).is_err());
+        assert!(apply_spawn_link(&mut l, "orch", "nope", None).is_err());
+    }
+
+    #[test]
+    fn a_task_without_spawned_by_reads_and_writes_as_before() {
+        let t = gt("x");
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("spawned_by"), "absent stays absent on disk");
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.spawned_by, None);
+    }
+
+    #[test]
     fn group_leave_keeps_the_rest_even_a_group_of_one() {
         let mut l = vec![gt("orch"), gt("c1"), gt("c2")];
         apply_group_join(&mut l, "c1", "orch", None).unwrap();
@@ -31535,8 +31961,8 @@ filename f.rs
         assert_eq!(reader.join().unwrap(), None, "reader saw a torn file");
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn write_atomic_preserves_the_destination_file_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -31549,8 +31975,8 @@ filename f.rs
         assert_eq!(fs::read_to_string(&f).unwrap(), "new");
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn write_atomic_writes_through_a_symlinked_destination() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("dotfiles-settings.json");
@@ -31566,8 +31992,8 @@ filename f.rs
     // Dangling link (dotfiles target not created yet): canonicalize fails, so
     // the manual read_link fallback must still write the target, not clobber
     // the link with a regular file.
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn write_atomic_creates_the_target_of_a_dangling_symlink() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("dotfiles-settings.json");
@@ -32136,5 +32562,66 @@ mod agents_save_account_fields_tests {
         carry_account_fields(&[stored], &mut incoming);
 
         assert!(incoming.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod windows_port_tests {
+    use super::*;
+
+    #[test]
+    fn plain_names_refuse_separators_and_dot_dirs() {
+        assert!(is_plain_name("api"));
+        assert!(is_plain_name("my-task.v2"));
+        for bad in ["", ".", "..", "a/b", "../x"] {
+            assert!(!is_plain_name(bad), "{bad:?} must be refused");
+        }
+        // `..\x` would rename outside the directory on Windows.
+        assert_eq!(is_plain_name("..\\x"), !cfg!(windows));
+        assert_eq!(is_plain_name("C:x"), !cfg!(windows));
+    }
+
+    #[test]
+    fn absolute_locations_include_tilde_and_the_platform_root() {
+        assert!(is_absolute_location("/wt"));
+        assert!(is_absolute_location("~"));
+        assert!(is_absolute_location("~/wt"));
+        assert!(!is_absolute_location("wt"));
+        // A drive path is absolute on Windows only, where it is a real root.
+        assert_eq!(is_absolute_location("D:\\wt"), cfg!(windows));
+    }
+
+    #[test]
+    fn lsp_uris_take_the_standard_windows_form() {
+        assert_eq!(lsp_path_to_uri_for("/tmp/a#b", false), "file:///tmp/a%23b");
+        assert_eq!(lsp_path_to_uri_for(r"C:\Users\u\a b.ts", true), "file:///C:/Users/u/a%20b.ts");
+        assert_eq!(lsp_path_to_uri_for(r"\\?\D:\x", true), "file:///D:/x");
+    }
+
+    #[test]
+    fn a_checkout_local_server_uses_the_windows_layout_there() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".venv/Scripts")).unwrap();
+        fs::write(d.path().join(".venv/Scripts/ty.exe"), "x").unwrap();
+        fs::create_dir_all(d.path().join("node_modules/.bin")).unwrap();
+        // npm's pair: an unrunnable sh shim and the .cmd that works.
+        fs::write(d.path().join("node_modules/.bin/tsgo"), "#!/bin/sh").unwrap();
+        fs::write(d.path().join("node_modules/.bin/tsgo.cmd"), "@echo off").unwrap();
+
+        let ty = lsp_local_exe_for(d.path(), ".venv/bin/ty", true).unwrap();
+        assert!(ty.replace('\\', "/").ends_with(".venv/Scripts/ty.exe"), "{ty}");
+        let tsgo = lsp_local_exe_for(d.path(), "node_modules/.bin/tsgo", true).unwrap();
+        assert!(tsgo.ends_with("tsgo.cmd"), "{tsgo}");
+        // Unix keeps the literal path.
+        assert!(lsp_local_exe_for(d.path(), "node_modules/.bin/tsgo", false).unwrap().ends_with("/tsgo"));
+        assert_eq!(lsp_local_exe_for(d.path(), ".venv/bin/ty", false), None);
+    }
+
+    #[test]
+    fn a_windows_browser_preset_path_is_checked_as_a_path() {
+        // The preset form: a quoted absolute path with spaces, backslashes kept.
+        let argv = browser_argv(r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --incognito"#, "https://x/").unwrap();
+        assert_eq!(argv[0], r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        assert_eq!(argv[1], "--incognito");
     }
 }

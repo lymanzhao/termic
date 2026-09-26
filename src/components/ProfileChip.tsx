@@ -32,6 +32,7 @@ import { ProfileDot } from "@/components/ui/AccentDots";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
 import { cn } from "@/lib/utils";
+import { appRegionStyle } from "@/lib/platform";
 
 export function ProfileChip() {
   const { t } = useTranslation("chrome");
@@ -56,7 +57,7 @@ export function ProfileChip() {
           variant="icon"
           data-testid="footer-profiles"
           data-no-drag
-          style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+          style={appRegionStyle("no-drag")}
           onClick={() => openSettings("profiles")}
         >
           <UsersRound className="h-[18px] w-[18px]" />
@@ -91,7 +92,7 @@ export function ProfileChip() {
             "flex max-w-[220px] shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1",
             "text-left hover:bg-[var(--color-bg-2)]",
           )}
-          style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+          style={appRegionStyle("no-drag")}
         >
           {/* A DOT, not a lettered tile. The name is right beside it in full,
               so the letter said nothing the word did not, and a square avatar

@@ -36,7 +36,7 @@ npm run build        # tsc -b && vite build
 
 ## Testing
 
-Unit/Rust: `npm test` (vitest) + `cargo test`. `npm run typecheck:e2e` covers `e2e/` and `perf/`, which the app's `tsc -b` project does NOT reach: they went unchecked long enough to accumulate 71 errors, so run it after touching a spec. UI flows: the written e2e suite (`make e2e`, WebdriverIO on the real window). The e2e suite also runs in CI on `macos-14` (`.github/workflows/test.yml`), deliberately NOT a required check yet, it is there to surface flakiness before it gates merges. Run it locally anyway; do not treat the CI job as your test pass.
+Unit/Rust: `npm test` (vitest) + `cargo test`. `npm run typecheck:e2e` covers `e2e/` and `perf/`, which the app's `tsc -b` project does NOT reach: they went unchecked long enough to accumulate 71 errors, so run it after touching a spec. UI flows: the written e2e suite (`make e2e`, WebdriverIO on the real window). The e2e suite also runs in CI on macOS, Linux and Windows (`.github/workflows/test.yml`, `.github/workflows/windows.yml`), deliberately NOT a required check yet, it is there to surface flakiness and per-platform regressions before it gates merges. Run it locally anyway; do not treat the CI job as your test pass.
 
 Performance: `make perf` runs the nightly suite (startup, memory) and the local-only bench (idle CPU, GPU) and reports them separately. Neither gates. What DOES gate a PR is the count-and-invariant class (`src/store/selectorFanout.test.ts`) because counts survive a 3-core CI runner and timings do not. Read [docs/perf-ci.md](docs/perf-ci.md) before adding a perf check, especially before adding a threshold.
 
@@ -228,6 +228,7 @@ Deeper references — read when working in that area:
 - [docs/agent-states.md](docs/agent-states.md) — every state an agent tab can be in, what produces it, what it draws, and whether it rings
 - [docs/agent-hooks.md](docs/agent-hooks.md) — agent hooks: what each agent reports, the transport (including Docker), and the measurements behind both
 - [docs/sandbox.md](docs/sandbox.md) — sandbox-exec + CONNECT proxy, YOLO interaction, deny debugging
+- [docs/windows.md](docs/windows.md) — the Windows port: building with make under Git Bash, what works differently (Docker-only sandbox, Git Bash scripts, process trees, loopback CLI transport), what is not there yet
 - [docs/shortcuts.md](docs/shortcuts.md) — shortcut system architecture, adding shortcuts, glyph rendering
 - [docs/themes.md](docs/themes.md) — custom theme file format (`~/.config/termic/themes/*.json`), ui/terminal key reference
 - [docs/lsp.md](docs/lsp.md) — language servers: the rules a new one must obey, and `make lsp-smoke`

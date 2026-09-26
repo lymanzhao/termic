@@ -32,7 +32,7 @@ export default {
   removeFromGroup: "移出分组",
   spotlightEnable: "启用 Spotlight",
   spotlightDisable: "停用 Spotlight",
-  revealInFinder: "在 Finder 中显示",
+  revealInFinder: "在 {{manager}} 中显示",
   copyPath: "复制路径",
   removeProjectTitle: "移除「{{name}}」？",
   removeProjectMessage: "所有任务将被归档，其工作树将从磁盘删除。仓库文件夹会保留。此操作无法在 Termic 内撤销。",

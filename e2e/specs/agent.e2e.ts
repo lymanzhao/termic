@@ -293,8 +293,9 @@ describe("image paste", () => {
       window.__termic!.ipc.clipboardImageSave(new Uint8Array(bytes as number[])), PNG) as string;
     // Under the shared clipboard dir, which Docker mode mounts read-only at
     // this same absolute path, so what gets typed resolves in both worlds.
-    expect(path).toContain("/clipboard/");
-    expect(path).toMatch(/\/pasted-\d+-[0-9a-f]{8}\.png$/);
+    const p = path.replace(/\\/g, "/");
+    expect(p).toContain("/clipboard/");
+    expect(p).toMatch(/\/pasted-\d+-[0-9a-f]{8}\.png$/);
   });
 
   it("refuses bytes that are not an image, rather than writing a fake .png", async () => {
@@ -307,7 +308,9 @@ describe("image paste", () => {
     expect(err).toBeTruthy();
   });
 
-  it("reads an image straight off the Mac clipboard for ctrl+V", async () => {
+  // Driven through pbcopy / osascript, so macOS only. The read itself is the
+  // clipboard plugin's, the same call on every platform.
+  (process.platform === "darwin" ? it : it.skip)("reads an image straight off the Mac clipboard for ctrl+V", async () => {
     // ctrl+V is not a paste event (it is byte 0x16 down the PTY, and the
     // gesture claude binds its own image-attach to), so there are no bytes to
     // hand over and the pasteboard is read natively. That read is the part
@@ -1943,7 +1946,18 @@ describe("agent notifications", () => {
           },
           "statusline");
       }, agent, session, weekly);
+    /** The footer IS the container the chip rule is written against, so its
+     *  width is set directly (see the narrow half below). */
+    const setFooterWidth = (px: string) => browser.execute((w) => {
+      const el = [...document.querySelectorAll('[data-testid="task-footer"]')]
+        .find(e => e.getClientRects().length > 0) as HTMLElement | undefined;
+      if (el) el.style.width = w;
+    }, px);
     try {
+      // Room for both, whatever the window: on a 1024px one (the CI runner's)
+      // the task footer is already below the threshold and drops the second
+      // chip, which is the narrow case, not this one.
+      await setFooterWidth("1200px");
       await browser.execute((id, second) => {
         window.__termic!.useApp.setState((s: any) => ({
           tabs: {
@@ -1976,11 +1990,6 @@ describe("agent notifications", () => {
       // assert nothing here. The rule itself is evaluated by the real engine
       // either way. The chip that survives is the one whose tab is on screen,
       // which is the task's own agent.
-      const setFooterWidth = (px: string) => browser.execute((w) => {
-        const el = [...document.querySelectorAll('[data-testid="task-footer"]')]
-          .find(e => e.getClientRects().length > 0) as HTMLElement | undefined;
-        if (el) el.style.width = w;
-      }, px);
       await setFooterWidth("600px");
       await browser.waitUntil(
         async () => (await shown()).length === 1,
@@ -1991,7 +2000,7 @@ describe("agent notifications", () => {
       // it comes back with the room.
       expect((await chips()).map(c => c.agent)).toEqual(["fakeagent", SECOND]);
 
-      await setFooterWidth("");
+      await setFooterWidth("1200px");
       await browser.waitUntil(
         async () => (await shown()).length === 2,
         { timeout: 8_000, timeoutMsg: "the second chip never came back with the room" });
@@ -2205,6 +2214,10 @@ describe("main-checkout resume for a capture-resume agent", () => {
     await waitForAgentReady(taskId);
 
     // Nothing to resume yet, so the first spawn carries no resume block.
+    // Waited for rather than read at once: "ready" means the PTY exists, and
+    // a Windows agent started through Git Bash has not run its first line yet.
+    await browser.waitUntil(() => Promise.resolve(spawnArgv(taskId!).length >= 1),
+      { timeout: 20_000, timeoutMsg: "the agent never recorded its spawn" });
     expect(spawnArgv(taskId)).toHaveLength(1);
     expect(spawnArgv(taskId)[0]).not.toContain("resume");
 
@@ -2454,6 +2467,17 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
   };
   const waitSpawns = (id: string, n: number, msg: string) => browser.waitUntil(
     () => Promise.resolve(spawnArgv(id).length >= n), { timeout: 30_000, timeoutMsg: msg });
+  /** How many times the fixture's picker has started listening in `id`.
+   *  Typing before it does can lose the keys (see scripts/fake-agent.sh). */
+  const pickersReady = (id: string): number => {
+    try {
+      return readFileSync(join(dataDir, "e2e-picker.log"), "utf8").split("\n")
+        .filter(l => l === `${id}\t<ready>`).length;
+    } catch { return 0; }
+  };
+  const waitPickerReady = (id: string, n: number) => browser.waitUntil(
+    () => Promise.resolve(pickersReady(id) >= n),
+    { timeout: 30_000, timeoutMsg: "the agent's picker never started listening" });
   const toasts = () => browser.execute(() =>
     (window.__termic!.useUI.getState().toasts as any[]).map(t => t.msg as string));
 
@@ -2497,6 +2521,7 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
   it("stores the session picked in the agent's picker, and resumes it next time", async () => {
     const id = taskId!;
     await waitForAgentReady(id);
+    await waitPickerReady(id, 1);
     await submitToAgent(id, `pick ${PICKED}`);
     await browser.waitUntil(async () => (await stored(id)) === PICKED,
       { timeout: 10_000, timeoutMsg: "the session picked in the agent's picker was not stored" });
@@ -2515,6 +2540,7 @@ describe("a stored session that no longer resolves opens the agent's picker (#31
     await relaunch(id);
     await waitSpawns(id, before + 2, "no picker spawn followed the failed resume");
     await waitForAgentReady(id);
+    await waitPickerReady(id, 2);
     // Leaving claude's picker is Esc alone, no Enter, which exits 1 with
     // nothing picked. Written to the pty directly: typing through xterm would
     // add the Enter that picking takes.
@@ -2687,7 +2713,9 @@ describe("a secondary capture-resume tab in the main checkout", () => {
     // A NEW tab is a new session: no resume block, and in the repo root no cwd
     // fallback either, so this agent genuinely starts from nothing. That is
     // the × contract for a secondary tab and it is not the bug.
-    expect(argvFor(id)[argvFor(id).length - 1]).not.toContain("resume");
+    // Every spawn since, not the last line: on a slow runner two fixture
+    // starts can record out of order.
+    expect(argvFor(id).slice(before).some(l => l.includes("resume"))).toBe(false);
 
     // The way back is the + menu's Resume list, which still holds the session.
     const entry = await browser.execute(
@@ -2698,10 +2726,9 @@ describe("a secondary capture-resume tab in the main checkout", () => {
       window.__termic!.useApp.getState().resumeClosedTab(t, e);
     }, id, (entry as { id: string }).id);
     await browser.waitUntil(
-      () => Promise.resolve(argvFor(id).length > at),
-      { timeout: 30_000, timeoutMsg: "the resumed tab never spawned" },
+      () => Promise.resolve(argvFor(id).slice(at).some(l => l.includes(`resume ${SESSION}`))),
+      { timeout: 30_000, timeoutMsg: `the resumed tab never spawned with resume ${SESSION}` },
     );
-    expect(argvFor(id)[argvFor(id).length - 1]).toContain(`resume ${SESSION}`);
   });
 });
 

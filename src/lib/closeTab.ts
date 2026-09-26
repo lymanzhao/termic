@@ -14,6 +14,7 @@ import type { ScratchTab, Tab } from "@/lib/types";
 import { agentDisplayName, isTerminalCli } from "@/lib/agents";
 import { discardScratchPad } from "@/lib/scratchTabs";
 import { isScheduled } from "@/lib/scheduledQueue";
+import { kbd } from "@/lib/platform";
 
 /** Scheduled queue messages (GH #300) this close would delete. They live on
  *  the tab's durable record, so a close that keeps the record (the MAIN strip
@@ -70,7 +71,7 @@ async function confirmTabClose(taskId: string, tab: Tab | undefined, paneTab: bo
     // === true keeps TS happy across its overloads.
     const ok = await useUI.getState().askConfirm({
       title: i18n.t("backend:closeTab.unsavedTitle"),
-      message: i18n.t("backend:closeTab.unsavedMessage", { name }),
+      message: i18n.t("backend:closeTab.unsavedMessage", { name, combo: kbd("⌘S") }),
       confirmLabel: i18n.t("backend:closeTab.unsavedConfirm"),
       destructive: true,
     });

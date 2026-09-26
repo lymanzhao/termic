@@ -18,9 +18,9 @@ export default {
   },
 
   tabBar: {
-    broadcastTip: "Broadcast a message to all agents from this task (⇧⌘B)",
-    splitRightTip: "Split right (⌘D)",
-    splitBelowTip: "Split below (⇧⌘D)",
+    broadcastTip: "Broadcast a message to all agents from this task ({{combo}})",
+    splitRightTip: "Split right ({{combo}})",
+    splitBelowTip: "Split below ({{combo}})",
     restartRunTip: "Restart run",
     stopTip: "Stop",
     runTip: "Run",
@@ -56,11 +56,11 @@ export default {
   // The editor breadcrumb under the tab bar (TaskView) + the bottom split's
   // strip controls.
   breadcrumb: {
-    scratchHint: "Scratchpad, not saved to the project yet. ⌘S picks a place for it.",
+    scratchHint: "Scratchpad, not saved to the project yet. {{combo}} picks a place for it.",
     setSyntaxTip: "Set syntax",
     readOnly: "Read-only",
     copyPathTip: "Copy path",
-    revealInFinderTip: "Reveal in Finder",
+    revealInFinderTip: "Reveal in {{manager}}",
     locateTip: "Locate in file tree",
     revealTip: "Reveal {{rel}} in file tree",
     openInFileManagerTip: "Open in file manager",
@@ -91,7 +91,7 @@ export default {
     revealFailed: "Couldn't reveal that path",
     noAppRevealed: "No app for that file type, revealed it instead",
     openFailed: "Couldn't open that file",
-    revealInFinder: "Reveal in Finder",
+    revealInFinder: "Reveal in {{manager}}",
     openInDefaultApp: "Open in default app",
     copyPath: "Copy path",
     noMatches: "No matches",

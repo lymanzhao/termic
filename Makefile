@@ -8,7 +8,17 @@
 #   * `.PHONY` everything — we have no real file targets here.
 #   * `MAKEFLAGS += --no-print-directory` keeps the output legible.
 #   * Each recipe runs in its own shell; multi-line uses backslash-newline.
+#
+# Windows: run from Git Bash, with GNU make installed
+# (`winget install ezwinports.make`). Recipes run under Git's bash there, and
+# the targets that differ by platform (setup, install, beta, reset, ...) pick
+# their Windows branch from $(IS_WINDOWS). See docs/windows.md.
+ifeq ($(OS),Windows_NT)
+IS_WINDOWS := 1
+SHELL := bash
+else
 SHELL := /bin/bash
+endif
 .SHELLFLAGS := -euo pipefail -c
 MAKEFLAGS += --no-print-directory
 
@@ -20,13 +30,18 @@ MAKEFLAGS += --no-print-directory
 # `just --list` without depending on just.
 help: ## Show this help (default target).
 	@awk 'BEGIN {FS = ":.*## "} \
-	     /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' \
+	     /^[a-zA-Z_-]+:.*## / && !seen[$$1]++ {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' \
 	     $(MAKEFILE_LIST) | sort
 .PHONY: help
 
 # ─── setup ────────────────────────────────────────────────────────────
 
-setup: ## One-shot dev env bootstrap (brew/rust/node + npm install + cargo check).
+ifdef IS_WINDOWS
+setup: ## One-shot dev env bootstrap (build tools, rust, node, make via winget + npm install + cargo check).
+	@# Also runnable without make: bash scripts/setup-windows.sh
+	@bash scripts/setup-windows.sh
+else
+setup: ## One-shot dev env bootstrap (rust/node + npm install + cargo check).
 	@echo "→ Termic dev environment bootstrap"
 	@if ! command -v brew >/dev/null 2>&1; then \
 	    echo "✗ homebrew required. Install from https://brew.sh and re-run."; \
@@ -72,6 +87,7 @@ setup: ## One-shot dev env bootstrap (brew/rust/node + npm install + cargo check
 	    echo "  To run 'make dev', add rustup to your shell, then restart it:"; \
 	    echo "    echo 'export PATH=\"\$$(brew --prefix rustup)/bin:\$$PATH\"' >> ~/.zshrc"; \
 	fi
+endif
 .PHONY: setup
 
 doctor: ## Verify the dev env without installing anything (CI-friendly, exits nonzero on first missing dep).
@@ -85,7 +101,13 @@ doctor: ## Verify the dev env without installing anything (CI-friendly, exits no
 	        echo "  ✗ $$name: missing"; fail=1; \
 	    fi; \
 	}; \
-	check brew brew --version; \
+	if [ -z "$(IS_WINDOWS)" ]; then check brew brew --version; else \
+	    check make make --version; check git git --version; \
+	    vsw="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"; \
+	    if [ -x "$$vsw" ] && [ -n "$$("$$vsw" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null)" ]; then \
+	        echo "  ✓ C++ build tools: present"; \
+	    else echo "  ✗ C++ build tools: missing"; fail=1; fi; \
+	fi; \
 	check rust cargo --version; \
 	check node node --version; \
 	if [ -d node_modules ]; then \
@@ -120,11 +142,18 @@ run_no_pill: ## Run dev with the DEV pill hidden (VITE_HIDE_DEV_PILL=1). For cle
 	@VITE_HIDE_DEV_PILL=1 node scripts/dev.mjs
 .PHONY: run_no_pill
 
-cli-dev: ## Build the debug termic-cli and symlink it as `termic-dev` in ~/.local/bin (talks to the dev app; coexists with a prod `termic`).
+cli-dev: ## Build the debug termic-cli and install it as `termic-dev` in ~/.local/bin (talks to the dev app; coexists with a prod `termic`).
 	@cd src-tauri && TERMIC_APP_VERSION="$$(node -p "require('$(CURDIR)/package.json').version")" cargo build -p termic-cli
 	@mkdir -p "$$HOME/.local/bin"
-	@ln -sf "$(CURDIR)/src-tauri/target/debug/termic-cli" "$$HOME/.local/bin/termic-dev"
-	@echo "✓ termic-dev -> src-tauri/target/debug/termic-cli"
+	@# Windows: a copy, not a link (symlinks need Developer Mode, and a
+	@# `termic-dev` without `.exe` would not run). Re-run after rebuilding.
+	@if [ -n "$(IS_WINDOWS)" ]; then \
+	    cp -f "$(CURDIR)/src-tauri/target/debug/termic-cli.exe" "$$HOME/.local/bin/termic-dev.exe"; \
+	    echo "✓ termic-dev.exe <- src-tauri/target/debug/termic-cli.exe (a copy: re-run after rebuilding)"; \
+	else \
+	    ln -sf "$(CURDIR)/src-tauri/target/debug/termic-cli" "$$HOME/.local/bin/termic-dev"; \
+	    echo "✓ termic-dev -> src-tauri/target/debug/termic-cli"; \
+	fi
 	@case ":$$PATH:" in *":$$HOME/.local/bin:"*) echo "  ~/.local/bin is on your PATH; run: termic-dev list";; \
 	  *) echo "  note: add ~/.local/bin to your PATH, then run: termic-dev list";; esac
 .PHONY: cli-dev
@@ -190,7 +219,7 @@ perf: ## Run both performance suites locally and report each separately.
 	@# it here would hide half the report over an unrelated failure. The status
 	@# is kept and re-raised at the end so `make perf` still fails honestly.
 	@npm run test:perf; echo $$? > .perf/.section1-status
-	@./perf/local/local-report.sh
+	@if [ -n "$(IS_WINDOWS)" ]; then echo "  (section 2, the local idle CPU / GPU bench, is macOS-only: skipped)"; else ./perf/local/local-report.sh; fi
 	@s=$$(cat .perf/.section1-status 2>/dev/null || echo 0); \
 	  if [ "$$s" != "0" ]; then \
 	    echo ""; \
@@ -258,8 +287,35 @@ icons: ## Regenerate every icon size + format from src-tauri/icons/icon.svg.
 #
 # A dormant install has no profiles.json and skips the whole thing; so does a
 # single-profile one, where nothing was ever cleared.
+ifdef IS_WINDOWS
+REGISTRY := $(LOCALAPPDATA)/termic/profiles.json
+else
 REGISTRY := $(HOME)/Library/Application Support/termic/profiles.json
+endif
 
+ifdef IS_WINDOWS
+# $(call quit_keeping_profiles,<app name>,<bundle id>)
+#
+# Windows: the same read-quit-restore dance, but the quit is a close message
+# to the process whose path is the installed exe (then a kill), because there
+# is no AppleScript `quit` and both apps may be named termic.exe.
+define quit_keeping_profiles
+@REG="$(REGISTRY)"; \
+	if [ -f "$$REG" ]; then \
+	  OPEN="$$(node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write((r.profiles||[]).filter(p=>p.open_at_quit).map(p=>p.slug).join(" "))' "$$REG" 2>/dev/null || true)"; \
+	  echo "→ Quitting $(1) (profile windows open: $${OPEN:-none})"; \
+	  DIR="$$LOCALAPPDATA\\$(1)"; \
+	  powershell -NoProfile -Command "Get-Process | Where-Object { \$$_.Path -like \"$$DIR\\*\" } | ForEach-Object { \$$_.CloseMainWindow() | Out-Null }" 2>/dev/null || true; \
+	  sleep 2; \
+	  powershell -NoProfile -Command "Get-Process | Where-Object { \$$_.Path -like \"$$DIR\\*\" } | Stop-Process -Force" 2>/dev/null || true; \
+	  sleep 1; \
+	  if [ -n "$$OPEN" ]; then \
+	    node -e 'const fs=require("fs"),f=process.argv[1],want=new Set(process.argv.slice(2));const r=JSON.parse(fs.readFileSync(f,"utf8"));let n=0;for(const p of r.profiles||[]){const v=want.has(p.slug);if(p.open_at_quit!==v){p.open_at_quit=v;n++;}}if(n)fs.writeFileSync(f,JSON.stringify(r,null,2)+"\n");process.stdout.write(String(n));' -- "$$REG" $$OPEN >/dev/null; \
+	    echo "  · will relaunch with: $$OPEN"; \
+	  fi; \
+	fi
+endef
+else
 # $(call quit_keeping_profiles,<app name>,<bundle id>)
 define quit_keeping_profiles
 @REG="$(REGISTRY)"; PAT="/$(1).app/Contents/MacOS/"; \
@@ -279,14 +335,31 @@ define quit_keeping_profiles
 	  fi; \
 	fi
 endef
+endif
 
 # ─── build / install / run ────────────────────────────────────────────
 
-build: ## Build a release .app + .dmg bundle. Output in src-tauri/target/release/bundle/.
-	@npm run tauri build
+# Windows: NSIS only. The MSI target needs WiX, which depends on VBScript and
+# is unreliable on Windows 11 24H2; the NSIS installer is what `install` runs.
+ifdef IS_WINDOWS
+BUNDLE_ARGS := -- --bundles nsis
+BETA_BUNDLES := nsis
+else
+BUNDLE_ARGS :=
+BETA_BUNDLES := app
+endif
+
+build: ## Build a release bundle (.app + .dmg on macOS, NSIS installer on Windows). Output in src-tauri/target/release/bundle/.
+	@# The updater artifacts need the release signing key. Without it (any
+	@# machine but the release one) skip them rather than fail the build.
+	@if [ -n "$${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then \
+	    npm run tauri build $(BUNDLE_ARGS); \
+	else \
+	    npm run tauri build -- $(filter-out --,$(BUNDLE_ARGS)) --config '{"bundle":{"createUpdaterArtifacts":false}}'; \
+	fi
 .PHONY: build
 
-install: build ## Build a release .app, copy it to /Applications (replacing any prior copy), and launch.
+install: build ## Build a release app, install it (/Applications on macOS, per-user NSIS on Windows), and launch.
 	$(call quit_keeping_profiles,Termic,com.simion.termic)
 	@./scripts/install-app.sh
 .PHONY: install
@@ -318,7 +391,7 @@ install: build ## Build a release .app, copy it to /Applications (replacing any 
 #
 # --bundles app: just the .app. No .dmg (nothing to distribute) and no updater
 # tarball, which is what wanted TAURI_SIGNING_PRIVATE_KEY.
-beta: ## Build the CURRENT BRANCH as `Termic Beta.app` (parallel install, shared data dir) and launch it.
+beta: ## Build the CURRENT BRANCH as Termic Beta (parallel install, shared data dir) and launch it.
 	@# A freshly pulled commit can add npm deps (tsc then fails with
 	@# TS2307 "Cannot find module"). npm install is a ~1s no-op when
 	@# node_modules is already in sync, so always run it first.
@@ -329,7 +402,7 @@ beta: ## Build the CURRENT BRANCH as `Termic Beta.app` (parallel install, shared
 	if [ -n "$$(git status --porcelain)" ]; then DIRTY="+"; fi; \
 	echo "→ Building Termic Beta from $$BRANCH@$$SHA$$DIRTY"; \
 	VITE_BETA=1 VITE_BETA_INFO="$$BRANCH@$$SHA$$DIRTY" \
-	    npm run tauri build -- --config src-tauri/tauri.beta.conf.json --bundles app
+	    npm run tauri build -- --config src-tauri/tauri.beta.conf.json --bundles $(BETA_BUNDLES)
 	$(call quit_keeping_profiles,Termic Beta,com.simion.termic.beta)
 	@./scripts/install-app.sh "Termic Beta" com.simion.termic.beta
 .PHONY: beta
@@ -337,14 +410,38 @@ beta: ## Build the CURRENT BRANCH as `Termic Beta.app` (parallel install, shared
 install-beta: beta ## Alias for `make beta`.
 .PHONY: install-beta
 
-uninstall: ## Remove the installed copies (shipped + beta) from /Applications (user data untouched).
+ifdef IS_WINDOWS
+uninstall: ## Remove the installed copies (shipped + beta). User data untouched.
+	@for app in "Termic" "Termic Beta"; do \
+	    un="$$LOCALAPPDATA/$$app/uninstall.exe"; \
+	    if [ -f "$$un" ]; then "$$un" //S && echo "✓ Uninstalled $$app"; else echo "  (not installed) $$app"; fi; \
+	done
+else
+uninstall: ## Remove the installed copies (shipped + beta). User data untouched.
 	@rm -rf /Applications/Termic.app /Applications/termic.app "/Applications/Termic Beta.app" \
 	  && echo "✓ Removed Termic.app + Termic Beta.app from /Applications"
+endif
 .PHONY: uninstall
 
 # ─── cleanup ──────────────────────────────────────────────────────────
 
-reset: ## DESTRUCTIVE: wipe every byte of termic state on this Mac (config, caches, window state, sandbox temp). Confirms first.
+ifdef IS_WINDOWS
+reset: ## DESTRUCTIVE: wipe every byte of termic state on this machine (config, caches, webview data, window state). Confirms first.
+	@L="$$(cygpath -u "$$LOCALAPPDATA")"; R="$$(cygpath -u "$$APPDATA")"; T="$$(cygpath -u "$$TEMP")"; \
+	TARGETS=("$$L/termic" "$$L/com.simion.termic" "$$L/com.simion.termic.beta" "$$R/com.simion.termic" "$$R/com.simion.termic.beta" "$$T/termic-debug.log"); \
+	echo "This will delete:"; for t in "$${TARGETS[@]}"; do echo "  $$t"; done; \
+	echo ""; \
+	echo "Worktrees under ~/termic/ are NOT touched (real git checkouts)."; \
+	echo ""; \
+	read -p "Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" != "yes" ]; then echo "✗ Aborted."; exit 1; fi; \
+	echo "→ Quitting any running termic"; \
+	powershell -NoProfile -Command "Get-Process | Where-Object { \$$_.Path -like \"*\\Termic*\\*\" -or \$$_.Path -like \"*\\target\\debug\\termic.exe\" } | Stop-Process -Force" 2>/dev/null || true; \
+	sleep 1; \
+	for t in "$${TARGETS[@]}"; do rm -rf "$$t"; done; \
+	echo "✓ Wiped. Worktrees on disk are untouched."
+else
+reset: ## DESTRUCTIVE: wipe every byte of termic state on this machine (config, caches, webview data, window state). Confirms first.
 	@BUNDLE_ID="com.simion.termic"; \
 	APP_DATA="$$HOME/Library/Application Support/termic"; \
 	APP_DATA_CAP="$$HOME/Library/Application Support/Termic"; \
@@ -408,13 +505,28 @@ reset: ## DESTRUCTIVE: wipe every byte of termic state on this Mac (config, cach
 	rm -f "$$TMPD"/termic-proxy-*.filter 2>/dev/null || true; \
 	rm -f "$$TMPD"/termic-debug.log 2>/dev/null || true; \
 	echo "✓ Wiped. Worktrees on disk are untouched."
+endif
 .PHONY: reset
 
 # Back-compat alias for the old `nuke-data` name.
 nuke-data: reset
 .PHONY: nuke-data
 
-reset_dev: ## DESTRUCTIVE (dev profile only): wipe ~/Library/Application Support/termic_dev + ~/termic_dev + the dev webview's localStorage. Production 'termic' data is untouched. No prompt.
+ifdef IS_WINDOWS
+reset_dev: ## DESTRUCTIVE (dev profile only): wipe the dev data dir + ~/termic_dev. Production 'termic' data is untouched. No prompt.
+	@DEV_DATA="$$(cygpath -u "$$LOCALAPPDATA")/termic_dev"; \
+	DEV_HOME="$$HOME/termic_dev"; \
+	echo "→ Quitting any running dev instance (best-effort)"; \
+	powershell -NoProfile -Command "Get-Process | Where-Object { \$$_.Path -like \"*\\target\\debug\\termic.exe\" } | Stop-Process -Force" 2>/dev/null || true; \
+	sleep 1; \
+	for d in "$$DEV_DATA" "$$DEV_HOME"; do \
+	    if [ -e "$$d" ]; then echo "→ Removing $$d"; rm -rf "$$d"; else echo "  (absent) $$d"; fi; \
+	done; \
+	echo "  (the dev webview's localStorage is not separate on Windows: WebView2 keys it by"; \
+	echo "   bundle identifier, which dev shares with the release build, so it is left alone)"; \
+	echo "✓ Dev profile reset. Production 'termic' data untouched."
+else
+reset_dev: ## DESTRUCTIVE (dev profile only): wipe the dev data dir + ~/termic_dev. Production 'termic' data is untouched. No prompt.
 	@DEV_DATA="$$HOME/Library/Application Support/termic_dev"; \
 	DEV_HOME="$$HOME/termic_dev"; \
 	DEV_WEBKIT="$$HOME/Library/WebKit/termic"; \
@@ -426,6 +538,7 @@ reset_dev: ## DESTRUCTIVE (dev profile only): wipe ~/Library/Application Support
 	    if [ -e "$$d" ]; then echo "→ Removing $$d"; rm -rf "$$d"; else echo "  (absent) $$d"; fi; \
 	done; \
 	echo "✓ Dev profile reset. Production 'termic' data untouched."
+endif
 .PHONY: reset_dev
 
 clean: ## Remove build artifacts (frontend dist + rust target). Recovers ~3GB.

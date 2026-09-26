@@ -153,7 +153,7 @@ pub fn parse_codex_result(result: &serde_json::Value) -> AgentUsage {
 ///
 /// It exists because of a bug that shipped. A packaged `.app` is launched by
 /// the GUI with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and codex installs to
-/// `~/.local/bin`, so `Command::new("codex")` is a plain ENOENT in every
+/// `~/.local/bin`, so `crate::proc_ctl::command("codex")` is a plain ENOENT in every
 /// release build while working in every dev one, where the terminal's PATH is
 /// inherited. The frontend swallows this error on purpose, so the footer was
 /// simply empty for codex with nothing anywhere saying why.
@@ -161,7 +161,7 @@ pub fn parse_codex_result(result: &serde_json::Value) -> AgentUsage {
 /// `shell_env` exists for exactly this and its module doc says so; the fix is
 /// to use it, and the test below is what stops it being dropped again.
 fn app_server_command(bin: &str, home: &Path) -> Command {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::proc_ctl::command(bin);
     cmd.arg("app-server")
         .env("PATH", crate::shell_env::resolved_path())
         .env("CODEX_HOME", home)
@@ -544,7 +544,7 @@ fn devin_window(agent_id: &str, model: &str) -> Option<u64> {
         .map(|a| a.command)
         .filter(|c| !c.trim().is_empty())
         .unwrap_or_else(|| "devin".to_string());
-    let out = Command::new(&bin)
+    let out = crate::proc_ctl::command(&bin)
         .args(["models", "list", "--format", "json"])
         .env("PATH", crate::shell_env::resolved_path())
         .stdin(Stdio::null()).stderr(Stdio::null())
@@ -588,7 +588,7 @@ pub async fn agent_context_devin(
     if !db.exists() {
         return Ok(None);
     }
-    let out = Command::new("sqlite3")
+    let out = crate::proc_ctl::command("sqlite3")
         .arg("-readonly").arg("-separator").arg("|").arg(&db).arg(&sql)
         .stdin(Stdio::null()).stderr(Stdio::null())
         .output().map_err(|e| format!("sqlite3: {e}"))?;

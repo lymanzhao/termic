@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
-  resolveBrowserCommand, browserPresets,
+  resolveBrowserCommand, browserPresets, WINDOWS_BROWSER_PRESETS,
   MAC_BROWSER_PRESETS, LINUX_BROWSER_PRESETS,
 } from "@/lib/previewBrowser";
 
@@ -47,6 +47,12 @@ describe("browser presets", () => {
   it("picks the list by platform", () => {
     expect(browserPresets("MacIntel")).toBe(MAC_BROWSER_PRESETS);
     expect(browserPresets("Linux x86_64")).toBe(LINUX_BROWSER_PRESETS);
+    expect(browserPresets("Win32")).toBe(WINDOWS_BROWSER_PRESETS);
+    // Windows presets name a quoted absolute path: the browsers are not on
+    // PATH there, and the path has spaces.
+    for (const p of WINDOWS_BROWSER_PRESETS.filter(p => p.command)) {
+      expect(p.command).toMatch(/^"C:\\Program Files[^"]*\.exe"/);
+    }
   });
 
   it("never ships a profile preset naming a profile that usually does not exist", () => {

@@ -76,7 +76,10 @@ const PRETTY_EXE: Record<string, string> = {
  * third process. The resolved path is the only thing that knows.
  */
 export function serverFor(exe: string | null, language: string): string {
-  const base = exe?.split("/").pop() ?? "";
+  // Either separator, and without a Windows executable extension: on Windows
+  // the resolved server is `...\\.bin\\tsgo.cmd`, which is still tsgo, and
+  // missing it here also lost the memory note keyed by the pretty name.
+  const base = (exe?.split(/[\\/]/).pop() ?? "").replace(/\.(exe|cmd|bat)$/i, "");
   if (!base) return WOULD_INSTALL[language] ?? language;
   return PRETTY_EXE[base] ?? base;
 }

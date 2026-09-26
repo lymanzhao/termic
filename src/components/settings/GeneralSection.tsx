@@ -26,6 +26,7 @@ import { CircleCheck, CircleX, RefreshCw } from "lucide-react";
 import { IS_MAC } from "@/lib/shortcuts";
 import { Tip } from "@/components/ui/Tooltip";
 import type { LanguagePref } from "@/lib/i18n";
+import { installCommand } from "@/lib/platform";
 
 export function GeneralSection() {
   const { t } = useTranslation("settings");
@@ -291,7 +292,7 @@ export function GeneralSection() {
 
       <Block id="setting-tray-enabled">
         <Toggle
-          label={t("general.tray.label")}
+          label={IS_MAC ? t("general.tray.label") : t("general.tray.labelSystem")}
           hint={t("general.tray.hint") + (IS_MAC ? t("general.tray.hintMac") : "")}
           value={trayEnabled}
           onChange={saveTrayEnabled}
@@ -368,7 +369,7 @@ function ForgeStatusBlock() {
               <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--color-fg-dim)]">
                 <CircleX className="h-3.5 w-3.5 text-[var(--color-fg-faint)]" />
                 {t("general.forge.notInstalled")}
-                <code className="rounded bg-[var(--color-bg-3)] px-1 py-px font-mono text-[11px]">brew install {f.id}</code>
+                <code className="rounded bg-[var(--color-bg-3)] px-1 py-px font-mono text-[11px]">{installCommand(f.id)}</code>
               </span>
             ) : !f.authed ? (
               <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--color-warn)]">

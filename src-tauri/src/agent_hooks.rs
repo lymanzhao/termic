@@ -395,7 +395,21 @@ fn bound_emits(script: &str) -> String {
             "{func} \"$TERMIC_PTY\" || {func} /proc/1/fd/1 || {func} /dev/tty || true"
         );
         if !func.is_empty() && rest == chain {
-            let call = chain.trim_end_matches(" || true");
+            let unix_call = chain.trim_end_matches(" || true");
+            // Windows host: `$TERMIC_PTY` is a named pipe (hook_pipe.rs),
+            // which Git Bash cannot open with `>`. The bundled CLI opens it
+            // properly, so the report goes through it. TERMIC_PTY_PIPE is set
+            // only on Windows host PTYs, so the same script inside a Docker
+            // container (Linux) takes the ordinary chain.
+            let windows_call;
+            let call = if cfg!(windows) {
+                windows_call = format!(
+                    "if [ -n \"$TERMIC_PTY_PIPE\" ]; then {func} /dev/stdout | \"$TERMIC_CLI\" hook-emit \"$TERMIC_PTY\"; else {unix_call}; fi"
+                );
+                windows_call.as_str()
+            } else {
+                unix_call
+            };
             out.push_str(&format!(
                 "{indent}( {call} ) </dev/null >/dev/null 2>&1 &\n\
                  {indent}termic_w=$!\n\
@@ -1953,9 +1967,11 @@ fn settings_rel(agent: &str) -> &'static str {
 /// would not resolve inside the cage.
 pub fn command_prefix(target: &Target) -> Result<String, String> {
     Ok(match target {
+        // Forward slashes on Windows: the agent runs the hook command
+        // through Git Bash, which would read `C:\\Users\\u` as escapes.
         Target::Host(_) => format!(
             "{}/",
-            config_dir(target)?.join(SCRIPT_DIR).to_string_lossy()
+            config_dir(target)?.join(SCRIPT_DIR).to_string_lossy().replace('\\', "/")
         ),
         Target::Docker(agent_id) => format!(
             "{}/{}/{}/",
@@ -2852,7 +2868,19 @@ pub fn remove(target: &Target) -> Result<(), String> {
 /// that reaches termic; see `event_for` / `uses_terminal_sequence`.
 pub const SUPPORTED: &[&str] = &["claude", "grok", "agy", "opencode", "codex", "devin", "pi", "copilot", "muse"];
 
+/// Which agents' hooks work on this OS. Windows: claude only. Its hooks run
+/// through Git Bash, which the `.sh` scripts need, and reach the app
+/// through the named pipe + `termic hook-emit` (hook_pipe.rs). Which shell
+/// the other agents run hooks in on Windows is unmeasured
+/// (docs/ideas/windows.md, M3), and a `.sh` path under cmd does nothing.
+fn hooks_work_for(base: &str) -> bool {
+    !cfg!(windows) || base == "claude"
+}
+
 fn check_supported(agent_id: &str) -> Result<(), String> {
+    if !hooks_work_for(&base_of(agent_id)) {
+        return Err(format!("hooks for {agent_id} are not available on Windows yet"));
+    }
     // A duplicated agent is supported when what it was cloned FROM is. It runs
     // the same binary and reads the same config shape, and the only reason it
     // was rejected before is that this list holds built-in names.
@@ -3044,7 +3072,7 @@ pub fn agent_hooks_plan(agent_id: String) -> Result<HookPlan, String> {
 #[tauri::command]
 pub fn agent_hooks_status(agent_id: String) -> AgentHookStatus {
     AgentHookStatus {
-        supported: SUPPORTED.contains(&base_of(&agent_id).as_str()),
+        supported: hooks_work_for(&base_of(&agent_id)) && SUPPORTED.contains(&base_of(&agent_id).as_str()),
         host: status(&Target::Host(agent_id.clone())),
         docker: status(&Target::Docker(agent_id.clone())),
         agent_id,
@@ -3912,7 +3940,15 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     fn bound_emits_wraps_every_chain_and_nothing_else() {
         let src = "a\n  emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true\nexit 0\n";
         let out = bound_emits(src);
-        assert!(out.starts_with("a\n  ( emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty ) </dev/null >/dev/null 2>&1 &\n"), "{out}");
+        // Windows routes a host PTY's report through `termic hook-emit` and
+        // keeps the ordinary chain for a Docker container (hook_pipe.rs).
+        let chain = "emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty";
+        let call = if cfg!(windows) {
+            format!("if [ -n \"$TERMIC_PTY_PIPE\" ]; then emit /dev/stdout | \"$TERMIC_CLI\" hook-emit \"$TERMIC_PTY\"; else {chain}; fi")
+        } else {
+            chain.to_string()
+        };
+        assert!(out.starts_with(&format!("a\n  ( {call} ) </dev/null >/dev/null 2>&1 &\n")), "{out}");
         assert!(out.contains("  ( sleep 2; kill \"$termic_w\" )"));
         assert!(out.ends_with("exit 0\n"));
         // Every generated script is bounded: no bare chain survives.
@@ -4766,6 +4802,7 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     /// `ready_output_for` with extra env for the hook process. The entrypoint
     /// is always cleared first: the test runner may itself be running under
     /// claude, whose value would otherwise decide the case.
+    #[cfg(unix)]
     fn ready_output_with_env(agent: &str, payload: &str, extra: &[(&str, &str)]) -> String {
         use std::io::Read;
         use std::process::{Command, Stdio};

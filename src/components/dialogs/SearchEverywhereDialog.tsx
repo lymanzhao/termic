@@ -30,7 +30,7 @@ import { CodeIntelActions } from "@/components/task/CodeIntelActions";
 import { fileIconUrl } from "@/lib/explorer/iconResolver";
 import { fuzzyMatch, Highlighted } from "@/lib/fuzzy";
 import { cn } from "@/lib/utils";
-import { bindingGlyphs } from "@/lib/shortcuts";
+import { bindingGlyphs, bindingText } from "@/lib/shortcuts";
 import { focusedTabId } from "@/lib/splitTree";
 import { effectiveLanguageId } from "@/lib/languages";
 import { lspServerFor } from "@/lib/lsp/languages";
@@ -511,7 +511,7 @@ export function SearchEverywhereDialog() {
     // past the symbols. Read from the live binding, never the default: the key
     // is rebindable, and a header naming a chord that opens nothing is worse
     // than a header with no chord at all.
-    hint: fileFinderBinding ? bindingGlyphs(fileFinderBinding).join("") : undefined,
+    hint: fileFinderBinding ? bindingText(fileFinderBinding) : undefined,
   });
 
   return (

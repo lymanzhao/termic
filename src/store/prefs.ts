@@ -2,6 +2,7 @@
 // Persisted to localStorage so they survive launches. Currently just the mono
 // font, but built for future things (themes, terminal opacity, etc.).
 
+import { SEATBELT_AVAILABLE } from "@/lib/platform";
 import { create } from "zustand";
 import type { SandboxSelection } from "@/lib/types";
 import { setDiagnosticsEnabled } from "@/lib/lsp/diagnosticsPref";
@@ -1100,6 +1101,8 @@ const initialFindInFilesMatchCase = lsGetBool(LS_FIND_IN_FILES_MATCH_CASE, false
 // to migrate: this was always a local-only pref, never persisted settings.
 function readInitialDefaultSandboxKind(): SandboxSelection {
   const stored = lsGet(LS_DEFAULT_SANDBOX_KIND, "");
+  // No Seatbelt on this OS: only off and docker are choices here.
+  if (!SEATBELT_AVAILABLE) return stored === "docker" ? "docker" : "off";
   if (stored === "off" || stored === "monitor" || stored === "enforce" || stored === "enforce-fs" || stored === "docker") {
     return stored;
   }

@@ -25,6 +25,7 @@ import { cn } from "@/lib/utils";
 import { Tip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { useAlignedSpin } from "@/hooks/useAlignedSpin";
+import { installCommand } from "@/lib/platform";
 
 const POLL_MS = 60_000;
 /** CLI re-probe cadence while the card is blocked on a missing / signed-out
@@ -181,8 +182,8 @@ export function PrCard({ task }: { task: Task }) {
     const cli = lookup.provider === "gitlab" ? "glab" : "gh";
     const hint =
       lookup.status === "cli-missing" ? {
-        title: t("pr.cliMissingTitle", { provider: providerLabel, noun: prNoun, cli }),
-        body: <Trans i18nKey="pr.cliMissingBody" values={{ install: `brew install ${cli}`, auth: `${cli} auth login` }} components={{ code: <Code /> }} />,
+        title: t("pr.cliMissingTitle", { provider: providerLabel, noun: prNoun, cli: lookup.provider === "gitlab" ? "glab" : "gh" }),
+        body: <Trans i18nKey="pr.cliMissingBody" values={{ install: installCommand(lookup.provider === "gitlab" ? "glab" : "gh"), auth: `${lookup.provider === "gitlab" ? "glab" : "gh"} auth login` }} components={{ code: <Code /> }} />,
       } : lookup.status === "cli-unauthed" ? {
         title: t("pr.signInTitle", { provider: providerLabel }),
         body: <Trans i18nKey="pr.signInBody" values={{ command: `${cli} auth login` }} components={{ code: <Code /> }} />,

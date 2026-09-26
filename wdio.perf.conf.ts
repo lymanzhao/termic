@@ -12,7 +12,7 @@ import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { flush, resetCollector } from "./perf/nightly/report.js";
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
-const appBinary = path.join(repoRoot, "src-tauri", "target", "debug", "termic");
+const appBinary = path.join(repoRoot, "src-tauri", "target", "debug", process.platform === "win32" ? "termic.exe" : "termic");
 
 export const dataDir = path.join(repoRoot, ".e2e", "profile");
 const reportPath =

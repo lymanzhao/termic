@@ -35,6 +35,7 @@ import { FileTree } from "./FileTree";
 import { GitPanel } from "./GitPanel";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
 import { useScriptRuns, useRunState } from "@/store/scriptRuns";
+import { kbd } from "@/lib/platform";
 
 /** Stable key for a composition member's `.termic.yaml` config maps.
  *  Inline members have no project id — key by their repo path (falling
@@ -934,7 +935,7 @@ function ScriptStream({ taskId, kind, run, hasScript, dismissKey, onStart, onCon
         <Button size="sm" variant="secondary" onClick={onStart} className="gap-1.5">
           <Play className="h-3 w-3" />
           {kind === "setup" ? t("rightPanel.runSetup") : t("rightPanel.runTask")}
-          <kbd className="ml-1 text-[10.5px] text-[var(--color-fg-faint)]">⌘R</kbd>
+          <kbd className="ml-1 text-[10.5px] text-[var(--color-fg-faint)]">{kbd("⌘R")}</kbd>
         </Button>
         <p className="text-[12px] text-[var(--color-fg-faint)]">
           {kind === "setup"

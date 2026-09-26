@@ -18,9 +18,9 @@ import {
   ctrlTabLabel,
   IS_MAC,
   type ShortcutGroup,
-  type ShortcutId,
-} from "@/lib/shortcuts";
+  type ShortcutId, displayGlyph } from "@/lib/shortcuts";
 import { codeIntelName } from "@/lib/lsp/featureName";
+import { dragRegion, appRegionStyle } from "@/lib/platform";
 
 /** One printed line: a label, the keys, and (for the fixed ones) why there is
  *  no recorder next to it. */
@@ -119,8 +119,7 @@ export function ShortcutsHelpDialog() {
     >
       {/* Header: ⌘ glyph + title on the left, Edit + Close on the right. */}
       <div
-        data-tauri-drag-region
-        style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+        {...dragRegion()}
         className="flex items-center justify-between gap-4 select-none"
       >
         <div className="flex items-center gap-2">
@@ -129,7 +128,7 @@ export function ShortcutsHelpDialog() {
         </div>
         <div
           data-tauri-drag-region="false"
-          style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+          style={appRegionStyle("no-drag")}
           className="flex items-center gap-1"
         >
           <button
@@ -203,7 +202,7 @@ export function ShortcutsHelpDialog() {
 function KeyCap({ glyph }: { glyph: string }) {
   return (
     <kbd className="inline-flex h-7 min-w-[28px] items-center justify-center rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 font-mono text-[12px] leading-none text-[var(--color-fg-dim)]">
-      {glyph}
+      {displayGlyph(glyph)}
     </kbd>
   );
 }

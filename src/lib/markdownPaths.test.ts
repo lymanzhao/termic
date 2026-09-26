@@ -126,6 +126,16 @@ describe("resolveExternalHref", () => {
     expect(resolveExternalHref("/a/b.md", "../../../c.md")).toBe("/c.md");
   });
 
+  it("resolves a Windows file's links in its own spelling", () => {
+    const win = "C:\\Users\\alice\\notes\\plans\\q3.md";
+    expect(resolveExternalHref(win, "retro.md")).toBe("C:\\Users\\alice\\notes\\plans\\retro.md");
+    expect(resolveExternalHref(win, "../README.md#x")).toBe("C:\\Users\\alice\\notes\\README.md");
+    expect(resolveExternalHref(win, "sub\\a.md")).toBe("C:\\Users\\alice\\notes\\plans\\sub\\a.md");
+    expect(resolveExternalHref(win, "/top.md")).toBe("C:\\top.md");
+    expect(resolveExternalHref(win, "../../../../../c.md")).toBe("C:\\c.md");
+    expect(resolveExternalHref("C:/Users/alice/q3.md", "retro.md")).toBe("C:\\Users\\alice\\retro.md");
+  });
+
   it("decodes percent-encoding", () => {
     expect(resolveExternalHref(file, "my%20notes.md")).toBe("/Users/alice/notes/plans/my notes.md");
   });

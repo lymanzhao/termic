@@ -212,8 +212,9 @@ no write. Restore stays in History; the Archived column links there.
 
 ## Task groups in the sidebar
 
-When an agent inside task A creates task B (`termic new`, or MCP `task_new`),
-both land in one group led by A. The agent can name and colour the group itself: `termic group --name
+When an agent inside task A creates task B (`termic new`, or MCP `task_new`)
+in A's own project, both land in one group led by A. In ANOTHER project B
+joins no group and is only linked (see "Spawn links" below). The agent can name and colour the group itself: `termic group --name
 ... --color ...` (MCP `task_group`); the `new` reply prints the group it
 joined and `TERMIC_CLI_HELP` teaches the verb, so an agent finds it
 without being told. The CLI reads
@@ -237,8 +238,11 @@ what a screenshot cannot settle. The rename input inherits the caption's
 font and has no padding or border (its outline is outside the box), so
 entering rename moves no text.
 A group exists while any live task carries it, one member included, the
-same rule as a project folder; a group spanning two projects draws its
-share in each. The label is the group's own name or,
+same rule as a project folder. A group lives in ONE project: Rust refuses
+a join across projects, and a group an older build left spanning two draws
+its lone member in a project as a plain row (`crossProjectStrays`), since
+two groups of one, both captioned with the lead's name, said nothing about
+how the tasks relate. The label is the group's own name or,
 unnamed, the lead's live name, so renaming the orchestrator renames the
 group until someone names it. Founding colours skip red first (`blue`,
 `teal`, ... `red` last): a red caption on a fresh group reads as an error.
@@ -290,6 +294,25 @@ Dragging the CAPTION moves the whole block within its project, the task
 twin of the project-folder drag: it hit-tests only top-level items (loose
 rows and other blocks), moves the members through the store as one run,
 and writes the display order through `task_reorder` on drop.
+
+## Spawn links
+
+Every task an agent creates carries `spawned_by`, its DIRECT parent's id,
+grouped or not (`src/lib/spawnLinks.ts`, `SpawnLinks.tsx`). Two things
+draw it:
+
+- A ↳ mark after the child's name, titled "Started by <parent> (<project>)";
+  a click goes to the parent. Only where the group rail does not already say
+  it: a child in another project, or one dragged out of its parent's group.
+- Lines, ONLY while a row is hovered: an elbow from the hovered task to its
+  parent and to each task it spawned, one level each way, down a faint 1px
+  trunk 12px in (the accent, at the very edge, read as a loud border). Always-on lines between rows that sit far apart, across
+  other projects, would tangle the list. Only between rows the grouping does
+  not already link (another project, another group, or none): inside one
+  group block the rail says it, so the mark and the line both stay off. The overlay keeps its own hover
+  state and reads the task list only when the hovered row changes, so
+  hovering re-renders nothing else; it skips a drag and the icon rail, and a
+  row that is not in the DOM (collapsed project, filtered out) gets no line.
 
 ## What a task is called (name vs branch)
 

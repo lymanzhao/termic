@@ -117,7 +117,9 @@ describe("MCP endpoint: files, discovery, and the Phase A boundary", () => {
     expect(fs.existsSync(tokenFile)).toBe(true);
     expect(endpoint()).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
     // The credential is 0600 and never the CLI's token.
-    expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
+    // Unix mode bits. Windows has none (the file inherits the per-user data
+    // dir's ACL), so the check is unix-only.
+    if (process.platform !== "win32") expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
     expect(token().length).toBeGreaterThanOrEqual(32);
     const cliToken = fs.readFileSync(path.join(dataDir, "cli-token"), "utf8").trim();
     expect(token()).not.toBe(cliToken);

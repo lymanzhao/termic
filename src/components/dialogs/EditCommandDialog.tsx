@@ -13,6 +13,7 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { taskSetCustomCommand } from "@/lib/ipc";
 import { SquareChevronRight } from "lucide-react";
+import { kbd } from "@/lib/platform";
 
 export function EditCommandDialog() {
   const { t } = useTranslation("dialogs");
@@ -88,6 +89,7 @@ export function EditCommandDialog() {
           <Trans
             t={t}
             i18nKey="editCommand.pressToSave"
+            values={{ combo: kbd("⌘↵") }}
             components={{ kbd: <kbd className="font-mono" /> }}
           />
         </span>
