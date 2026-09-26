@@ -65,12 +65,22 @@ fn build_cli_sidecar() {
         .expect("failed to spawn cargo for the termic-cli sidecar");
     assert!(status.success(), "building the termic-cli sidecar failed");
 
-    let built = sidecar_target_dir.join(&target).join(profile_dir).join("termic-cli");
+    let built = sidecar_target_dir
+        .join(&target)
+        .join(profile_dir)
+        .join(if cfg!(windows) { "termic-cli.exe" } else { "termic-cli" });
     let binaries = manifest_dir.join("binaries");
     std::fs::create_dir_all(&binaries).expect("create src-tauri/binaries");
     let dest = binaries.join(format!("termic-cli-{target}"));
     std::fs::copy(&built, &dest)
         .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", built.display(), dest.display()));
+    // tauri-build looks for the platform-executable name on Windows; give
+    // it the .exe spelling too so bundle validation finds the sidecar.
+    if cfg!(windows) {
+        let dest_exe = binaries.join(format!("termic-cli-{target}.exe"));
+        std::fs::copy(&built, &dest_exe)
+            .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", built.display(), dest_exe.display()));
+    }
 
     // Universal-macOS convenience: once both arch sidecars exist, lipo
     // them so a `--target universal-apple-darwin` bundle finds its file

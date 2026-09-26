@@ -10,11 +10,11 @@
 
 use crate::CliError;
 use std::io::{BufReader, Read};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 use termic_proto as proto;
 use termic_proto::exit_code;
+use termic_proto::transport::Stream;
 
 /// Where the socket and token live. `custom` is set when TERMIC_SOCKET
 /// overrode discovery; auto-launch is disabled then (the override points
@@ -65,8 +65,8 @@ pub fn socket_paths_from(socket_env: Option<String>, data_dir: Option<PathBuf>) 
 }
 
 pub struct Conn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
 }
 
 /// Read-timeout ceiling for verbs whose single reply legitimately takes
@@ -100,22 +100,24 @@ impl Conn {
 
     /// Split into the raw halves for the attach session's two loops
     /// (socket-to-stdout on one thread, stdin-to-socket on another).
-    pub fn into_split(self) -> (BufReader<UnixStream>, UnixStream) {
+    pub fn into_split(self) -> (BufReader<Stream>, Stream) {
         (self.reader, self.writer)
     }
 
     /// Direct line-level read access (attach's pre-session handshake).
-    pub fn reader_mut(&mut self) -> &mut BufReader<UnixStream> {
+    pub fn reader_mut(&mut self) -> &mut BufReader<Stream> {
         &mut self.reader
     }
 }
 
 fn try_connect(paths: &SocketPaths) -> std::io::Result<Conn> {
-    let stream = UnixStream::connect(&paths.socket)?;
     // Replies for these read verbs are quick; the generous ceiling only
     // exists so a wedged app can never hang a script forever.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let stream = proto::transport::connect_with_timeouts(
+        &paths.socket,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    )?;
     let reader = BufReader::new(stream.try_clone()?);
     Ok(Conn { reader, writer: stream })
 }

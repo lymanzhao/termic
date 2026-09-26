@@ -181,11 +181,17 @@ pub fn label_for(
 /// Signals the monitor is allowed to send. Deliberately small: this is a
 /// process manager for OUR agents, not a general-purpose `kill`.
 pub fn signal_from_name(name: &str) -> Option<libc::c_int> {
+    // KILL/STOP/CONT have no Windows libc constant; the only consumer of
+    // these numbers is the real procmon (macOS/Linux), so on other OSes
+    // the names resolve to "unsupported" rather than a made-up number.
     match name {
         "TERM" => Some(libc::SIGTERM),
-        "KILL" => Some(libc::SIGKILL),
         "INT" => Some(libc::SIGINT),
+        #[cfg(unix)]
+        "KILL" => Some(libc::SIGKILL),
+        #[cfg(unix)]
         "STOP" => Some(libc::SIGSTOP),
+        #[cfg(unix)]
         "CONT" => Some(libc::SIGCONT),
         _ => None,
     }

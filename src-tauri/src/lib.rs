@@ -45,6 +45,7 @@ mod forge;
 mod mcp_server;
 // Row shapes + OS-agnostic logic (subtree walk, cpu_ratio, label_for,
 // signal_from_name) shared by every `procmon` variant below.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 mod procmon_common;
 // macOS: real libproc/mach FFI. Linux: /proc. Everything else: a stub that
 // answers "unsupported on this OS" — see procmon_other.rs's module doc.
@@ -61,6 +62,7 @@ mod procmon;
 mod docker;
 mod agent_dirs;
 mod profiles;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod sudo_touchid;
 #[cfg(test)]
 mod test_support;
@@ -4280,7 +4282,7 @@ fn pty_kill(state: State<'_, PtyManager>, pty_id: String) -> Result<(), String> 
         // thread that has the Child handle pinned in wait()).
         if let Some(pid) = slot.child_pid {
             // SAFETY: kill(2) is async-signal-safe and the pid is an i32.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+            proc_kill(pid, false, ProcSignal::Kill);
         }
         drop(slot.writer);
         drop(slot.master);
@@ -5709,8 +5711,8 @@ fn link_repo_mode_members(host_dir: &Path, members: &[ProjectMember], first_port
                 eprintln!("task_open_repo: {} exists and isn't our symlink; skipping {}", target.display(), pm.name);
                 continue;
             }
-        } else if let Err(e) = std::os::unix::fs::symlink(&pm.root_path, &target) {
-            eprintln!("task_open_repo: symlink {} failed: {e}", pm.name);
+        } else if let Err(e) = make_link(Path::new(&pm.root_path), &target) {
+            eprintln!("task_open_repo: link {} failed: {e}", pm.name);
             continue;
         }
         let member_port = next_member_port;
@@ -6838,7 +6840,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
             if src.exists() {
                 let dst = wrapper.join(shared);
                 if !dst.exists() {
-                    let _ = std::os::unix::fs::symlink(&src, &dst);
+                    let _ = make_link(&src, &dst);
                 }
             }
         }
@@ -6941,7 +6943,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         match spec.mode {
             MemberMode::RepoRoot => {
                 emit_create_progress(&app, &task_id, format!("Linking member '{dir_name}' to its live checkout…"));
-                if let Err(e) = std::os::unix::fs::symlink(&mp.root_path, &target) {
+                if let Err(e) = make_link(Path::new(&mp.root_path), &target) {
                     rollback(&done);
                     return Err(format!("symlink {dir_name}: {e}"));
                 }
@@ -8350,7 +8352,7 @@ pub(crate) fn kill_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     let count = victims.len();
     for (pid, container) in victims {
         if let Some(pid) = pid {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+            proc_kill(pid, false, ProcSignal::Kill);
         }
         // Killing the client does not stop the container (see
         // docker::rm_container). Reap by name so this stays correct even
@@ -9088,6 +9090,190 @@ pub(crate) fn stop_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     count
 }
 
+// ───────────────────── process kill / liveness ───────────────────────
+// The platform split for everything that used to call kill(2) directly.
+
+/// What a kill wants to happen to the target. Unix has both; Windows has
+/// only the hard stop (TerminateProcess, or a tree kill via taskkill /T),
+/// where `Term` collapses to `Kill` - there is no polite signal to send.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcSignal {
+    /// SIGTERM: ask the process to exit.
+    Term,
+    /// SIGKILL: the kernel takes it down now.
+    Kill,
+}
+
+/// Put `src` (a live repo checkout, a shared config dir, a shared memory
+/// file) at `link` inside a worktree. Unix: a symlink. Windows: a
+/// junction for directories (symlink_dir needs privileges a junction
+/// does not) and a hardlink for files, falling back to a copy across
+/// volumes - a copy stops propagating edits, which the shared-memory
+/// callers tolerate rather than fail the whole worktree over.
+pub(crate) fn make_link(src: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, link)
+    }
+    #[cfg(windows)]
+    {
+        if src.is_dir() {
+            win_junction(src, link)
+        } else {
+            std::fs::hard_link(src, link)
+                .or_else(|_| std::fs::copy(src, link).map(|_| ()))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (src, link);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no link support"))
+    }
+}
+
+/// Directory junction (the no-privilege Windows directory link), through
+/// `cmd /C mklink /J`. Paths are canonicalized so cmd sees backslashes,
+/// then the `\\?\` prefix is stripped (cmd does not accept it on the
+/// link side).
+#[cfg(windows)]
+fn win_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let deunc = |p: &Path| {
+        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = c.to_string_lossy().to_string();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    };
+    let link = deunc(link);
+    let target = deunc(target);
+    let script = format!("mklink /J \"{}\" \"{}\"", link.display(), target.display());
+    let st = std::process::Command::new("cmd")
+        .args(["/C", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("mklink /J {} failed", link.display()),
+        ))
+    }
+}
+
+/// Pid as stored by the various registries: PTY slots keep u32
+/// (child_pid), the script/grep/LSP maps keep i32 (pgid). A private
+/// conversion keeps every call site cast-free.
+trait ToPid {
+    fn to_pid(self) -> u32;
+}
+impl ToPid for u32 {
+    fn to_pid(self) -> u32 {
+        self
+    }
+}
+impl ToPid for i32 {
+    fn to_pid(self) -> u32 {
+        self.max(0) as u32
+    }
+}
+
+/// Kill a process by pid; with `group`, the whole process GROUP on Unix
+/// (a negated pid) / the whole process TREE on Windows (taskkill /T).
+/// Best-effort: reports whether the signal was delivered.
+pub(crate) fn proc_kill(pid: impl ToPid, group: bool, sig: ProcSignal) -> bool {
+    let pid = pid.to_pid();
+    #[cfg(unix)]
+    {
+        let sig = match sig {
+            ProcSignal::Term => libc::SIGTERM,
+            ProcSignal::Kill => libc::SIGKILL,
+        };
+        let target = if group { -(pid as i32) } else { pid as i32 };
+        // SAFETY: kill(2) is async-signal-safe and the pid is an i32.
+        unsafe { libc::kill(target, sig) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        if group {
+            // No process groups on Windows; taskkill takes the tree,
+            // which is the property every `group` call site wants (the
+            // children must not outlive the leader).
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        } else {
+            terminate_pid(pid)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, group, sig);
+        false
+    }
+}
+
+/// Liveness probe without signalling (`kill(pid, 0)` on Unix).
+pub(crate) fn proc_alive(pid: impl ToPid) -> bool {
+    let pid = pid.to_pid();
+    #[cfg(unix)]
+    {
+        // A pid the waiter has already reaped fails with ESRCH, which is
+        // the exit the caller is waiting for.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess on a pid we do not own fails with
+        // ACCESS_DENIED, which reads as "not ours / not alive" - the
+        // fail-closed direction for a liveness check on our own children.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) as HANDLE;
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Hard-stop a single process (Windows single-target half of proc_kill).
+#[cfg(windows)]
+fn terminate_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+    };
+    // SAFETY: OpenProcess may fail (gone or not ours) -> false;
+    // TerminateProcess is the documented hard stop, handle closed below.
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(h, 1);
+        CloseHandle(h);
+        ok != 0
+    }
+}
+
 /// SIGTERM, wait for exit up to STOP_GRACE, SIGKILL the remainder.
 /// Split out so both the task-tagged and the role-tagged sweeps share it.
 fn graceful_then_kill(pids: &[u32]) {
@@ -9095,20 +9281,19 @@ fn graceful_then_kill(pids: &[u32]) {
         return;
     }
     for &pid in pids {
-        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        proc_kill(pid, false, ProcSignal::Term);
     }
     // `kill(pid, 0)` probes liveness without signalling. A pid the waiter has
     // already reaped fails with ESRCH, which is the exit we are waiting for.
-    let alive = |pid: u32| unsafe { libc::kill(pid as i32, 0) } == 0;
     let deadline = std::time::Instant::now() + STOP_GRACE;
     while std::time::Instant::now() < deadline {
-        if !pids.iter().any(|&p| alive(p)) {
+        if !pids.iter().any(|&p| proc_alive(p)) {
             return;
         }
         std::thread::sleep(STOP_POLL);
     }
-    for &pid in pids.iter().filter(|&&p| alive(p)) {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    for &pid in pids.iter().filter(|&&p| proc_alive(p)) {
+        proc_kill(pid, false, ProcSignal::Kill);
     }
 }
 
@@ -9327,7 +9512,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
         };
         for k in keys {
             if let Some(pid) = running_scripts_remove(&k) {
-                unsafe { libc::kill(-pid, libc::SIGTERM); }
+                proc_kill(pid, true, ProcSignal::Term);
             }
         }
     }
@@ -9645,7 +9830,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                 if src.exists() {
                     let dst = wt_path.join(shared);
                     if !dst.exists() {
-                        let _ = std::os::unix::fs::symlink(&src, &dst);
+                        let _ = make_link(&src, &dst);
                     }
                 }
             }
@@ -9682,7 +9867,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                     // Recreate symlink: <wrapper>/<dir_name> → m.path
                     let link = wt_path.join(&m.dir_name);
                     if !link.exists() {
-                        let _ = std::os::unix::fs::symlink(&m.path, &link);
+                        let _ = make_link(Path::new(&m.path), &link);
                     }
                 }
                 MemberMode::Worktree => {
@@ -13781,7 +13966,7 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
             if target.symlink_metadata().is_ok() { continue; }
             let src = member_repo_path(m);
             if src.is_empty() || !Path::new(&src).exists() { continue; }
-            match std::os::unix::fs::symlink(&src, &target) {
+            match make_link(Path::new(&src), &target) {
                 Ok(()) => out.push(FileEntry { name: m.dir_name.clone(), is_dir: true }),
                 Err(e) => eprintln!("heal member link {} → {src} failed: {e}", target.display()),
             }
@@ -15370,6 +15555,9 @@ async fn lsp_install_version(
         let _ = fs::remove_dir_all(&staging);
         return Err(format!("{} {} did not contain {exe_rel}", spec.label, asset.version));
     }
+    // Executable bits are a Unix concept; a staged .exe on Windows is
+    // already executable.
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&staged_exe, fs::Permissions::from_mode(0o755))
@@ -16100,6 +16288,7 @@ async fn lsp_start(
     custom: Option<String>,
 ) -> Result<String, String> {
     use std::io::{BufReader, Read as _};
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -16159,8 +16348,12 @@ async fn lsp_start(
         .env("PATH", path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    // Own process group so the stop path can signal the whole tree
+    // (language servers fork cargo/node). Windows has no process groups;
+    // the tree kill in proc_kill covers the same cleanup.
+    #[cfg(unix)]
+    cmd.process_group(0);
     for (k, v) in inject {
         cmd.env(k, v);
     }
@@ -16324,7 +16517,7 @@ async fn lsp_start(
         }
         // Signal the GROUP: language servers fork (cargo check, node) and
         // signalling the leader alone leaves the children behind.
-        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        proc_kill(pid, true, ProcSignal::Term);
         let _ = child.wait();
     });
 
@@ -16368,9 +16561,7 @@ async fn lsp_stop(id: String) -> Result<(), String> {
         g.as_mut().and_then(|m| m.remove(&id))
     };
     if let Some(s) = server {
-        unsafe {
-            libc::kill(-s.pid, libc::SIGTERM);
-        }
+        proc_kill(s.pid, true, ProcSignal::Term);
     }
     Ok(())
 }
@@ -16424,7 +16615,7 @@ fn reap_foreign_servers(page: &str) -> usize {
         ));
         // The GROUP: these fork (node, cargo check), and signalling the leader
         // alone leaves the children behind, which is the leak twice over.
-        unsafe { libc::kill(-s.pid, libc::SIGTERM) };
+        proc_kill(s.pid, true, ProcSignal::Term);
     }
     orphans.len()
 }
@@ -16719,7 +16910,7 @@ fn spotlight_kill_run(ws_id: &str) {
     // Host run scripts use map key "{ws_id}::run" (empty member component).
     let key = format!("{ws_id}::run");
     if let Some(pid) = running_scripts_remove(&key) {
-        unsafe { libc::kill(-pid, libc::SIGTERM); }
+        proc_kill(pid, true, ProcSignal::Term);
     }
 }
 
@@ -17032,6 +17223,7 @@ fn task_run_script_stream(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -17152,9 +17344,9 @@ fn task_run_script_stream(
         // key maps to neither pid tiny; running_scripts_finish's pid check
         // covers the old waiter racing us.
         if let Some(prev) = running_scripts_remove(&map_key_o) {
-            unsafe { libc::kill(-prev, libc::SIGTERM); }
+            proc_kill(prev, true, ProcSignal::Term);
             for _ in 0..50 {
-                if unsafe { libc::kill(-prev, 0) } != 0 { break; }
+                if !proc_alive(prev) { break; }
                 thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -17186,8 +17378,11 @@ fn task_run_script_stream(
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "UTF-8")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // Own process group so the stop path can kill the whole tree;
+        // see the LSP spawn for the Windows note.
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (k, v) in run_inject {
             cmd.env(k, v);
         }
@@ -17248,7 +17443,7 @@ fn task_stop_script(id: String, kind: String, member: Option<String>) -> Result<
     let member_dir = member.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let map_key = format!("{id}:{}:{kind}", member_dir.unwrap_or_default());
     if let Some(pid) = running_scripts_remove(&map_key) {
-        unsafe { libc::kill(-pid, libc::SIGTERM); }
+        proc_kill(pid, true, ProcSignal::Term);
     }
     Ok(())
 }
@@ -17280,15 +17475,28 @@ impl FindBackend {
 /// instead of shelling out to `which` because this runs on the search
 /// path and a process spawn is the expensive part of the probe.
 fn find_on_path(bin: &str, path: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    path.split(':')
-        .filter(|d| !d.is_empty())
-        .map(|d| Path::new(d).join(bin))
-        .find(|p| {
-            fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join(bin))
+            .find(|p| {
+                fs::metadata(p)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        // No exec bits on Windows: CreateProcess resolves `bin` to
+        // `bin.exe` itself (PATHEXT is a shell layer, not a kernel one),
+        // so probe both spellings and accept any plain file.
+        std::env::split_paths(path)
+            .filter(|d| !d.as_os_str().is_empty())
+            .flat_map(|d| [d.join(format!("{bin}.exe")), d.join(bin)])
+            .find(|p| p.is_file())
+    }
 }
 
 /// Resolve the backend, memoizing only an answer that can't get better.
@@ -17479,6 +17687,7 @@ fn task_grep_start(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -17507,7 +17716,7 @@ fn task_grep_start(
     // search_id each keystroke and ignores late events from stale ids,
     // but we still want to free the CPU cycles ASAP.
     if let Some(prev) = running_greps_swap(&id, None) {
-        unsafe { libc::kill(-prev, libc::SIGKILL); }
+        proc_kill(prev, true, ProcSignal::Kill);
     }
 
     let app_o = app.clone();
@@ -17552,9 +17761,12 @@ fn task_grep_start(
         };
         cmd.current_dir(rcwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
+            .stderr(Stdio::null());
+        // Own process group so cancel can kill the tree (see the LSP
+        // spawn for the Windows note).
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn()
     };
 
     thread::spawn(move || {
@@ -17631,7 +17843,7 @@ fn task_grep_start(
                     }
                     if count >= RESULT_CAP {
                         truncated = true;
-                        unsafe { libc::kill(-pid, libc::SIGKILL); }
+                        proc_kill(pid, true, ProcSignal::Kill);
                         break;
                     }
                 }
@@ -17668,7 +17880,7 @@ fn task_grep_start(
 #[tauri::command]
 fn task_grep_cancel(id: String) -> Result<(), String> {
     if let Some(prev) = running_greps_swap(&id, None) {
-        unsafe { libc::kill(-prev, libc::SIGKILL); }
+        proc_kill(prev, true, ProcSignal::Kill);
     }
     Ok(())
 }
@@ -22976,7 +23188,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = RUNNING_SCRIPTS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, pid) in map.drain() {
-                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                proc_kill(pid, true, ProcSignal::Kill);
             }
         }
     }
@@ -22987,7 +23199,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = LSP_SERVERS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, s) in map.drain() {
-                unsafe { libc::kill(-s.pid, libc::SIGKILL); }
+                proc_kill(s.pid, true, ProcSignal::Kill);
             }
         }
     }
@@ -22996,7 +23208,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut g = RUNNING_GREPS.lock().unwrap();
         if let Some(map) = g.as_mut() {
             for (_, pid) in map.drain() {
-                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                proc_kill(pid, true, ProcSignal::Kill);
             }
         }
     }
@@ -23006,7 +23218,7 @@ fn cleanup_children(app: &tauri::AppHandle) {
         let mut inner = mgr.inner.lock();
         for (_, slot) in inner.drain() {
             if let Some(pid) = slot.child_pid {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                proc_kill(pid, false, ProcSignal::Kill);
             }
         }
     }

@@ -25,9 +25,21 @@ path = "src/lib.rs"
 # dependency-light.
 [dependencies]
 termic-proto = { path = "../termic-proto" }
-# SIGPIPE restoration only (main.rs); keep this list short.
-libc = "0.2"
 serde = "1"
 serde_json = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 dirs = "5"
+
+# Unix-only: SIGPIPE restoration (main.rs) + termios/ioctl raw mode
+# (attach.rs). Windows has no SIGPIPE and uses the Console API instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows-only: attach's raw mode + terminal size via the Console API.
+# windows-sys 0.60.2 is already in the dependency tree via tauri.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+] }
