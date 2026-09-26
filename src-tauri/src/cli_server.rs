@@ -4589,7 +4589,9 @@ pub fn cli_rpc_progress(id: String, payload: String) -> Result<(), String> {
 pub(crate) fn bundled_cli_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("app binary has no parent dir")?;
-    let p = dir.join("termic-cli");
+    // The bundler installs the sidecar as `termic-cli.exe` on Windows
+    // (build.rs / build-cli.mjs stage both spellings during the build).
+    let p = dir.join(if cfg!(windows) { "termic-cli.exe" } else { "termic-cli" });
     if p.is_file() {
         Ok(p)
     } else {
@@ -8020,6 +8022,30 @@ mod tests {
         assert!(fresh.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_shim_round_trips_through_recognition() {
+        // The shim IS the install on Windows: write it, then verify every
+        // recognition primitive the reconcile/status paths rely on.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("app").join("termic-cli.exe");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"binary").unwrap();
+        let link = dir.path().join("bin").join("termic.cmd");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+
+        symlink_replacing(&src, &link).unwrap();
+        assert!(replaceable(&link).unwrap(), "a shim of ours is replaceable");
+        assert!(shim_src(&link).is_some_and(|t| t == src), "the shim records its source");
+        assert!(installed_points_at(&link, &src), "reconcile sees it as current");
+        assert!(is_our_installed_link(&link), "install status reports it");
+
+        // A foreign .cmd is never ours to replace.
+        let foreign = dir.path().join("bin").join("other.cmd");
+        std::fs::write(&foreign, b"@echo off\r\nrem someone else\r\n").unwrap();
+        assert!(!replaceable(&foreign).unwrap(), "a foreign shim is not replaceable");
     }
 
     #[test]
