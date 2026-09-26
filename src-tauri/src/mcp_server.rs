@@ -3864,6 +3864,7 @@ command = \"/bin/true\"\n";
     /// the copy affordance only reads a file this server would have
     /// written, so a hand-made or loosened one is not handed out.
     #[test]
+    #[cfg(unix)]
     fn token_from_file_accepts_only_a_file_this_server_wrote() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

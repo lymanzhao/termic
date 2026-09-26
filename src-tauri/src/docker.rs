@@ -1984,7 +1984,7 @@ mod tests {
         // logins apart. Mounting claude's own folder here would defeat the
         // reason the clone exists.
         let cfg_mount = spec.mounts.iter().find(|m| m.container == "/root/.claude").unwrap();
-        assert!(cfg_mount.host.ends_with("docker-agents/next-claude"), "{}", cfg_mount.host);
+        assert!(cfg_mount.host.replace('\\', "/").ends_with("docker-agents/next-claude"), "{}", cfg_mount.host);
     }
 
     // ── the Docker credential realm, for the account switcher (GH #278) ──
@@ -2035,7 +2035,7 @@ mod tests {
                     &[], false, &[], &[], "pty-realm00001", agent, &[], None);
                 let m = spec.mounts.iter().find(|m| m.container == container)
                     .unwrap_or_else(|| panic!("{agent}: no config mount at {container}"));
-                assert!(m.host.contains(&format!("docker-agents/{agent}")), "{agent}: {}", m.host);
+                assert!(m.host.replace('\\', "/").contains(&format!("docker-agents/{agent}")), "{agent}: {}", m.host);
                 let var = crate::agent_dirs::config_relocation_env(agent)
                     .unwrap_or_else(|| panic!("{agent} should relocate"));
                 assert!(spec.env.iter().any(|(k, v)| k == var && v == container),
@@ -2057,7 +2057,7 @@ mod tests {
                 &[], false, &[], &[], "pty-noreloc0001", "agy", &[], None);
             let m = spec.mounts.iter().find(|m| m.container == "/root/.gemini")
                 .expect("agy's primary config dir must be mounted");
-            assert!(m.host.contains("docker-agents/agy"), "{}", m.host);
+            assert!(m.host.replace('\\', "/").contains("docker-agents/agy"), "{}", m.host);
             assert!(crate::agent_dirs::config_relocation_env("agy").is_none());
         });
     }
@@ -2237,7 +2237,7 @@ mod tests {
         }
         // The account's own directory is still what the config dir points at,
         // so the CREDENTIAL stays per-account. That is the whole feature.
-        assert!(spec.mounts.iter().any(|m| m.host.ends_with("/claude/work") && m.container == "/root/.claude"),
+        assert!(spec.mounts.iter().any(|m| m.host.replace('\\', "/").ends_with("/claude/work") && m.container == "/root/.claude"),
             "the account keeps its own config dir: {:?}", spec.mounts);
 
         // Without an account nothing is overlaid: the primary dir IS the
@@ -2602,7 +2602,7 @@ mod tests {
                 .expect("a shared dir the user listed should be mounted");
             // Host layout mirrors the container path, so two entries with the
             // same basename (.config/gh vs some other gh) cannot collide.
-            assert!(nvim.host.ends_with("docker-forge/config/nvim"), "{}", nvim.host);
+            assert!(nvim.host.replace('\\', "/").ends_with("docker-forge/config/nvim"), "{}", nvim.host);
             assert!(std::path::Path::new(&nvim.host).is_dir(), "{} should exist already", nvim.host);
             assert!(!spec.env.iter().any(|(_, v)| v == "/root/.config/nvim"),
                 "no relocation env should be invented for a CLI this module knows nothing about");

@@ -4465,7 +4465,6 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     /// the generated shell against a `TERMIC_PTY` file inside one, and cargo
     /// runs them in parallel: pid+nanos lands two tests on the same path often
     /// enough that one reads (or deletes) the other's pty mid-run.
-    #[cfg(unix)]
     fn unique_test_dir(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);

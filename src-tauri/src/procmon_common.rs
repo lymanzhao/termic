@@ -281,6 +281,7 @@ mod tests {
     #[test]
     fn only_known_signals_are_allowed() {
         assert_eq!(signal_from_name("TERM"), Some(libc::SIGTERM));
+        #[cfg(unix)]
         assert_eq!(signal_from_name("CONT"), Some(libc::SIGCONT));
         assert_eq!(signal_from_name("SIGKILL"), None);
         assert_eq!(signal_from_name("9"), None);

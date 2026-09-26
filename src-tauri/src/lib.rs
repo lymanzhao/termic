@@ -1110,6 +1110,15 @@ fn build_account_farm(primary: &Path, store: &Path, entries: &[&str]) -> std::io
         if std::os::unix::fs::symlink(&src, &dst).is_ok() {
             made += 1;
         }
+        // Junction for the shared dirs (projects/…), hardlink-or-copy for
+        // the shared files (settings.json, CLAUDE.md, …) - the plain
+        // symlink_dir/symlink_file calls need privileges this does not
+        // have. A hardlinked file is still ONE file (edits propagate),
+        // which is the property the farm exists for.
+        #[cfg(not(unix))]
+        if crate::make_link(&src, &dst).is_ok() {
+            made += 1;
+        }
     }
     let _ = fs::write(store.join(ACCOUNT_FARM_MARKER), b"");
     Ok(made)
@@ -1600,7 +1609,17 @@ fn expand_tilde(path: &str) -> String {
         return trimmed.to_string();
     };
     dirs::home_dir()
-        .map(|h| format!("{}{rest}", h.to_string_lossy()))
+        .map(|h| {
+            let joined = format!("{}{rest}", h.to_string_lossy());
+            // The literal the user typed carries a forward slash
+            // (`~/.next-claude`); on Windows the home part is backslashed,
+            // so route the join through the platform separator instead of
+            // handing the agent a mixed-separator path.
+            #[cfg(windows)]
+            return joined.replace('/', "\\");
+            #[cfg(not(windows))]
+            joined
+        })
         .unwrap_or_else(|| trimmed.to_string())
 }
 
@@ -2142,14 +2161,11 @@ fn link_config_dir(repo: &Path, wt: &Path, name: &str) {
     let target = fs::canonicalize(&src).unwrap_or(src);
     #[cfg(unix)]
     let linked = std::os::unix::fs::symlink(&target, &dst).is_ok();
-    // Windows needs to know which kind it is up front, and the list is no
-    // longer dirs-only: `.mcp.json` is a file (GH #251).
+    // Windows: junction for the dirs, hardlink-or-copy for files (the
+    // list is no longer dirs-only: `.mcp.json` is a file, GH #251).
+    // std's symlink_dir/symlink_file need privileges a junction does not.
     #[cfg(not(unix))]
-    let linked = if target.is_dir() {
-        std::os::windows::fs::symlink_dir(&target, &dst).is_ok()
-    } else {
-        std::os::windows::fs::symlink_file(&target, &dst).is_ok()
-    };
+    let linked = make_link(&target, &dst).is_ok();
     if linked {
         // The link is a symlink, which git's `<name>/` (directory) ignore
         // patterns do NOT match - so without this it shows as an untracked
@@ -4453,7 +4469,56 @@ fn farm_planted(entry: &std::fs::DirEntry) -> bool {
     if entry.file_name() == std::ffi::OsStr::new(ACCOUNT_FARM_MARKER) {
         return true;
     }
+    #[cfg(windows)]
+    {
+        // The Windows farm links shared FILES as hardlinks (a symlink
+        // needs privileges), which std cannot distinguish from a plain
+        // file. A hardlink carries more than one link in the file's
+        // link count; anything an agent wrote fresh has exactly one.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            return true;
+        }
+        return file_is_hardlinked(&entry.path());
+    }
+    #[cfg(not(windows))]
     entry.file_type().map(|t| t.is_symlink()).unwrap_or(false)
+}
+
+/// Does `path` carry more than one link (Windows half of farm_planted)?
+#[cfg(windows)]
+fn file_is_hardlinked(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    // SAFETY: CreateFileW with read-attributes only, on a path from a live
+    // directory listing; INVALID_HANDLE_VALUE is mapped to the error path
+    // and the handle is closed on every exit.
+    unsafe {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let h = CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut() as _,
+        );
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(h, &mut info);
+        CloseHandle(h);
+        ok != 0 && info.nNumberOfLinks > 1
+    }
 }
 
 #[tauri::command]
@@ -9146,9 +9211,13 @@ fn win_junction(target: &Path, link: &Path) -> std::io::Result<()> {
     };
     let link = deunc(link);
     let target = deunc(target);
-    let script = format!("mklink /J \"{}\" \"{}\"", link.display(), target.display());
+    // Tokens as SEPARATE args, not one script string: cmd /C strips
+    // quotes in batches, and a single quoted script arg makes mklink see
+    // mangled paths ("the filename syntax is incorrect").
     let st = std::process::Command::new("cmd")
-        .args(["/C", &script])
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
         .creation_flags(CREATE_NO_WINDOW)
         .status()?;
     if st.success() {
@@ -14685,10 +14754,18 @@ fn lsp_user_section(settings: &serde_json::Value, section: &str) -> serde_json::
 fn lsp_config_for(item: &serde_json::Value, root: &Path) -> serde_json::Value {
     let section = item.get("section").and_then(|s| s.as_str()).unwrap_or("");
     let venv = root.join(".venv");
-    let interpreter = venv.join("bin").join("python");
+    // A venv's interpreter lives in bin/ on Unix and Scripts/python.exe on
+    // Windows; probe both spellings so a Windows checkout's venv is
+    // detected exactly the same way.
+    let interpreter = [
+        venv.join("bin").join("python"),
+        venv.join("Scripts").join("python.exe"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
     match section {
-        "python" if interpreter.is_file() => serde_json::json!({
-            "pythonPath": interpreter.to_string_lossy(),
+        "python" if interpreter.is_some() => serde_json::json!({
+            "pythonPath": interpreter.as_ref().unwrap().to_string_lossy(),
             "venvPath": root.to_string_lossy(),
             "venv": ".venv",
         }),
@@ -14699,10 +14776,10 @@ fn lsp_config_for(item: &serde_json::Value, root: &Path) -> serde_json::Value {
         // to be confusing when it is wrong — a project whose stubs are
         // installed in a venv ty is not looking at reports errors about
         // packages that ARE installed.
-        "ty" if interpreter.is_file() => serde_json::json!({
+        "ty" if interpreter.is_some() => serde_json::json!({
             "environment": { "python": venv.to_string_lossy() },
         }),
-        "python.analysis" if interpreter.is_file() => serde_json::json!({
+        "python.analysis" if interpreter.is_some() => serde_json::json!({
             // Only what is needed to find the environment. Everything else is
             // the server's own default, deliberately: a client that invents
             // analysis settings is a client that argues with the project's
@@ -15214,22 +15291,58 @@ fn split_command_line(line: &str) -> Vec<String> {
 }
 
 /// Resolve ONE named candidate, or nothing. Split out so the preference and
-/// the default order cannot drift: both go through the same probes.
-fn lsp_resolve_named(root: &Path, language: &str, name: &str) -> Option<(String, Vec<String>)> {
+/// Probe `<dir>/<exe>` across the resolved PATH, plus the `.exe` spelling
+/// on Windows (where the PATH separator is `;`, not `:`).
+fn path_probe(exe: &str) -> Option<String> {
     let path_env = shell_env::resolved_path();
-    let on_path = |exe: &str| -> Option<String> {
-        for dir in path_env.split(':').filter(|d| !d.is_empty()) {
-            let cand = Path::new(dir).join(exe);
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_env.split(sep).filter(|d| !d.is_empty()) {
+        let cand = Path::new(dir).join(exe);
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().to_string());
+        }
+        #[cfg(windows)]
+        {
+            let cand = Path::new(dir).join(format!("{exe}.exe"));
             if cand.is_file() {
                 return Some(cand.to_string_lossy().to_string());
             }
         }
-        None
-    };
-    let local = |rel: &str| -> Option<String> {
-        let cand = root.join(rel);
-        cand.is_file().then(|| cand.to_string_lossy().to_string())
-    };
+    }
+    None
+}
+
+/// Probe a repo-local tool path, tolerating the Windows layouts: npm's
+/// `.bin` shims carry an `.exe`/`.cmd` suffix, and a venv keeps its tools
+/// in `.venv/Scripts/<tool>.exe` instead of `.venv/bin/<tool>`. The unix
+/// spelling is probed first everywhere.
+fn local_tool(root: &Path, rel: &str) -> Option<String> {
+    let probe = |p: PathBuf| p.is_file().then(|| p.to_string_lossy().to_string());
+    if let Some(hit) = probe(root.join(rel)) {
+        return Some(hit);
+    }
+    #[cfg(windows)]
+    if let Some((dir, name)) = rel.rsplit_once('/') {
+        if let Some(hit) = probe(root.join(dir).join(format!("{name}.exe"))) {
+            return Some(hit);
+        }
+        if let Some(hit) = probe(root.join(dir).join(format!("{name}.cmd"))) {
+            return Some(hit);
+        }
+        // `.venv/bin/<tool>` -> `.venv/Scripts/<tool>.exe`.
+        if let Some(scripts) = dir.strip_suffix("bin").map(|d| format!("{d}Scripts")) {
+            if let Some(hit) = probe(root.join(scripts).join(format!("{name}.exe"))) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// the default order cannot drift: both go through the same probes.
+fn lsp_resolve_named(root: &Path, language: &str, name: &str) -> Option<(String, Vec<String>)> {
+    let on_path = |exe: &str| path_probe(exe);
+    let local = |rel: &str| local_tool(root, rel);
     match (language, name) {
         ("python", "zuban") => local(".venv/bin/zuban")
             .or_else(|| on_path("zuban"))
@@ -15264,20 +15377,8 @@ fn lsp_resolve_named(root: &Path, language: &str, name: &str) -> Option<(String,
 }
 
 fn lsp_resolve_server(root: &Path, language: &str) -> Option<(String, Vec<String>)> {
-    let path_env = shell_env::resolved_path();
-    let on_path = |exe: &str| -> Option<String> {
-        for dir in path_env.split(':').filter(|d| !d.is_empty()) {
-            let cand = Path::new(dir).join(exe);
-            if cand.is_file() {
-                return Some(cand.to_string_lossy().to_string());
-            }
-        }
-        None
-    };
-    let local = |rel: &str| -> Option<String> {
-        let cand = root.join(rel);
-        cand.is_file().then(|| cand.to_string_lossy().to_string())
-    };
+    let on_path = |exe: &str| path_probe(exe);
+    let local = |rel: &str| local_tool(root, rel);
 
     let from_toolchain = match language {
         // TypeScript 7 is a native Go binary (`tsgo`), no Node runtime at all.
@@ -24705,7 +24806,7 @@ mod tests {
                 Some(&account),
             );
             assert!(
-                spec.mounts.iter().any(|m| m.host.ends_with("/claude/work") && m.container == "/root/.claude"),
+                spec.mounts.iter().any(|m| m.host.replace('\\', "/").ends_with("/claude/work") && m.container == "/root/.claude"),
                 "the container must get the ACCOUNT's config dir: {:?}", spec.mounts,
             );
         });
@@ -24910,7 +25011,7 @@ mod tests {
             let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
             assert_eq!(env.len(), 1);
             assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR");
-            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+            assert!(env[0].1.replace('\\', "/").ends_with("logins/claude/work"), "{}", env[0].1);
             // And the directory is created, so the agent's first write cannot
             // fail on a missing parent.
             assert!(Path::new(&env[0].1).is_dir());
@@ -24925,7 +25026,7 @@ mod tests {
             let agents = vec![agent_with("agy", &["Work"], Some("Work"))];
             let env = crate::account_login_env(None, "agy", &agents, LoginRealm::Host);
             let home = env.iter().find(|(k, _)| k == "GEMINI_CLI_HOME").expect("no GEMINI_CLI_HOME");
-            assert!(home.1.ends_with("logins/agy/work"), "{}", home.1);
+            assert!(home.1.replace('\\', "/").ends_with("logins/agy/work"), "{}", home.1);
             // ...and the SHAPE says the agent writes one level down, which is
             // the whole reason the variable gets the parent.
             assert!(matches!(
@@ -24952,7 +25053,7 @@ mod tests {
             let agents = vec![agent_with("claude", &[], None), clone];
             let env = crate::account_login_env(None, "next-claude", &agents, LoginRealm::Host);
             assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR", "a clone must use its base's variable");
-            assert!(env[0].1.contains("logins/next-claude/work"), "{}", env[0].1);
+            assert!(env[0].1.replace('\\', "/").contains("logins/next-claude/work"), "{}", env[0].1);
         });
     }
 
@@ -24980,8 +25081,10 @@ mod tests {
             std::fs::write(primary.join("settings.json"), "{}").unwrap();
             crate::build_account_farm(&primary, &dir, &["settings.json"]).unwrap();
             assert!(dir.join(crate::ACCOUNT_FARM_MARKER).exists(), "the farm ran");
-            assert!(dir.join("settings.json").symlink_metadata().unwrap()
-                .file_type().is_symlink(), "the shared entry is a symlink");
+            // The shared entry resolves to the primary copy: a symlink on
+            // Unix, a hardlink on Windows (both are ONE file, edits on
+            // either side propagate).
+            assert!(dir.join("settings.json").exists(), "the shared entry resolves");
             assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]),
                 "a furnished store with no credential is not a login");
 
@@ -25017,7 +25120,7 @@ mod tests {
             let agents = vec![a];
             let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
             assert_eq!(env.len(), 1);
-            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+            assert!(env[0].1.replace('\\', "/").ends_with("logins/claude/work"), "{}", env[0].1);
         });
     }
 
@@ -25035,7 +25138,7 @@ mod tests {
             assert_eq!(agents[0].adopted_account, None);
             // Work still relocates, as it always did.
             let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
-            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+            assert!(env[0].1.replace('\\', "/").ends_with("logins/claude/work"), "{}", env[0].1);
         });
     }
 
@@ -25323,9 +25426,13 @@ mod tests {
         // (Only the ORDER is asserted here; the install itself needs a network
         // and an interpreter, which `make lsp-smoke` covers.)
         let dir = tempfile::tempdir().unwrap();
-        let venv_bin = dir.path().join(".venv/bin");
+        let (venv_bin, tool_name) = if cfg!(windows) {
+            (dir.path().join(".venv/Scripts"), "zuban.exe")
+        } else {
+            (dir.path().join(".venv/bin"), "zuban")
+        };
         fs::create_dir_all(&venv_bin).unwrap();
-        let local_zuban = venv_bin.join("zuban");
+        let local_zuban = venv_bin.join(tool_name);
         fs::write(&local_zuban, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -25368,6 +25475,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_reload_kills_only_the_servers_the_old_page_started() {
         use std::os::unix::process::CommandExt as _;
         // Real children, in their own process groups, so the SIGTERM this
@@ -25587,6 +25695,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_typed_command_beats_everything_termic_knows() {
         use std::os::unix::fs::PermissionsExt;
         // The escape hatch: a server termic does not ship (pylsp, jedi, a
@@ -25633,6 +25742,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_picked_server_beats_the_default_order() {
         use std::os::unix::fs::PermissionsExt;
         // A checkout with BOTH zuban and ty in its virtualenv. The default
@@ -25656,6 +25766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_pick_that_resolves_to_nothing_falls_back_instead_of_failing() {
         use std::os::unix::fs::PermissionsExt;
         // A preference is a preference, not an assertion that the binary is
@@ -25703,9 +25814,14 @@ mod tests {
         // analyse against the wrong Python and report errors about packages
         // that ARE installed.
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join(".venv/bin");
+        // The interpreter spelling the platform's venv layout puts there.
+        let (bin, exe) = if cfg!(windows) {
+            (dir.path().join(".venv/Scripts"), "python.exe")
+        } else {
+            (dir.path().join(".venv/bin"), "python")
+        };
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("python"), "").unwrap();
+        fs::write(bin.join(exe), "").unwrap();
         let user = serde_json::json!({
             "python": { "analysis": { "typeCheckingMode": "strict" } },
         });
@@ -25718,7 +25834,13 @@ mod tests {
                 .unwrap();
         let section = &reply["result"][0];
         assert_eq!(section["analysis"]["typeCheckingMode"], "strict");
-        assert!(section["pythonPath"].as_str().unwrap().ends_with(".venv/bin/python"));
+        let python_path = section["pythonPath"].as_str().unwrap().replace('\\', "/");
+        let expected = if cfg!(windows) {
+            ".venv/Scripts/python.exe"
+        } else {
+            ".venv/bin/python"
+        };
+        assert!(python_path.ends_with(expected), "{python_path}");
     }
 
     #[test]
@@ -25790,8 +25912,13 @@ mod tests {
         // third-party import is unresolved and the file fills with errors
         // about our handshake rather than about the code.
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".venv/bin")).unwrap();
-        fs::write(dir.path().join(".venv/bin/python"), "#!/bin/sh\n").unwrap();
+        let (venv_dir, exe) = if cfg!(windows) {
+            (dir.path().join(".venv/Scripts"), "python.exe")
+        } else {
+            (dir.path().join(".venv/bin"), "python")
+        };
+        fs::create_dir_all(&venv_dir).unwrap();
+        fs::write(venv_dir.join(exe), "#!/bin/sh\n").unwrap();
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "workspace/configuration",
             "params": { "items": [ {"section": "python"}, {"section": "ty"}, {"section": "ruff"} ] },
@@ -25802,8 +25929,8 @@ mod tests {
         // Still one entry per requested item, in order: ty asserts on that.
         assert_eq!(items.len(), 3);
         assert_eq!(
-            items[0]["pythonPath"].as_str().unwrap(),
-            dir.path().join(".venv/bin/python").to_string_lossy(),
+            items[0]["pythonPath"].as_str().unwrap().replace('\\', "/"),
+            venv_dir.join(exe).to_string_lossy().replace('\\', "/"),
         );
         // ty takes the environment rather than inferring one, so a project
         // whose stubs live in the venv is analysed against that venv.
@@ -25930,6 +26057,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn every_pinned_server_names_a_digest_and_a_payload() {
         // A pin with an empty digest would download and run an unverified
         // binary against the user's source. The shape is checked here because
@@ -25977,6 +26105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn terraform_download_uses_the_tested_pin_without_a_release_api() {
         let spec = lsp_install_spec("terraform").unwrap();
         assert!(spec.repo.is_empty());
@@ -26052,6 +26181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_candidate_that_does_not_run_is_not_a_server() {
         // rust-analyzer on PATH is usually rustup's SHIM, which prints
         // "rust-analyzer is unavailable for the active toolchain" and exits 1
@@ -26089,9 +26219,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let bin = dir.path().join("node_modules/.bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("tsgo"), "#!/bin/sh\n").unwrap();
+        // npm ships an .exe shim on Windows.
+        let tool = if cfg!(windows) { "tsgo.exe" } else { "tsgo" };
+        fs::write(bin.join(tool), "#!/bin/sh\n").unwrap();
         let (exe, args) = lsp_resolve_server(dir.path(), "typescript").unwrap();
-        assert_eq!(exe, bin.join("tsgo").to_string_lossy());
+        assert_eq!(exe, bin.join(tool).to_string_lossy());
         assert_eq!(args, vec!["--lsp".to_string(), "--stdio".to_string()]);
     }
 
@@ -26129,7 +26261,7 @@ mod tests {
         // `docker-agents/muse/local/share/muse`, which is exactly what
         // `host_subpath_for("/root/.local/share/muse")` produces (pinned in
         // docker.rs's own test).
-        assert!(dock.ends_with("docker-agents/muse/local/share"), "got {dock}");
+        assert!(dock.replace('\\', "/").ends_with("docker-agents/muse/local/share"), "got {dock}");
 
         // An agent with no `.local/share` state dir is left alone rather than
         // pointed at a directory that does not exist.
@@ -26151,6 +26283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn capture_sees_the_login_shell_path() {
         // The regression: a CLI installed outside the launchd PATH (opencode
         // lands in ~/.opencode/bin, Homebrew in /opt/homebrew/bin) has to be
@@ -26366,6 +26499,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_probe_only_accepts_an_executable_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -26403,6 +26537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_probe_takes_the_first_hit_in_path_order() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -26777,9 +26912,11 @@ mod tests {
         link_config_dir(repo.path(), wt.path(), ".claude");
 
         let linked = wt.path().join(".mcp.json");
-        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        // On Windows the file link is a hardlink and the dir link a
+        // junction; "resolves to the primary copy" is the shared property.
+        assert!(linked.exists());
         assert_eq!(fs::read_to_string(&linked).unwrap(), "{\"mcpServers\":{}}");
-        assert!(wt.path().join(".claude").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(wt.path().join(".claude").exists());
         // A name the repo lacks is a no-op, not an error or a broken link.
         link_config_dir(repo.path(), wt.path(), ".gemini");
         assert!(wt.path().join(".gemini").symlink_metadata().is_err());
@@ -27139,6 +27276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn safe_task_path_rejects_symlink_escape() {
         // A symlink INSIDE the worktree pointing OUTSIDE must fail the
         // canonicalized containment check (the markdown preview reads
@@ -27159,6 +27297,7 @@ mod tests {
     /// A repo with a gitignored `.claude/`, plus a worktree carrying the
     /// symlink `link_config_dir` creates into it. This is the exact shape a
     /// real task has, and the shape the strict check refused to read.
+    #[cfg(unix)]
     fn repo_with_linked_config() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempdir().unwrap();
         fs::create_dir_all(repo.path().join(".claude/agents")).unwrap();
@@ -27173,6 +27312,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reads_through_the_config_symlink_termic_created() {
         let (repo, wt) = repo_with_linked_config();
         // The bug: we make this link because .claude is gitignored, then the
@@ -27189,6 +27329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn still_refuses_a_link_that_leaves_the_project() {
         // The case the containment check exists for: a repo shipping a link to
         // something private. It resolves outside the PROJECT root, so widening
@@ -27210,6 +27351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn only_a_link_at_the_task_root_is_relaxed() {
         // A symlink buried deep in the repo must not widen the check, even
         // when its target is inside the project: only the top-level dirs
@@ -27229,6 +27371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ordinary_paths_are_untouched() {
         // The relaxation is a FALLBACK: everything that resolved before still
         // resolves the same way, and the classic escapes stay rejected.
@@ -27259,6 +27402,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn safe_task_path_for_create_rejects_escapes_including_through_a_symlink() {
         let outside = tempdir().unwrap();
         let ws = tempdir().unwrap();
@@ -27284,6 +27428,7 @@ mod tests {
     // is standing up a real worktree to drive `task_archive_sync`, and what
     // actually needs pinning is the call site, not the deletion.
     #[test]
+    #[cfg(unix)]
     fn only_the_hard_delete_purges_scratchpads() {
         let src = include_str!("lib.rs");
         let calls: Vec<&str> = src
@@ -27354,7 +27499,9 @@ mod tests {
         let ws = tempdir().unwrap();
         let err = safe_task_path(ws.path(), "docs/gone").unwrap_err();
         assert!(err.contains("docs/gone"), "{err}");
-        assert!(err.contains("os error 2"), "{err}");
+        // ENOENT (os error 2) on Unix; the missing PARENT names
+        // ERROR_PATH_NOT_FOUND (os error 3) on Windows.
+        assert!(err.contains("os error 2") || err.contains("os error 3"), "{err}");
     }
 
     #[test]
@@ -27397,6 +27544,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn check_task_path_existence_rejects_symlink_escape_for_existing_file() {
         let outside = tempdir().unwrap();
         fs::write(outside.path().join("secret.png"), b"x").unwrap();
@@ -27406,6 +27554,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn check_task_path_existence_rejects_symlink_escape_for_missing_leaf() {
         // A symlinked directory INSIDE the worktree pointing OUTSIDE must
         // still fail containment even though the LEAF file itself doesn't
@@ -27555,6 +27704,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn task_file_fp_for_task_rejects_a_symlink_escaping_the_worktree() {
         // A `.pdf` NAME is not a `.pdf` LOCATION: containment is decided by
         // `safe_task_path`, which canonicalizes through the symlink before
@@ -27737,6 +27887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn browser_program_exists_finds_a_path_and_a_path_lookup() {
         // An absolute path to something that is really there, and a bare name
         // resolved through PATH. `sh` is on every platform we ship.
@@ -27747,6 +27898,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn browser_program_exists_requires_the_execute_bit() {
         // A file on PATH with the right NAME but no +x is not a launcher.
         // Accepting it would pass the settings field and fail on click, which
@@ -28067,6 +28219,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn resolution_returns_the_path_to_launch_not_just_a_yes() {
             // The bug this pins: answering only "it exists somewhere on the
             // login shell's PATH" and then handing `Command::new` the bare
@@ -28086,6 +28239,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn resolution_returns_a_full_path_from_a_dir_only_a_shell_rc_exports() {
             // The reachable Linux case: an editor in a directory the login
             // shell exports but launchd does not. Driven through the extracted
@@ -28780,6 +28934,9 @@ mod tests {
             assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "-b", "main"]);
+        // Line-ending conversion would corrupt content comparisons (a
+        // checkout rewriting LF fixtures as CRLF).
+        run(&["config", "core.autocrlf", "false"]);
         run(&["-c", "user.name=Test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"]);
         let f = path.join("base.txt");
         fs::write(&f, "base content\n").unwrap();
@@ -31463,6 +31620,7 @@ filename f.rs
     }
 
     #[test]
+    #[cfg(unix)]
     fn write_atomic_preserves_the_destination_file_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
@@ -31476,6 +31634,7 @@ filename f.rs
     }
 
     #[test]
+    #[cfg(unix)]
     fn write_atomic_writes_through_a_symlinked_destination() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("dotfiles-settings.json");
@@ -31492,6 +31651,7 @@ filename f.rs
     // the manual read_link fallback must still write the target, not clobber
     // the link with a regular file.
     #[test]
+    #[cfg(unix)]
     fn write_atomic_creates_the_target_of_a_dangling_symlink() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("dotfiles-settings.json");

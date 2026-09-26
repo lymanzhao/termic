@@ -854,7 +854,7 @@ mod tests {
             let work = codex_home("codex", false, Some("Work")).expect("a named account resolves");
             let other = codex_home("codex", false, Some("Personal")).expect("...and so does another");
             assert_ne!(work, other, "two accounts must not share one CODEX_HOME");
-            assert!(work.to_string_lossy().contains("/logins/"), "{work:?}");
+            assert!(work.to_string_lossy().replace('\\', "/").contains("/logins/"), "{work:?}");
 
             // No account named: the agent's ordinary login, unchanged.
             let plain = codex_home("codex", false, None).expect("the plain path still resolves");
@@ -1034,12 +1034,12 @@ mod tests {
             let work = devin_credentials("devin", false, Some("Work")).expect("a named account resolves");
             let other = devin_credentials("devin", false, Some("Personal")).expect("...and so does another");
             assert_ne!(work, other, "two accounts must not share one credentials.toml");
-            assert!(work.to_string_lossy().contains("/logins/"), "{work:?}");
+            assert!(work.to_string_lossy().replace('\\', "/").contains("/logins/"), "{work:?}");
             // XDG_DATA_HOME=<store>, devin appends `devin/credentials.toml`.
-            assert!(work.ends_with("devin/credentials.toml"), "{work:?}");
+            assert!(work.to_string_lossy().replace('\\', "/").ends_with("devin/credentials.toml"), "{work:?}");
 
             let plain = devin_credentials("devin", false, None).expect("the plain path resolves");
-            assert!(plain.ends_with(".local/share/devin/credentials.toml"), "{plain:?}");
+            assert!(plain.to_string_lossy().replace('\\', "/").ends_with(".local/share/devin/credentials.toml"), "{plain:?}");
         });
     }
 

@@ -5828,6 +5828,14 @@ mod tests {
     use std::io::Write as _;
     use test_support::*;
 
+    // Socket tests run through the platform transport: the real
+    // UnixStream/UnixListener on macOS/Linux, the named-pipe Stream/
+    // Listener on Windows (same operation surface).
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
+    #[cfg(not(unix))]
+    use termic_proto::transport::{Listener as UnixListener, Stream as UnixStream};
+
     fn handle(req: &Request, host: &dyn CliHost) -> Reply {
         handle_request(req, host, &mut VecSink::default())
     }
@@ -7763,6 +7771,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn token_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -7926,6 +7935,7 @@ mod tests {
     /// into a fish config is a syntax error the user meets in their next
     /// terminal rather than here, where we could have told them.
     #[test]
+    #[cfg(unix)]
     fn the_path_line_matches_the_shell_that_will_read_it() {
         let dir = Path::new("/Users/u/.local/bin");
 
@@ -7953,6 +7963,7 @@ mod tests {
     /// Appending twice is the failure this has to prevent, and "twice" has
     /// more spellings than our own.
     #[test]
+    #[cfg(unix)]
     fn an_rc_that_already_has_the_dir_is_left_alone() {
         let home = dirs::home_dir().unwrap_or_default();
         let dir = home.join(".local/bin");
@@ -7980,6 +7991,7 @@ mod tests {
     /// Against real files, because this writes into a dotfile the user wrote
     /// and the failure mode is silent corruption rather than an error.
     #[test]
+    #[cfg(unix)]
     fn appending_the_path_line_never_corrupts_the_users_rc() {
         let dir = std::env::temp_dir().join(format!("termic-rc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -8056,6 +8068,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_prefers_an_existing_current_name_over_a_legacy_one() {
         let cur = PathBuf::from("/usr/local/bin/termic");
@@ -8063,6 +8076,7 @@ mod tests {
         assert_eq!(reconcile_target("termic", Some(cur.clone()), &legacy), Some(cur));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_atomic_replaces_without_a_gap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8086,6 +8100,7 @@ mod tests {
         assert!(strays.is_empty(), "left temp links behind: {strays:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_legacy_links_leaves_foreign_files_alone() {
         // `replaceable` is the only thing standing between a prune and
@@ -8109,6 +8124,7 @@ mod tests {
         assert!(!replaceable(&link).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_targets_use_the_name() {
         let t = install_targets("termic-dev");

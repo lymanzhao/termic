@@ -656,9 +656,9 @@ mod imp {
         }
     }
 
-    /// Query a token's TokenUser into an owned buffer. Returns a pointer
-    /// INTO the buffer (the SID) alongside it so the caller can EqualSid
-    /// before the buffer drops.
+    /// Query a token's TokenUser into an owned buffer. Returns the SID
+    /// pointer (into the SAME buffer, which is returned alongside so the
+    /// caller can EqualSid before the buffer drops).
     fn token_user(token: HANDLE) -> Option<(*const u8, Vec<u8>)> {
         let mut buf = vec![0u8; TOKEN_USER_BUF];
         let mut needed: u32 = 0;
@@ -676,7 +676,15 @@ mod imp {
                 return None;
             }
         }
-        let sid = buf.as_ptr();
+        // TOKEN_USER is { SID_AND_ATTRIBUTES { PSID Sid, DWORD Attributes } }:
+        // offset 0 holds a POINTER to the SID, which itself lives inside this
+        // buffer a few bytes in. Hand back the SID, not the struct address -
+        // EqualSid compares SIDs, and comparing the struct header is always
+        // a mismatch (this exact mistake dropped every same-user connection).
+        let sid: *const u8 = unsafe { std::ptr::read(buf.as_ptr() as *const *const u8) };
+        if sid.is_null() {
+            return None;
+        }
         Some((sid, buf))
     }
 
@@ -684,7 +692,8 @@ mod imp {
     /// hex-encoded rather than hashed: the data dir is per-user, the pipe
     /// namespace is machine-global, and a hash collision would hand
     /// another local user a squatting point on our control socket.
-    fn pipe_name(path: &Path) -> String {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn pipe_name(path: &Path) -> String {
         let text = path.to_string_lossy();
         let mut out = String::from("\\\\.\\pipe\\termic\\");
         for b in text.as_bytes() {
@@ -707,4 +716,30 @@ pub fn connect_with_timeouts(path: &Path, read: Duration, write: Duration) -> io
     s.set_read_timeout(Some(read))?;
     s.set_write_timeout(Some(write))?;
     Ok(s)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn bind_leaves_a_connectable_pipe_in_the_namespace() {
+        let dir = std::env::temp_dir().join(format!("termic-proto-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        println!("pipe name: {}", imp::pipe_name(&sock));
+        let mut listener = Listener::bind(&sock).expect("bind");
+        println!("bound");
+        let client = std::thread::spawn(move || {
+            let s = Stream::connect(&sock).expect("client connect");
+            s
+        });
+        let mut server = listener.accept().expect("accept");
+        let mut client = client.join().unwrap();
+        use std::io::{Read, Write};
+        client.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+    }
 }
