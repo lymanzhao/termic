@@ -1295,3 +1295,27 @@ move the editor's viewport, and the selection is empty 600ms later, every
 time; blur first and it survives, every time. So a spec that builds a
 selection outside the editor blurs the active element first
 (`selectInParagraph`), which is the part of the gesture it was skipping.
+
+## A closed terminal tab loses shell history unless it gets a hangup
+
+zsh writes its history file on a normal exit and on **SIGHUP**, and not on
+SIGTERM; SIGKILL of course saves nothing. `pty_kill` used to SIGKILL the
+child, so every command typed in a tab closed from the UI was lost, and the
+archive / quit paths (SIGTERM, grace, SIGKILL) lost it too despite being
+"graceful".
+
+Every PTY teardown goes through `graceful_then_kill`, whose third tuple field
+marks an interactive shell (`owner.kind` = `shell` / `aux` / `custom`): those
+get SIGHUP before the SIGTERM/grace/SIGKILL sequence. Agent CLIs keep SIGTERM,
+because that is what they flush their transcript on and a hangup would bypass
+the handler. `kill_task_ptys` (a sandbox change) deliberately stays SIGKILL:
+the termination there is a security boundary and must not wait.
+
+Separately, zsh's default history is per-process: it loads the file at startup
+and writes it at exit, so two live tabs cannot see each other's commands and
+the later exit overwrites the earlier one's entries. The Appearance setting
+"Share shell history across terminals" points a spawned zsh's `ZDOTDIR` at a
+generated shim (`<data dir>/shell/zsh/.zshenv`) that sources the user's real
+`.zshenv`, restores `ZDOTDIR` (zsh then looks up `.zprofile` / `.zshrc` in the
+real directory, verified) and enables `SHARE_HISTORY`. The shim only ever
+touches interactive zsh; bash and fish are left to their own configs.

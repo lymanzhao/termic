@@ -447,6 +447,10 @@ export default {
       label: "终端回滚行数",
       hint: "{{count}} 行。智能体终端保留这么多行；临时 shell 保留一半。",
     },
+    shareHistory: {
+      label: "在各终端间共享 shell 历史",
+      hint: "在一个终端中输入的命令，其他所有 Termic 终端（zsh）按 ↑ 立即可见。会开启 zsh 的 SHARE_HISTORY；你自己的 .zshrc 如果设置了它仍以你的为准，其他终端应用不受影响。对改动之后打开的终端生效。",
+    },
     meta: {
       label: "把 {{alt}} 用作 Meta 键",
       hint: "把 {{alt}}+键 作为 ESC 前缀序列发送，让终端编辑器（vim、emacs、nano）将其识别为 Meta/Alt。关闭时，{{alt}} 照常输入带重音的字符。",

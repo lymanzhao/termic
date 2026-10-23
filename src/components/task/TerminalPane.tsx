@@ -2976,6 +2976,11 @@ const captureArmedRef = useRef(false);
             ),
             TERMIC_WORKSPACE_NAME: task.name,
             COLORFGBG: currentColorFgBg(),
+            // Settings > Appearance > Share shell history. Read via
+            // getState() rather than a subscription: this is consumed once
+            // at spawn, and subscribing would respawn live terminals on a
+            // preference toggle. Rust turns it into the zsh startup shim.
+            TERMIC_SHARE_HISTORY: usePrefs.getState().shareShellHistory ? "1" : "0",
             ...taskDotEnv,
             // Registry entries (agents AND terminal-kind) carry a
             // user-configured env block; sentinel shell/custom tabs don't.

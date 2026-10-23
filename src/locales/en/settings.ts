@@ -448,6 +448,10 @@ export default {
       label: "Terminal scrollback",
       hint: "{{count}} lines. Agent terminals keep this many lines; the scratch shell keeps half.",
     },
+    shareHistory: {
+      label: "Share shell history across terminals",
+      hint: "A command typed in one terminal is immediately available to ↑ in every other Termic terminal (zsh). Turns on zsh's SHARE_HISTORY; your own .zshrc can still override it, and other terminal apps are unaffected. Applies to terminals opened after the change.",
+    },
     meta: {
       label: "Use {{alt}} as Meta key",
       hint: "Send {{alt}}+key as an ESC-prefixed sequence so terminal editors (vim, emacs, nano) see it as Meta/Alt. When off, {{alt}} types accented characters as usual.",

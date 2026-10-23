@@ -59,6 +59,8 @@ export function AppearanceSection() {
   const setTerminalScrollback = usePrefs(s => s.setTerminalScrollback);
   const terminalOptionAsMeta = usePrefs(s => s.terminalOptionAsMeta);
   const setTerminalOptionAsMeta = usePrefs(s => s.setTerminalOptionAsMeta);
+  const shareShellHistory = usePrefs(s => s.shareShellHistory);
+  const setShareShellHistory = usePrefs(s => s.setShareShellHistory);
   const terminalRenderer = usePrefs(s => s.terminalRenderer);
   const setTerminalRenderer = usePrefs(s => s.setTerminalRenderer);
   const editorFontSize = usePrefs(s => s.editorFontSize);
@@ -199,6 +201,13 @@ export function AppearanceSection() {
         control={
           <NumberInput value={terminalScrollback} onChange={setTerminalScrollback} min={1000} max={100000} step={1000} />
         }
+      />
+
+      <Toggle
+        label={t("appearance.shareHistory.label")}
+        hint={t("appearance.shareHistory.hint")}
+        value={shareShellHistory}
+        onChange={setShareShellHistory}
       />
 
       {IS_MAC && (

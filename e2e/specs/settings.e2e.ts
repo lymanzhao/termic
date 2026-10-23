@@ -126,6 +126,52 @@ describe("settings", () => {
 
     await snap("settings.png");
   });
+
+  // Terminal history sharing is a per-spawn setting: Rust reads it once when
+  // a shell starts, so the only thing the UI owns is the pref and its switch.
+  // This pins both, and restores the default so the rest of the run (and the
+  // next one, since the profile is shared) sees an untouched profile.
+  it("shares shell history across terminals from Appearance", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("appearance"));
+    await waitVisible('[data-appearance-tab="terminal"]');
+    // Appearance remembers the last sub-tab; this row lives on Terminal.
+    await browser.execute(() =>
+      (document.querySelector('[data-appearance-tab="terminal"]') as HTMLElement).click());
+
+    const label = "Share shell history across terminals";
+    await waitForText(label);
+    const original = await browser.execute(
+      () => window.__termic!.usePrefs.getState().shareShellHistory,
+    );
+    await clickToggleByLabel(label);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (o) => window.__termic!.usePrefs.getState().shareShellHistory !== o,
+          original,
+        ),
+      { timeout: 8_000, timeoutMsg: "shareShellHistory pref never changed" },
+    );
+    const now = await browser.execute(
+      () => window.__termic!.usePrefs.getState().shareShellHistory,
+    );
+    expect(await ariaCheckedFor(label)).toBe(String(now));
+
+    // Restore through the control, not the store, so the switch is proven
+    // to work in both directions.
+    await clickToggleByLabel(label);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (o) => window.__termic!.usePrefs.getState().shareShellHistory === o,
+          original,
+        ),
+      { timeout: 8_000, timeoutMsg: "shareShellHistory never restored" },
+    );
+    await snap("settings-share-shell-history.png");
+  });
 });
 
 // The settings rail. General used to be an 18-block scroll; it is now split

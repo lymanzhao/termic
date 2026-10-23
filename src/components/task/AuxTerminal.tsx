@@ -281,7 +281,12 @@ export function AuxTerminal({ taskId, tabId, taskPath, active, autoFocus, onExit
           // Signal terminal theme so prompts / status bars that honor
           // COLORFGBG (oh-my-zsh themes, starship, etc.) pick the right
           // colors for the current chrome, merged with task .env vars.
-          env: { COLORFGBG: currentColorFgBg(), ...taskDotEnv },
+          env: {
+            COLORFGBG: currentColorFgBg(),
+            // Same setting TerminalPane sends; see the comment there.
+            TERMIC_SHARE_HISTORY: usePrefs.getState().shareShellHistory ? "1" : "0",
+            ...taskDotEnv,
+          },
           // NEVER pass task_id here. The aux shell is a scratch
           // zsh for the user's own git/grep/etc work - sandboxing it
           // would block exactly the moves the user opened it for

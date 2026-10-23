@@ -101,6 +101,7 @@ const LS_TERMINAL_OPTION_AS_META = "terminalOptionAsMeta";
 const LS_TERMINAL_GPU            = "terminalGpuEnabled";
 const LS_TERMINAL_RENDERER       = "terminalRenderer";
 const LS_TERMINAL_COPY_ON_SELECT = "terminalCopyOnSelect";
+const LS_SHARE_SHELL_HISTORY   = "shareShellHistory";
 const LS_TASK_EXPAND_MODE = scoped("taskExpandMode");
 const LS_HIDE_INACTIVE_PROJECTS = scoped("hideInactiveProjects");
 const LS_BOARD_ARCHIVE_LIMIT_MODE = scoped("boardArchiveLimitMode");
@@ -734,6 +735,19 @@ interface PrefsState {
   /** iTerm-style copy-on-select: a finished mouse selection in any terminal
    *  is written to the clipboard automatically. ON by default. */
   terminalCopyOnSelect: boolean;
+  /** Let Termic's terminals share command history: a command typed in one
+   *  task is immediately visible to ↑ in every other open Termic terminal.
+   *  ON by default.
+   *
+   *  This is not a terminal-rendering concern, but it has the same shape as
+   *  the settings around it: a per-spawn fact read at shell start. Rust
+   *  implements it by pointing the PTY's zsh at a startup shim (`ZDOTDIR`)
+   *  that sources the user's real dotfiles and enables zsh's SHARE_HISTORY
+   *  before their .zshrc runs, so their own settings still win. zsh only; fish already
+   *  shares one history file by default, and bash has no equivalent env hook
+   *  for an interactive login shell. Applies to terminals opened after the
+   *  change. */
+  shareShellHistory: boolean;
   editorFontSize: number;
   /** Whole-app zoom, in percent (100 = native). Applied via the webview's
    *  native page zoom (see applyUiScale), so it scales every chrome surface
@@ -983,6 +997,7 @@ interface PrefsState {
   setTerminalScrollback:  (n: number) => void;
   setTerminalOptionAsMeta: (v: boolean) => void;
   setTerminalGpuEnabled: (v: boolean) => void;
+  setShareShellHistory: (v: boolean) => void;
   setTerminalRenderer: (v: TerminalRendererKind) => void;
   setTerminalCopyOnSelect: (v: boolean) => void;
   setEditorFontSize:  (px: number) => void;
@@ -1180,6 +1195,7 @@ export const APPEARANCE_DEFAULTS = {
   terminalOptionAsMeta:  false,
   terminalGpuEnabled:    true,
   terminalRenderer:      "webgl" as TerminalRendererKind,
+  shareShellHistory:     true,
   editorFontSize:        13,
   uiScale:               100,
   codeLigatures:         true,
@@ -1264,6 +1280,7 @@ function readStoredPrefs() {
     initialTerminalGpuEnabled ? "webgl" : "dom",
   );
   const initialTerminalCopyOnSelect  = lsGetBool(LS_TERMINAL_COPY_ON_SELECT, true);
+  const initialShareShellHistory     = lsGetBool(LS_SHARE_SHELL_HISTORY, APPEARANCE_DEFAULTS.shareShellHistory);
   const initialEditorSize   = lsGetNum(LS_EDITOR_SIZE, APPEARANCE_DEFAULTS.editorFontSize);
   const initialUiScale      = clampUiScale(lsGetNum(LS_UI_SCALE, APPEARANCE_DEFAULTS.uiScale));
   const initialLigatures    = lsGetBool(LS_LIGATURES, APPEARANCE_DEFAULTS.codeLigatures);
@@ -1419,6 +1436,7 @@ function readStoredPrefs() {
     terminalGpuEnabled: initialTerminalGpuEnabled,
     terminalRenderer: initialTerminalRenderer,
     terminalCopyOnSelect: initialTerminalCopyOnSelect,
+    shareShellHistory: initialShareShellHistory,
     editorFontSize: initialEditorSize,
     uiScale: initialUiScale,
     codeLigatures: initialLigatures,
@@ -1555,6 +1573,10 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_TERMINAL_COPY_ON_SELECT, v ? "1" : "0"); } catch {}
     set({ terminalCopyOnSelect: v });
   },
+  setShareShellHistory: (v) => {
+    try { localStorage.setItem(LS_SHARE_SHELL_HISTORY, v ? "1" : "0"); } catch {}
+    set({ shareShellHistory: v });
+  },
   setEditorFontSize: (px) => {
     try { localStorage.setItem(LS_EDITOR_SIZE, String(px)); } catch {}
     set({ editorFontSize: px });
@@ -1655,6 +1677,7 @@ export const usePrefs = create<PrefsState>(set => ({
     s.setTerminalScrollback(d.terminalScrollback);
     s.setTerminalOptionAsMeta(d.terminalOptionAsMeta);
     s.setTerminalGpuEnabled(d.terminalGpuEnabled);
+    s.setShareShellHistory(d.shareShellHistory);
     s.setEditorFontSize(d.editorFontSize);
     s.setUiScale(d.uiScale);
     s.setCodeLigatures(d.codeLigatures);

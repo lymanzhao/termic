@@ -74,6 +74,7 @@ export const PREF_KEYS: readonly PrefKey[] = [
   { key: "terminalScrollback", scoped: false, class: "sync" },
   { key: "terminalOptionAsMeta", scoped: false, class: "sync" },
   { key: "terminalCopyOnSelect", scoped: false, class: "sync" },
+  { key: "shareShellHistory", scoped: false, class: "sync" },
   { key: "terminalRenderer", scoped: false, class: "local", reason: "renderer choice follows this machine's GPU" },
   { key: "terminalGpuEnabled", scoped: false, class: "local", reason: "hardware: whether this machine's GPU renders terminals" },
 

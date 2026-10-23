@@ -21,6 +21,11 @@
 pub enum Sig {
     Term,
     Kill,
+    /// Terminal hangup. Unix only: a shell writes its history file on HUP,
+    /// and zsh in particular exits on SIGTERM WITHOUT saving it, so a
+    /// history-preserving shutdown has to start here.
+    #[cfg(unix)]
+    Hup,
 }
 
 /// Signal one process.
@@ -68,6 +73,7 @@ mod imp {
         match sig {
             Sig::Term => libc::SIGTERM,
             Sig::Kill => libc::SIGKILL,
+            Sig::Hup => libc::SIGHUP,
         }
     }
 
